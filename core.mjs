@@ -5,6 +5,11 @@ export const today = () => { const d = new Date(); return `${d.getFullYear()}-${
 export const escapeHTML = (s = '') => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 export function safeUrl(value) { try { const u = new URL(value, 'http://localhost'); return ['https:', 'http:'].includes(u.protocol) ? value : ''; } catch { return ''; } }
 
+export function normalizeGenres(value) {
+  const values=Array.isArray(value)?value:typeof value==='string'?value.split(/[,;|]/):[];
+  const seen=new Set();return values.filter(x=>typeof x==='string').map(x=>x.trim().replace(/\s+/g,' ').slice(0,40)).filter(x=>{const key=x.toLocaleLowerCase();if(!x||seen.has(key))return false;seen.add(key);return true;}).slice(0,8);
+}
+
 export function normalizeAttachments(items) {
   if(!Array.isArray(items)) return [];
   const seen=new Set();
@@ -82,7 +87,7 @@ export function normalizeImport(text, fileName='', source='auto') {
     }
     const isbn=get('ISBN13','ISBN').replace(/[="\s]/g,'');
     return [migrateEntry({id:uid(),title,type,status,date,rating,creator:get('Author','Creator','Directors'),year:get('Year','Original Publication Year','Year Published'),
-      notes:textReview(get('Review','My Review','Notes')),favorite:/^(true|yes|1)$/i.test(get('Favorite','Liked')),
+      genres:normalizeGenres(get('Genres','Genre')),notes:textReview(get('Review','My Review','Notes')),favorite:/^(true|yes|1)$/i.test(get('Favorite','Liked')),
       image:safeUrl(get('Image')) || (type==='book' && /^(\d{10}|\d{13})$/.test(isbn)?`https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`:''),
       source:source==='generic'?'CSV':source,sourceUrl:safeUrl(get('Letterboxd URI','URL','Source URL')),externalId:get('Book Id','Const'),
       addedAt:new Date().toISOString(),history:date?[date]:[]})];
@@ -112,7 +117,8 @@ export function mergeEntries(existing,incoming) {
     const old=direct||(titles.get(titleKey(item))||[]).find(x=>sameItem(x,item));
     if(!old) { const addedItem={...item,history:[...(item.history||[])]};entries.push(addedItem);index(addedItem);added++;continue; }
     let changed=false;
-    for(const key of ['creator','year','date','rating','notes','description','image','sourceUrl','externalId']) if(!old[key] && item[key]) {old[key]=item[key]; changed=true;}
+    for(const key of ['creator','year','date','rating','notes','description','image','sourceUrl','externalId','metadataSource','metadataSourceUrl']) if(!old[key] && item[key]) {old[key]=item[key]; changed=true;}
+    const genres=normalizeGenres([...normalizeGenres(old.genres),...normalizeGenres(item.genres)]);if(JSON.stringify(genres)!==JSON.stringify(old.genres||[])){old.genres=genres;changed=true;}
     if(item.forLater&&!old.forLater){old.forLater=true;changed=true;}
     if(item.favorite && !old.favorite) {old.favorite=true;changed=true;}
     const ranks={want:0,progress:1,done:2}; if(ranks[item.status]>ranks[old.status]) {old.status=item.status;changed=true;}

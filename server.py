@@ -66,6 +66,17 @@ def search(kind, query):
                     descriptions = {x['title']: x.get('extract', '') for x in pages.values()}
                 except (HTTPError, URLError, TimeoutError, ValueError, OSError):
                     pass  # A cover outage must not prevent logging a found film.
+            genre_ids = sorted({claim.get('mainsnak', {}).get('datavalue', {}).get('value', {}).get('id')
+                                for entity in entities.values() for claim in entity.get('claims', {}).get('P136', [])} - {None})
+            genre_labels = {}
+            if genre_ids:
+                try:
+                    genre_data = fetch('https://www.wikidata.org/w/api.php?' + urlencode({
+                        'action': 'wbgetentities', 'ids': '|'.join(genre_ids[:50]), 'props': 'labels',
+                        'languages': 'en', 'format': 'json'}), 'wikidata').get('entities', {})
+                    genre_labels = {key: val.get('labels', {}).get('en', {}).get('value', '').removesuffix(' film').title() for key, val in genre_data.items()}
+                except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+                    pass
             for hit in hits:
                 entity = entities.get(hit['id'], {})
                 wiki_title = entity.get('sitelinks', {}).get('enwiki', {}).get('title', '')
@@ -74,6 +85,7 @@ def search(kind, query):
                 director = re.search(r'(?:directed by|film by) (.+)$', description)
                 items.append({'title': hit.get('label', ''), 'creator': director.group(1) if director else '',
                               'year': year_match.group(0) if year_match else '', 'type': 'movie',
+                              'genres': [genre_labels[g] for claim in entity.get('claims', {}).get('P136', []) if (g := claim.get('mainsnak', {}).get('datavalue', {}).get('value', {}).get('id')) in genre_labels][:8],
                               'image': images.get(wiki_title, ''), 'description': descriptions.get(wiki_title, '') or description, 'source': provider,
                               'sourceUrl': 'https://www.wikidata.org/wiki/' + hit['id'], 'externalId': hit['id']})
     elif kind == 'album':
@@ -87,7 +99,7 @@ def search(kind, query):
             items.append({'title': title, 'creator': row.get('artistName', ''), 'year': row.get('releaseDate', '')[:4],
                           'type': kind, 'image': row.get('artworkUrl100', '').replace('100x100bb', '600x600bb'),
                           'source': provider, 'sourceUrl': row.get('collectionViewUrl', ''),
-                          'externalId': str(row.get('collectionId', '')), 'description': f"{title} is an album by {row.get('artistName', 'an unknown artist')}." + (f" Released in {row['releaseDate'][:4]}." if row.get('releaseDate') else '')})
+                          'externalId': str(row.get('collectionId', '')), 'genres': [row['primaryGenreName']] if row.get('primaryGenreName') else [], 'description': f"{title} is an album by {row.get('artistName', 'an unknown artist')}." + (f" Released in {row['releaseDate'][:4]}." if row.get('releaseDate') else '')})
     elif kind == 'tv':
         data = fetch('https://api.tvmaze.com/search/shows?' + urlencode({'q': query}), 'tvmaze')
         for result in data[:16]:
@@ -95,24 +107,25 @@ def search(kind, query):
             items.append({'title': row['name'], 'creator': (row.get('network') or row.get('webChannel') or {}).get('name', ''),
                           'year': (row.get('premiered') or '')[:4], 'type': kind,
                           'image': (row.get('image') or {}).get('medium', ''), 'source': provider,
-                          'sourceUrl': row.get('url', ''), 'externalId': str(row['id']), 'description': html.unescape(re.sub(r'<[^>]*>', '', row.get('summary') or ''))})
+                          'sourceUrl': row.get('url', ''), 'externalId': str(row['id']), 'genres': row.get('genres') or [], 'description': html.unescape(re.sub(r'<[^>]*>', '', row.get('summary') or ''))})
     elif kind == 'anime':
-        data = fetch('https://kitsu.io/api/edge/anime?' + urlencode({'filter[text]': query, 'page[limit]': 16}), 'kitsu')
+        data = fetch('https://kitsu.io/api/edge/anime?' + urlencode({'filter[text]': query, 'page[limit]': 16, 'include': 'categories'}), 'kitsu')
+        category_names = {r['id']: r.get('attributes', {}).get('title', '') for r in data.get('included', []) if r.get('type') == 'categories'}
         for row in data.get('data', []):
             attr = row.get('attributes', {})
             items.append({'title': attr.get('titles', {}).get('en') or attr.get('canonicalTitle', ''),
                           'creator': '', 'year': (attr.get('startDate') or '')[:4], 'type': 'movie' if attr.get('subtype') == 'movie' else kind,
                           'image': (attr.get('posterImage') or {}).get('medium', ''),
                           'source': provider, 'sourceUrl': 'https://kitsu.app/anime/' + str(row['id']),
-                          'externalId': str(row['id']), 'description': attr.get('synopsis') or ''})
+                          'externalId': str(row['id']), 'genres': [category_names.get(r['id'], '') for r in row.get('relationships', {}).get('categories', {}).get('data', []) if category_names.get(r['id'])][:8], 'description': attr.get('synopsis') or ''})
     elif kind == 'book':
         data = fetch('https://openlibrary.org/search.json?' + urlencode({'q': query, 'limit': 16,
-                     'fields': 'key,title,author_name,first_publish_year,cover_i'}), 'openlibrary')
+                     'fields': 'key,title,author_name,first_publish_year,cover_i,subject'}), 'openlibrary')
         for row in data.get('docs', []):
             items.append({'title': row['title'], 'creator': ', '.join(row.get('author_name', [])[:2]),
                           'year': str(row.get('first_publish_year', '')), 'type': kind,
                           'image': f"https://covers.openlibrary.org/b/id/{row['cover_i']}-L.jpg" if row.get('cover_i') else '',
-                          'source': provider, 'sourceUrl': 'https://openlibrary.org' + row['key'], 'externalId': row['key']})
+                          'source': provider, 'sourceUrl': 'https://openlibrary.org' + row['key'], 'externalId': row['key'], 'genres': (row.get('subject') or [])[:8]})
     unique = list({(r['type'], r['externalId']): r for r in items}.values())
     result = {'items': unique, 'provider': provider}
     CACHE[cache_key] = (time.time(), result)

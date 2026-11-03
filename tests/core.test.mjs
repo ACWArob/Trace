@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {parseCSV,normalizeImport,mergeEntries,recapEntries,dateOnly,safeUrl} from '../core.mjs';
+import {parseCSV,normalizeImport,mergeEntries,recapEntries,dateOnly,safeUrl,normalizeGenres} from '../core.mjs';
 
 test('CSV preserves quoted commas, newlines, escaped quotes, CRLF and BOM',()=>{
  const rows=parseCSV('\uFEFFTitle,Notes\r\n"A, B","Line one\nShe said ""hello"""\r\n');
@@ -103,4 +103,18 @@ test('For later membership and descriptions merge without changing a completed e
  const old={id:'logged-film',type:'movie',title:'Arrival',year:'2016',status:'done',date:'2026-10-10',rating:4.5,notes:'My review',history:['2026-10-10']};
  const incoming={...old,id:'other-id',status:'want',date:'',rating:0,forLater:true,description:'A linguist communicates with extraterrestrial visitors.'};
  const result=mergeEntries([old],[incoming]);assert.equal(result.entries.length,1);const item=result.entries[0];assert.equal(item.forLater,true);assert.equal(item.status,'done');assert.equal(item.rating,4.5);assert.equal(item.date,old.date);assert.equal(item.notes,old.notes);assert.equal(item.description,incoming.description);
+});
+
+
+test('Genres normalize bounded arrays and CSV text, and merge without losing personal history',()=>{
+ assert.deepEqual(normalizeGenres('Drama, drama; Science Fiction | Drama'),['Drama','Science Fiction']);
+ assert.deepEqual(normalizeGenres([null,2,'  Indie   Rock ','indie rock']),['Indie Rock']);
+ assert.equal(normalizeGenres(Array.from({length:20},(_,i)=>'Genre '+i)).length,8);
+ const original={id:'mine',type:'movie',title:'Arrival',rating:4.5,notes:'My note',date:'2026-10-01',genres:['Drama'],history:[]};
+ const result=mergeEntries([original],[{type:'movie',title:'Arrival',genres:['Science Fiction','Drama'],rating:1,notes:'Catalog note',date:'2026-11-03'}]);
+ assert.deepEqual(result.entries[0].genres,['Drama','Science Fiction']);
+ assert.equal(result.entries[0].rating,4.5);assert.equal(result.entries[0].notes,'My note');assert.equal(result.entries[0].date,'2026-10-01');
+ assert.deepEqual(original.genres,['Drama']);
+ const csv=normalizeImport('Title,Type,Genres\nArrival,movie,"Drama, Science Fiction"','trace.csv','generic');
+ assert.deepEqual(csv.entries[0].genres,['Drama','Science Fiction']);
 });

@@ -66,4 +66,26 @@ class DescriptionTests(unittest.TestCase):
         show=server.search('tv','a show')['items'][0]
         self.assertEqual(show['description'],'A & B')
 
+class GenreTests(unittest.TestCase):
+    def setUp(self):
+        server.CACHE.clear()
+
+    @patch('server.fetch')
+    def test_movie_claims_resolve_genres_without_guessing_from_description(self, fetch):
+        fetch.side_effect=[{'search':[{'id':'Q1','label':'A Film','description':'2020 film'}]},
+                           {'entities':{'Q1':{'claims':{'P136':[{'mainsnak':{'datavalue':{'value':{'id':'Q9'}}}}]}}}},
+                           {'entities':{'Q9':{'labels':{'en':{'value':'science fiction film'}}}}}]
+        item=server.search('movie','a film')['items'][0]
+        self.assertEqual(item['genres'],['Science Fiction'])
+        self.assertEqual(item['year'],'2020')
+
+    @patch('server.fetch')
+    def test_album_tv_books_use_provider_genres(self, fetch):
+        fetch.return_value={'results':[{'collectionType':'Album','collectionName':'Blue','primaryGenreName':'Folk','collectionId':9}]}
+        self.assertEqual(server.search('album','blue')['items'][0]['genres'],['Folk'])
+        fetch.return_value=[{'show':{'id':7,'name':'The Bear','genres':['Drama','Comedy']}}]
+        self.assertEqual(server.search('tv','bear')['items'][0]['genres'],['Drama','Comedy'])
+        fetch.return_value={'docs':[{'key':'/works/OL9W','title':'Dune','subject':['Science Fiction']}]}
+        self.assertEqual(server.search('book','dune')['items'][0]['genres'],['Science Fiction'])
+
 if __name__=='__main__': unittest.main()

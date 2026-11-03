@@ -2,6 +2,8 @@
 
 A local-first collection of movies, TV, anime, books, **albums**, and personal memories. DVD cases, books, vinyl sleeves, and Polaroids form a responsive shelf. Log an item, keep notes and ratings, browse your diary, or create a Tracewall recap and download it as a PNG.
 
+Development instructions for Codex live in [AGENTS.md](AGENTS.md), adapted from the SWE/global workflow in [ACWArob/claude-md-templates](https://github.com/ACWArob/claude-md-templates). Codex reads this project file using the [official AGENTS.md convention](https://developers.openai.com/codex/guides/agents-md/).
+
 ## Run
 
 Requires Python 3.10+ and a modern browser. No package installation, paid API, or API key is required.
@@ -35,6 +37,10 @@ The initial collection is explicitly a **sample**, kept separate from personal d
 - Other services: download the Trace CSV template and map your export columns. Albums only, with no track import.
 - Preview imports before applying. Matching entries fill missing metadata, preserve existing ratings/notes, combine known diary dates, and advance want → in progress → logged. Similar titles with different known years/creators stay separate. A shelf has one item per work; rewatch dates are retained in backup history, while the diary shows one primary date per item.
 - Trace JSON backup/restore. CSVs are parsed in the browser and are never sent to the local server. Maximum 10 MB per file, 30,000 rows per batch. Very large collections can exceed browser storage; failed writes do not replace in-memory data or report success.
+
+Movies now uses vertically scrolling columns with **DVD cases / Posters** appearance options and batches of 60 items. The choice is saved on this browser. All keeps the mixed horizontal shelves.
+
+Genres are editable on every entry (tags for memories), filterable across the shelf, retained in CSV/JSON import and merge, and shown in title details. Catalog searches return provider genres/subjects when available; **Find cover & genres** lets you choose the correct release before filling metadata. Ratings, notes, and dates are preserved.
 
 ## Real catalogs and import sources
 
@@ -87,3 +93,5 @@ python3 -m py_compile server.py
 2026-11-02 — bookcase previews shrank to their spine slots — keep the revealed cover from shrinking inside its fixed-width shelf position.
 
 2026-11-02 — one profile refresh detached another profile’s error message — retain per-provider errors and render them in the current connection panel.
+
+2026-11-03 — a Letterboxd public feed omitted ratings without diary entries — use the full ratings export for complete imports and leave unknown viewing dates blank.
