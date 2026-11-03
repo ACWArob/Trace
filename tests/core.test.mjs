@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {parseCSV,normalizeImport,mergeEntries,recapEntries,dateOnly,safeUrl,normalizeGenres} from '../core.mjs';
+import {parseCSV,normalizeImport,mergeEntries,recapEntries,dateOnly,safeUrl,normalizeGenres,normalizePublicScores,blendRatings,reviewLinks} from '../core.mjs';
 
 test('CSV preserves quoted commas, newlines, escaped quotes, CRLF and BOM',()=>{
  const rows=parseCSV('\uFEFFTitle,Notes\r\n"A, B","Line one\nShe said ""hello"""\r\n');
@@ -117,4 +117,24 @@ test('Genres normalize bounded arrays and CSV text, and merge without losing per
  assert.deepEqual(original.genres,['Drama']);
  const csv=normalizeImport('Title,Type,Genres\nArrival,movie,"Drama, Science Fiction"','trace.csv','generic');
  assert.deepEqual(csv.entries[0].genres,['Drama','Science Fiction']);
+});
+
+
+test('Trace ratings normalize real scales, weight known vote counts, and count each source once',()=>{
+ const input=[{source:'IMDb',value:8,max:10,count:10000},{source:'Rotten Tomatoes',value:90,max:100,count:null}];
+ assert.equal(blendRatings(input).value,4.2);assert.equal(blendRatings(input).count,2);
+ assert.equal(blendRatings([...input,{source:'Internet Movie Database',value:9,max:10,count:1}]).count,2);
+ assert.equal(blendRatings([{source:'TVmaze',value:8.2,max:10,count:null}]).value,4.1);
+ assert.equal(blendRatings([{source:'Trace',value:4,max:5,count:25}]).value,4);
+ assert.equal(blendRatings([]).value,null);
+ assert.deepEqual(normalizePublicScores([{source:'Missing',value:null,max:5},{source:'Blank',value:'',max:5},{source:'Fake',value:1000,max:10},{source:'Empty',value:0,max:5,count:0},{source:'NaN',value:NaN,max:5}]),[]);
+ assert.equal(input[0].value,8);
+});
+test('External review links use exact IDs when available and label title searches honestly',()=>{
+ const exact=reviewLinks({type:'movie',title:'Moonlight',year:'2016',imdbId:'tt4975722',sourceUrl:'https://letterboxd.com/acwarob/film/moonlight-2016/'});
+ assert.equal(exact[0].url,'https://www.imdb.com/title/tt4975722/reviews/');
+ assert.equal(exact[1].url,'https://letterboxd.com/film/moonlight-2016/reviews/');
+ assert.equal(reviewLinks({type:'book',title:'Dune'} )[0].label,'Find on Goodreads');
+ assert.equal(reviewLinks({type:'book',title:'Dune',source:'goodreads',externalId:'44767458'})[0].url,'https://www.goodreads.com/book/show/44767458');
+ assert.deepEqual(reviewLinks({type:'memory',title:'A Sunday'}),[]);
 });

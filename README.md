@@ -1,68 +1,82 @@
 # Trace
 
-A local-first collection of movies, TV, anime, books, **albums**, and personal memories. DVD cases, books, vinyl sleeves, and Polaroids form a responsive shelf. Log an item, keep notes and ratings, browse your diary, or create a Tracewall recap and download it as a PNG.
+A life, collected. Films in a cinema room, books on wooden shelves, records in a jukebox, and memories on a calendar.
 
-Development instructions for Codex live in [AGENTS.md](AGENTS.md), adapted from the SWE/global workflow in [ACWArob/claude-md-templates](https://github.com/ACWArob/claude-md-templates). Codex reads this project file using the [official AGENTS.md convention](https://developers.openai.com/codex/guides/agents-md/).
+Trace brings your media, notes, ratings, and people into one warm little place. Built with browser JavaScript and Python’s standard library—no install step, API key, or paid service required for the core app.
 
-## Run
+![Trace cinema with DVD columns](assets/screenshots/cinema.png)
 
-Requires Python 3.10+ and a modern browser. No package installation, paid API, or API key is required.
+## Make a little room for everything
+
+- **Your shelf:** movies, TV/anime, books, albums, and personal memories. Movies and TV stay separate; music means albums, not individual songs.
+- **Dedicated spaces:** Cinema with vertically scrolling DVD/poster columns; a TV lounge; a wooden bookcase; a record-wheel jukebox; a memory calendar; and Diary chapters. All keeps the mixed shelves.
+- **Log it your way:** half-star ratings, notes, dates, favorites, For later lists, editable genres, and genre filters. A first tap previews the cover; a second opens details.
+- **Discover:** search real catalogs, choose the right release, and save it to your shelf. Results and attribution are cached in SQLite. Cover/genre enrichment preserves your personal ratings and notes.
+- **Trace rating:** available public scores are normalized to five stars and combined with a transparent, vote-aware weighting. Source values and the formula are visible. Missing scores stay missing, and your personal rating is separate.
+- **Elsewhere:** IMDb, Letterboxd, Goodreads, and other community links on a title. Exact review links are used when IDs are known; otherwise the link is labeled as a search.
+- **Your circle:** profiles, following, a public review feed, likes, comments, spoiler controls, editing, and removal with undo. Reviews publish only when you choose to post; an existing private shelf is never published automatically.
+- **Tracewall:** make a monthly, yearly, or all-time recap and download it as a PNG.
+
+![Sample profiles in Trace Circle](assets/screenshots/circle.png)
+
+![Album jukebox](assets/screenshots/albums.png)
+
+Screenshots use sample titles and clearly labeled test profiles. They do not show a real user’s private notes.
+
+## Run locally
+
+Requires Python 3.10+ and a modern browser.
 
 ```sh
-cd /Users/adamw/Documents/ChatGPT/Trace
+git clone https://github.com/ACWArob/Trace.git
+cd Trace
 python3 server.py 5173
 ```
 
-Open http://localhost:5173. Keep the server running for live catalog search. The server listens only on your computer. The app stores personal entries and compressed uploaded photos in this browser's local storage. Use **Back up my collection** regularly; import the resulting JSON to restore it. Browser storage is specific to the browser and address, so use the same localhost address and port.
+Open [localhost:5173](http://localhost:5173). Keep the server running for catalogs, images, and shared features. There is no package installation or build step.
 
-The initial collection is explicitly a **sample**, kept separate from personal data. Your first log/import starts an empty personal collection containing only what you add. Sample entries are never included in personal backups.
+Your collection and uploaded photos stay in this browser’s local storage. Use the same hostname/port, and **Back up my collection** regularly. Catalog data, accounts, and explicitly published reviews live in `.trace/trace.sqlite3`, which is ignored by Git. Set `TRACE_DATA_DIR` to choose a different server data directory.
 
-## Working features
+This is a local development server bound to `127.0.0.1`. A public multi-user deployment needs hosting, HTTPS, account recovery, and moderation. Publishing this repository does not publish your browser collection or server database.
 
-- In All, each category is a single horizontally scrolling shelf. Books and DVDs start as spines; first click/tap reveals the cover and full name, second opens details. Albums overlap like filed records and expand when selected. Lists/diary rows still open details directly. Reduced-motion preferences disable the selection animation.
-- Movies and TV shows have separate shelves and filters. Anime series belong with TV, anime films with Movies. The sample collection is separate from personal entries.
-- Detail pages show descriptions, a visible five-star rating control, exact half-star options, and For later/Favorites list actions. For later is independent of watched/read status, so saving a completed title to a list does not remove it from the diary. Use the shelf filter to browse For later.
-- Descriptions come from Wikipedia, TVmaze, Kitsu, and a validated, cached Open Library work lookup when available. Descriptions, list membership, and ratings survive backup/restore.
+## Bring your history
 
-- Dedicated rooms: All uses mixed horizontal rails; Books uses a vertical wooden bookcase; Movies uses a cinema screening room; TV has its own lounge; Albums uses a rotating jukebox carousel; Memories uses a month calendar; Diary groups entries into dated chapters.
-- Public profile connections: Letterboxd username or Goodreads profile URL/user ID, with one-way feed import, refresh/unlink, and six-hour refresh on app open. Feeds can omit older/private entries. Letterboxd was live-verified; a Goodreads example feed was blocked during verification, so that connector remains provider-dependent and CSV remains a fallback. No profile is marked linked when its feed fails.
-- Six item types, quick catalog/manual logging, editable details, date, notes, optional 1–5 star ratings, favorites, status, image URLs, photo upload.
-- Memories: photo, date, context, and notes, with up to 12 attached books, albums, films, or shows from your shelf. No star ratings. Attachments retain a small snapshot so backups remain meaningful even when the original item is absent. Existing food/place entries become memories in memory on load; photos, notes, dates, original source, and old rating/type (as legacy metadata) are preserved. The original storage is not rewritten until a successful save.
-- The collection shares one continuous background with wooden ledges: book jackets/spines, DVD cases, records in a wooden rack, and memory Polaroids. The iPhone layout uses bottom tabs, safe-area insets, 16px form inputs, and a memory sheet. Selection has a 170 ms lift and a soft modal reveal; reduced-motion preferences disable movement.
-- Shelf/list views, category/status/favorite filters, search, sort, diary grouped by month. Half-star imported ratings are retained.
-- Tracewall: all-time, yearly, or monthly recap; editable title; three paper colors; select up to 12 completed entries; local PNG download. Images without CORS permission or unavailable images become labeled title cards during export.
-- Letterboxd CSV: diary, ratings, reviews, watched, watchlist, and lists. Extract the ZIP yourself and select multiple CSVs. Ratings and diary dates enrich matching existing entries. `Date` is treated as a viewing date only for diary files; activity dates are not invented watch dates.
-- Goodreads CSV: books, authors, original publication years, ratings, plain-text reviews, ISBN covers, read dates, and exclusive shelf status. Unrated (zero) stays unrated. Blank read dates remain blank.
-- IMDb ratings CSV: title, type, year, directors, and ratings converted from ten to five stars.
-- Other services: download the Trace CSV template and map your export columns. Albums only, with no track import.
-- Preview imports before applying. Matching entries fill missing metadata, preserve existing ratings/notes, combine known diary dates, and advance want → in progress → logged. Similar titles with different known years/creators stay separate. A shelf has one item per work; rewatch dates are retained in backup history, while the diary shows one primary date per item.
-- Trace JSON backup/restore. CSVs are parsed in the browser and are never sent to the local server. Maximum 10 MB per file, 30,000 rows per batch. Very large collections can exceed browser storage; failed writes do not replace in-memory data or report success.
+Link a public Letterboxd/Goodreads profile for available recent feed entries, or import full exports. Public feeds can be unavailable or incomplete.
 
-Movies now uses vertically scrolling columns with **DVD cases / Posters** appearance options and batches of 60 items. The choice is saved on this browser. All keeps the mixed horizontal shelves.
+For **every Letterboxd rating**, export your data, unzip it, and import `ratings.csv` alongside `diary.csv`, `reviews.csv`, `watched.csv`, and `watchlist.csv`. Ratings without diary entries are included and keep unknown watch dates blank. Goodreads library CSV and IMDb ratings CSV are supported too.
 
-Genres are editable on every entry (tags for memories), filterable across the shelf, retained in CSV/JSON import and merge, and shown in title details. Catalog searches return provider genres/subjects when available; **Find cover & genres** lets you choose the correct release before filling metadata. Ratings, notes, and dates are preserved.
+Imports preview before saving, match duplicates, preserve existing ratings/notes, and fill missing details. JSON backup/restore retains genres, attachments, ratings, and known diary history. Maximum 10 MB per file and 30,000 rows per batch.
 
-## Real catalogs and import sources
+Letterboxd exports/public feeds import your reviews with original links. **Two-way Letterboxd publishing is not enabled:** its [official API](https://api-docs.letterboxd.com/) supports writes through OAuth, but [access requires approval](https://letterboxd.com/api-beta/access/). A profile/feed link is read-only. Other communities’ reviews open on their original sites.
 
-Search is explicit (no background bulk enrichment). Fixed provider adapters in `server.py` cache queries for an hour and pace requests. Catalog availability and coverage vary; failures offer manual entry.
+## Catalogs and score sources
 
-- Movies: [Wikidata](https://www.mediawiki.org/wiki/Wikibase/API) title search and [Wikipedia PageImages](https://www.mediawiki.org/wiki/Extension:PageImages#API). Only results described as films are included; coverage and thumbnails vary. Source links are retained.
-- Albums: [Apple Search API](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/index.html)'s **album** entity; individual tracks and collections labeled Single or EP are excluded. Original Apple Music/store links are retained for opening the album.
-- TV: [TVmaze API](https://www.tvmaze.com/api), with source attribution and links. TVmaze data is CC BY-SA; retain attribution and review licensing before production redistribution.
-- Anime: [Kitsu public API](https://kitsu.docs.apiary.io/), with original item links.
-- Books: [Open Library Search API](https://openlibrary.org/dev/docs/api/search) and cover service.
-- [Letterboxd account exports](https://letterboxd.zendesk.com/hc/en-us/articles/15179196880911-Can-I-get-a-copy-of-my-account-data), [Goodreads export page](https://www.goodreads.com/review/import).
+The catalog grows through searches; it does not claim to contain every title locally. Fixed provider adapters are attributed, cached, and paced. Core providers are [Wikidata/Wikipedia](https://www.wikidata.org/), [TVmaze](https://www.tvmaze.com/api), [Kitsu](https://kitsu.docs.apiary.io/), [Open Library](https://openlibrary.org/dev/docs/api/search), and [Apple album search](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/index.html). TVmaze data is CC BY-SA; retain its links and attribution.
 
-This version uses public feeds and user-provided exports, without service-account login. It has no Trace sign-in accounts, cloud persistence, or social feed. Profile connections use read-only public RSS, not authenticated provider accounts. A hosted multi-user version needs authentication, a database, storage, and production provider agreements/limits. These updates have not been committed or published.
+Public scores currently come from TVmaze, Kitsu, Open Library, eligible IMDb records, and published Trace ratings. Availability varies by title; Goodreads and Letterboxd aggregate scores are not supplied by public profile feeds. Optional `OMDB_API_KEY` enables additional IMDb, Rotten Tomatoes, and Metacritic values via OMDb; the key stays on the server. No key is bundled.
 
-## Verification
+For personal/non-commercial IMDb scores, run:
+
+```sh
+python3 ratings.py --import-imdb
+```
+
+This streams IMDb’s [official ratings dataset](https://developer.imdb.com/non-commercial-datasets/) into the ignored local database. IMDb permits personal/non-commercial copies under its terms; the data is not bundled or redistributed by this repository. Review provider licensing before commercial deployment. OMDb content is [CC BY-NC 4.0](https://www.omdbapi.com/). See [asset provenance](assets/sources.json) for sample covers and photos.
+
+## Development
+
+Codex guidance lives in [AGENTS.md](AGENTS.md), adapted from [ACWArob’s SWE/global templates](https://github.com/ACWArob/claude-md-templates) using the [official Codex convention](https://developers.openai.com/codex/guides/agents-md/).
 
 ```sh
 node --test tests/core.test.mjs tests/views.test.mjs
 python3 -m unittest discover -s tests -p 'test_*.py'
 node --input-type=module --check < app.js
-python3 -m py_compile server.py
+node --input-type=module --check < social.js
+python3 -m py_compile server.py social.py catalog_store.py ratings.py
+git diff --check
 ```
+
+Tests use temporary databases. Browser test accounts and sample reviews are isolated from the real collection. Passwords are scrypt-hashed; sessions use HttpOnly cookies and hashed tokens; writes enforce same-origin and CSRF checks. Database files, exports, passwords, and API keys must never be committed.
 
 ## Lessons
 

@@ -61,3 +61,6 @@ No installation or build step. Prefer the affected test file over the whole suit
 - 2026-11-03 — large movie collections made horizontal browsing tedious — use
   vertical columns with bounded rendering and retain separate DVD/poster choices.
 - 2026-11-03 — metadata selection looked available for unsaved samples — show it only for personal entries; an explicit cover choice may replace the previous cover.
+- 2026-11-03 — movie columns displaced the loved cinema view — retain the screen above columns and keep the TV room and mixed All shelf.
+- 2026-11-03 — Discover seeded a today date for unexperienced titles — want entries start undated; metadata updates retain available public scores and canceled composers clear their intent.
+- 2026-11-03 — malformed review types raised a handler error — validate JSON value types before set membership and return a bounded 400 response.

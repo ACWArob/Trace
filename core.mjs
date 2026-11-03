@@ -117,8 +117,9 @@ export function mergeEntries(existing,incoming) {
     const old=direct||(titles.get(titleKey(item))||[]).find(x=>sameItem(x,item));
     if(!old) { const addedItem={...item,history:[...(item.history||[])]};entries.push(addedItem);index(addedItem);added++;continue; }
     let changed=false;
-    for(const key of ['creator','year','date','rating','notes','description','image','sourceUrl','externalId','metadataSource','metadataSourceUrl']) if(!old[key] && item[key]) {old[key]=item[key]; changed=true;}
+    for(const key of ['creator','year','date','rating','notes','description','image','sourceUrl','externalId','metadataSource','metadataSourceUrl','imdbId']) if(!old[key] && item[key]) {old[key]=item[key]; changed=true;}
     const genres=normalizeGenres([...normalizeGenres(old.genres),...normalizeGenres(item.genres)]);if(JSON.stringify(genres)!==JSON.stringify(old.genres||[])){old.genres=genres;changed=true;}
+    if(!old.publicScores?.length&&item.publicScores?.length){old.publicScores=normalizePublicScores(item.publicScores);changed=true;}
     if(item.forLater&&!old.forLater){old.forLater=true;changed=true;}
     if(item.favorite && !old.favorite) {old.favorite=true;changed=true;}
     const ranks={want:0,progress:1,done:2}; if(ranks[item.status]>ranks[old.status]) {old.status=item.status;changed=true;}
@@ -131,4 +132,34 @@ export function mergeEntries(existing,incoming) {
 }
 export function recapEntries(entries,period) {
   return entries.filter(x=>x.status==='done' && (period==='all' || (x.date && x.date.startsWith(period))));
+}
+
+export function reviewLinks(item) {
+ const query=encodeURIComponent([item.title,item.type==='book'||item.type==='album'?item.creator:item.year].filter(Boolean).join(' '));
+ if(['movie','tv','anime'].includes(item.type)){
+  const imdb=/^tt\d{5,12}$/.test(item.imdbId||'')?item.imdbId:item.source?.toLowerCase()==='imdb'&&/^tt\d{5,12}$/.test(item.externalId||'')?item.externalId:'';
+  const links=[{label:imdb?'IMDb reviews':'Find on IMDb',url:imdb?`https://www.imdb.com/title/${imdb}/reviews/`:`https://www.imdb.com/find/?q=${query}&s=tt`}];
+  if(item.type==='movie'){
+   const match=String(item.sourceUrl||'').match(/^https:\/\/(?:www\.)?letterboxd\.com\/(?:[A-Za-z0-9_-]+\/)?film\/([a-z0-9-]+)\//i);
+   links.push({label:match?'Letterboxd reviews':'Find on Letterboxd',url:match?`https://letterboxd.com/film/${match[1]}/reviews/`:`https://letterboxd.com/search/films/${encodeURIComponent(item.title)}/`});
+  }
+  links.push({label:'Find on Rotten Tomatoes',url:`https://www.rottentomatoes.com/search?search=${query}`});return links;
+ }
+ if(item.type==='book'){
+  const known=item.source?.toLowerCase()==='goodreads'&&/^\d+$/.test(item.externalId||'');
+  return [{label:known?'Goodreads reviews':'Find on Goodreads',url:known?`https://www.goodreads.com/book/show/${item.externalId}`:`https://www.goodreads.com/search?q=${query}`},{label:'Open Library',url:/^\/works\/OL\d+W$/.test(item.externalId||'')?`https://openlibrary.org${item.externalId}`:`https://openlibrary.org/search?q=${query}`}];
+ }
+ if(item.type==='album')return [{label:'Find on MusicBrainz',url:`https://musicbrainz.org/search?query=${query}&type=release_group&method=indexed`},{label:'Find on Last.fm',url:`https://www.last.fm/search/albums?q=${query}`}];
+ return [];
+}
+
+export function normalizePublicScores(input) {
+ if(!Array.isArray(input))return [];
+ const seen=new Set();return input.flatMap(row=>{if(!row||typeof row.source!=='string'||row.value===null||row.value===undefined||row.value===''||row.max===null||row.max===undefined||row.max==='')return [];let source=row.source.trim().slice(0,60);if(source.toLowerCase()==='internet movie database')source='IMDb';const key=source.toLowerCase();const value=Number(row.value),max=Number(row.max);const count=row.count===undefined||row.count===null||row.count===''?null:Number(row.count);if(!source||seen.has(key)||!Number.isFinite(value)||!Number.isFinite(max)||max<=0||max>100||value<0||value>max||count!==null&&(!Number.isFinite(count)||count<=0))return [];seen.add(key);return [{source,value,max,count:count===null?null:Math.floor(count),url:safeUrl(row.url||''),via:String(row.via||'').slice(0,60)}];}).slice(0,8);
+}
+export function blendRatings(input) {
+ const sources=normalizePublicScores(input).map(row=>({...row,five:row.value/row.max*5,weight:row.count===null?.5:Math.max(.2,Math.min(1,Math.log10(row.count+1)/4))}));
+ if(!sources.length)return {value:null,sources:[],count:0};
+ const total=sources.reduce((n,x)=>n+x.five*x.weight,0),weight=sources.reduce((n,x)=>n+x.weight,0);
+ return {value:Math.round(total/weight*10)/10,sources,count:sources.length};
 }

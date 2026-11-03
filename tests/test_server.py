@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 from unittest.mock import patch
 import sys
 from pathlib import Path
@@ -8,6 +9,9 @@ import server
 class SearchTests(unittest.TestCase):
     def setUp(self):
         server.CACHE.clear()
+        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
+        for name, store in [('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore),('SOCIAL_STORE',server.SocialStore)]:
+            patcher=patch.object(server,name,store(Path(directory.name)/'test.sqlite3'));patcher.start();self.addCleanup(patcher.stop)
 
     @patch('server.fetch')
     def test_album_adapter_rejects_tracks_and_keeps_source(self, fetch):
@@ -40,6 +44,9 @@ class SearchTests(unittest.TestCase):
 class DescriptionTests(unittest.TestCase):
     def setUp(self):
         server.CACHE.clear()
+        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
+        for name, store in [('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore),('SOCIAL_STORE',server.SocialStore)]:
+            patcher=patch.object(server,name,store(Path(directory.name)/'test.sqlite3'));patcher.start();self.addCleanup(patcher.stop)
 
     @patch('server.fetch')
     def test_openlibrary_description_formats_and_cache(self, fetch):
@@ -69,6 +76,9 @@ class DescriptionTests(unittest.TestCase):
 class GenreTests(unittest.TestCase):
     def setUp(self):
         server.CACHE.clear()
+        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
+        for name, store in [('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore),('SOCIAL_STORE',server.SocialStore)]:
+            patcher=patch.object(server,name,store(Path(directory.name)/'test.sqlite3'));patcher.start();self.addCleanup(patcher.stop)
 
     @patch('server.fetch')
     def test_movie_claims_resolve_genres_without_guessing_from_description(self, fetch):
