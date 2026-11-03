@@ -37,4 +37,33 @@ class SearchTests(unittest.TestCase):
         self.assertNotIn('place',server.PROVIDERS)
         self.assertNotIn('restaurant',server.PROVIDERS)
 
+class DescriptionTests(unittest.TestCase):
+    def setUp(self):
+        server.CACHE.clear()
+
+    @patch('server.fetch')
+    def test_openlibrary_description_formats_and_cache(self, fetch):
+        fetch.return_value={'description':{'type':'/type/text','value':'A book description.'}}
+        self.assertEqual(server.book_description('/works/OL123W')['description'],'A book description.')
+        server.book_description('/works/OL123W')
+        self.assertEqual(fetch.call_count,1)
+        fetch.return_value={'description':'A second description.'}
+        self.assertEqual(server.book_description('/works/OL124W')['description'],'A second description.')
+
+    @patch('server.fetch')
+    def test_description_rejects_external_urls_and_paths(self, fetch):
+        for value in ['https://example.org', '/works/../../secret', '/works/OL123W?redirect=bad']:
+            with self.assertRaises(ValueError): server.book_description(value)
+        fetch.assert_not_called()
+
+    @patch('server.fetch')
+    def test_anime_films_are_movies_and_shows_keep_synopsis(self, fetch):
+        fetch.return_value={'data':[{'id':'1','attributes':{'canonicalTitle':'An Anime Film','subtype':'movie','synopsis':'A film description.'}}]}
+        movie=server.search('anime','a film')['items'][0]
+        self.assertEqual(movie['type'],'movie')
+        self.assertEqual(movie['description'],'A film description.')
+        fetch.return_value=[{'show':{'id':2,'name':'A Show','summary':'<p>A &amp; B</p>'}}]
+        show=server.search('tv','a show')['items'][0]
+        self.assertEqual(show['description'],'A & B')
+
 if __name__=='__main__': unittest.main()

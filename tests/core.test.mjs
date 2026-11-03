@@ -98,3 +98,9 @@ test('A renamed memory matches its older backup by ID and keeps the current titl
  const old={...current,title:'A good afternoon',notes:'An older note.'};
  const result=mergeEntries([current],[old]);assert.equal(result.entries.length,1);assert.equal(result.added,0);assert.equal(result.entries[0].title,current.title);assert.equal(result.entries[0].notes,current.notes);
 });
+
+test('For later membership and descriptions merge without changing a completed entry',()=>{
+ const old={id:'logged-film',type:'movie',title:'Arrival',year:'2016',status:'done',date:'2026-10-10',rating:4.5,notes:'My review',history:['2026-10-10']};
+ const incoming={...old,id:'other-id',status:'want',date:'',rating:0,forLater:true,description:'A linguist communicates with extraterrestrial visitors.'};
+ const result=mergeEntries([old],[incoming]);assert.equal(result.entries.length,1);const item=result.entries[0];assert.equal(item.forLater,true);assert.equal(item.status,'done');assert.equal(item.rating,4.5);assert.equal(item.date,old.date);assert.equal(item.notes,old.notes);assert.equal(item.description,incoming.description);
+});

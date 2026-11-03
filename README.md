@@ -17,9 +17,16 @@ The initial collection is explicitly a **sample**, kept separate from personal d
 
 ## Working features
 
-- Six categories, quick catalog/manual logging, editable details, date, notes, optional 1–5 star ratings, favorites, status, image URLs, photo upload.
+- In All, each category is a single horizontally scrolling shelf. Books and DVDs start as spines; first click/tap reveals the cover and full name, second opens details. Albums overlap like filed records and expand when selected. Lists/diary rows still open details directly. Reduced-motion preferences disable the selection animation.
+- Movies and TV shows have separate shelves and filters. Anime series belong with TV, anime films with Movies. The sample collection is separate from personal entries.
+- Detail pages show descriptions, a visible five-star rating control, exact half-star options, and For later/Favorites list actions. For later is independent of watched/read status, so saving a completed title to a list does not remove it from the diary. Use the shelf filter to browse For later.
+- Descriptions come from Wikipedia, TVmaze, Kitsu, and a validated, cached Open Library work lookup when available. Descriptions, list membership, and ratings survive backup/restore.
+
+- Dedicated rooms: All uses mixed horizontal rails; Books uses a vertical wooden bookcase; Movies uses a cinema screening room; TV has its own lounge; Albums uses a rotating jukebox carousel; Memories uses a month calendar; Diary groups entries into dated chapters.
+- Public profile connections: Letterboxd username or Goodreads profile URL/user ID, with one-way feed import, refresh/unlink, and six-hour refresh on app open. Feeds can omit older/private entries. Letterboxd was live-verified; a Goodreads example feed was blocked during verification, so that connector remains provider-dependent and CSV remains a fallback. No profile is marked linked when its feed fails.
+- Six item types, quick catalog/manual logging, editable details, date, notes, optional 1–5 star ratings, favorites, status, image URLs, photo upload.
 - Memories: photo, date, context, and notes, with up to 12 attached books, albums, films, or shows from your shelf. No star ratings. Attachments retain a small snapshot so backups remain meaningful even when the original item is absent. Existing food/place entries become memories in memory on load; photos, notes, dates, original source, and old rating/type (as legacy metadata) are preserved. The original storage is not rewritten until a successful save.
-- The collection shares one continuous background with wooden ledges: book jackets/spines, DVD cases, records in a wooden rack, and memory Polaroids. Desktop groups books and DVDs side by side when space allows. The iPhone layout uses bottom tabs, safe-area insets, 16px form inputs, and a memory sheet. Selection has a 170 ms lift and a soft modal reveal; reduced-motion preferences disable movement.
+- The collection shares one continuous background with wooden ledges: book jackets/spines, DVD cases, records in a wooden rack, and memory Polaroids. The iPhone layout uses bottom tabs, safe-area insets, 16px form inputs, and a memory sheet. Selection has a 170 ms lift and a soft modal reveal; reduced-motion preferences disable movement.
 - Shelf/list views, category/status/favorite filters, search, sort, diary grouped by month. Half-star imported ratings are retained.
 - Tracewall: all-time, yearly, or monthly recap; editable title; three paper colors; select up to 12 completed entries; local PNG download. Images without CORS permission or unavailable images become labeled title cards during export.
 - Letterboxd CSV: diary, ratings, reviews, watched, watchlist, and lists. Extract the ZIP yourself and select multiple CSVs. Ratings and diary dates enrich matching existing entries. `Date` is treated as a viewing date only for diary files; activity dates are not invented watch dates.
@@ -40,12 +47,12 @@ Search is explicit (no background bulk enrichment). Fixed provider adapters in `
 - Books: [Open Library Search API](https://openlibrary.org/dev/docs/api/search) and cover service.
 - [Letterboxd account exports](https://letterboxd.zendesk.com/hc/en-us/articles/15179196880911-Can-I-get-a-copy-of-my-account-data), [Goodreads export page](https://www.goodreads.com/review/import).
 
-This version uses user-provided exports, not scraping or service-account login. It has no accounts, automatic sync, cloud persistence, or social feed. A hosted multi-user version needs authentication, a database, storage, and production provider agreements/limits. No data has been published or committed.
+This version uses public feeds and user-provided exports, without service-account login. It has no Trace sign-in accounts, cloud persistence, or social feed. Profile connections use read-only public RSS, not authenticated provider accounts. A hosted multi-user version needs authentication, a database, storage, and production provider agreements/limits. These updates have not been committed or published.
 
 ## Verification
 
 ```sh
-node --test tests/core.test.mjs
+node --test tests/core.test.mjs tests/views.test.mjs
 python3 -m unittest discover -s tests -p 'test_*.py'
 node --input-type=module --check < app.js
 python3 -m py_compile server.py
@@ -66,3 +73,17 @@ python3 -m py_compile server.py
 2026-11-02 — the framed wood cabinet felt disconnected from the app — use one continuous room background, restrained ledges, readable labels, and shared native-style controls; avoid decorative slogans.
 
 2026-11-02 — a backdrop-filtered sidebar trapped fixed mobile navigation at the top — clear ancestor filters before anchoring navigation to the viewport.
+
+2026-11-02 — shelf rendering split categories into extra rows — render every category once inside a horizontally scrollable rail; keep the ledge stationary.
+
+2026-11-02 — cover selection opened the editor too early — keep spine selection, cover preview, and entry details as two explicit steps, with ratings visible in details.
+
+2026-11-02 — generic category pages lost their individual character — keep All mixed while Books, Cinema, TV, Albums, Memories, and Diary use their own collection views.
+
+2026-11-02 — a preview could stay selected after filters changed — clear selection on view, category, status, search, or route changes.
+
+2026-11-02 — adjacent-month calendar dates reset when selected — move the displayed month with the selected day.
+
+2026-11-02 — bookcase previews shrank to their spine slots — keep the revealed cover from shrinking inside its fixed-width shelf position.
+
+2026-11-02 — one profile refresh detached another profile’s error message — retain per-provider errors and render them in the current connection panel.

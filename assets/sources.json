@@ -88,5 +88,115 @@
     "url": "https://upload.wikimedia.org/wikipedia/en/d/db/Spirited_Away_Japanese_poster.png",
     "source": "Wikipedia",
     "sourceUrl": "https://en.wikipedia.org/wiki/Spirited_Away"
+  },
+  "dune-book": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780441172719-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780441172719"
+  },
+  "normal-people": {
+    "url": "https://covers.openlibrary.org/b/isbn/9781984822178-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9781984822178"
+  },
+  "bell-jar": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780060837020-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780060837020"
+  },
+  "little-prince": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780156012195-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780156012195"
+  },
+  "arrival": {
+    "url": "https://upload.wikimedia.org/wikipedia/en/d/df/Arrival%2C_Movie_Poster.jpg?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail_unscaled",
+    "source": "Wikipedia",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Arrival_(film)"
+  },
+  "moonlight": {
+    "url": "https://upload.wikimedia.org/wikipedia/en/8/84/Moonlight_%282016_film%29.png?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail_unscaled",
+    "source": "Wikipedia",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Moonlight_(2016_film)"
+  },
+  "amelie": {
+    "url": "https://upload.wikimedia.org/wikipedia/en/5/53/Amelie_poster.jpg?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail_unscaled",
+    "source": "Wikipedia",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Amélie"
+  },
+  "abbey-road": {
+    "url": "https://thumb.wikimedia.org/wikipedia/commons/thumb/a/a4/The_Beatles_Abbey_Road_album_cover.jpg/500px-The_Beatles_Abbey_Road_album_cover.jpg?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail",
+    "source": "Wikipedia",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Abbey_Road"
+  },
+  "blue": {
+    "url": "https://upload.wikimedia.org/wikipedia/en/e/e1/Bluealbumcover.jpg?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail_unscaled",
+    "source": "Wikipedia",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Blue_(Joni_Mitchell_album)"
+  },
+  "severance": {
+    "url": "https://static.tvmaze.com/uploads/images/medium_portrait/548/1371406.jpg",
+    "source": "TVmaze",
+    "sourceUrl": "https://www.tvmaze.com/shows/44933/severance"
+  },
+  "fleabag": {
+    "url": "https://static.tvmaze.com/uploads/images/medium_portrait/192/482341.jpg",
+    "source": "TVmaze",
+    "sourceUrl": "https://www.tvmaze.com/shows/16149/fleabag"
+  },
+  "breaking-bad": {
+    "url": "https://static.tvmaze.com/uploads/images/medium_portrait/501/1253519.jpg",
+    "source": "TVmaze",
+    "sourceUrl": "https://www.tvmaze.com/shows/169/breaking-bad"
+  },
+  "evangelion": {
+    "url": "https://static.tvmaze.com/uploads/images/medium_portrait/11/27792.jpg",
+    "source": "TVmaze",
+    "sourceUrl": "https://www.tvmaze.com/shows/1925/neon-genesis-evangelion"
+  },
+  "melodrama": {
+    "url": "https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/58/11/b1/5811b172-e180-25a6-69e6-4385fbbfb5dc/17UM1IM02207.rgb.jpg/600x600bb.jpg",
+    "source": "Apple Music",
+    "sourceUrl": "https://music.apple.com/us/album/melodrama/1428764777?uo=4"
+  },
+  "stranger": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780679720201-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780679720201"
+  },
+  "1984": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780451524935-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780451524935"
+  },
+  "secret-history": {
+    "url": "https://covers.openlibrary.org/b/isbn/9781400031702-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9781400031702"
+  },
+  "alchemist": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780061122415-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780061122415"
+  },
+  "hobbit": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780547928227-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780547928227"
+  },
+  "kitchen": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780802142443-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780802142443"
+  },
+  "midnight-library": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780525559474-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780525559474"
+  },
+  "catcher": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780316769488-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780316769488"
   }
 }

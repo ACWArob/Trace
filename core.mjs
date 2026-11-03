@@ -112,7 +112,8 @@ export function mergeEntries(existing,incoming) {
     const old=direct||(titles.get(titleKey(item))||[]).find(x=>sameItem(x,item));
     if(!old) { const addedItem={...item,history:[...(item.history||[])]};entries.push(addedItem);index(addedItem);added++;continue; }
     let changed=false;
-    for(const key of ['creator','year','date','rating','notes','image','sourceUrl','externalId']) if(!old[key] && item[key]) {old[key]=item[key]; changed=true;}
+    for(const key of ['creator','year','date','rating','notes','description','image','sourceUrl','externalId']) if(!old[key] && item[key]) {old[key]=item[key]; changed=true;}
+    if(item.forLater&&!old.forLater){old.forLater=true;changed=true;}
     if(item.favorite && !old.favorite) {old.favorite=true;changed=true;}
     const ranks={want:0,progress:1,done:2}; if(ranks[item.status]>ranks[old.status]) {old.status=item.status;changed=true;}
     if(old.type==='memory'){const combined=normalizeAttachments([...(old.attachments||[]),...(item.attachments||[])]);if(JSON.stringify(combined)!==JSON.stringify(old.attachments||[])){old.attachments=combined;changed=true;}}

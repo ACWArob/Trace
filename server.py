@@ -6,10 +6,12 @@ from urllib.error import HTTPError, URLError
 from pathlib import Path
 import json
 import re
+import html
 import sys
 import time
 import threading
 import ssl
+from profile_feeds import read_profile_feed, FeedUnavailable
 
 ROOT = Path(__file__).resolve().parent
 CACHE = {}
@@ -54,12 +56,14 @@ def search(kind, query):
             titles = [x.get('sitelinks', {}).get('enwiki', {}).get('title', '') for x in entities.values()]
             titles = [x for x in titles if x]
             images = {}
+            descriptions = {}
             if titles:
                 try:
                     pages = fetch('https://en.wikipedia.org/w/api.php?' + urlencode({
-                        'action': 'query', 'format': 'json', 'titles': '|'.join(titles), 'prop': 'pageimages',
+                        'action': 'query', 'format': 'json', 'titles': '|'.join(titles), 'prop': 'pageimages|extracts', 'exintro': 1, 'explaintext': 1, 'exsentences': 5,
                         'piprop': 'thumbnail', 'pithumbsize': 500, 'pilicense': 'any'}), 'wikipedia').get('query', {}).get('pages', {})
                     images = {x['title']: x.get('thumbnail', {}).get('source', '') for x in pages.values()}
+                    descriptions = {x['title']: x.get('extract', '') for x in pages.values()}
                 except (HTTPError, URLError, TimeoutError, ValueError, OSError):
                     pass  # A cover outage must not prevent logging a found film.
             for hit in hits:
@@ -70,7 +74,7 @@ def search(kind, query):
                 director = re.search(r'(?:directed by|film by) (.+)$', description)
                 items.append({'title': hit.get('label', ''), 'creator': director.group(1) if director else '',
                               'year': year_match.group(0) if year_match else '', 'type': 'movie',
-                              'image': images.get(wiki_title, ''), 'source': provider,
+                              'image': images.get(wiki_title, ''), 'description': descriptions.get(wiki_title, '') or description, 'source': provider,
                               'sourceUrl': 'https://www.wikidata.org/wiki/' + hit['id'], 'externalId': hit['id']})
     elif kind == 'album':
         args = {'term': query, 'entity': 'album', 'media': 'music', 'limit': 30, 'country': 'US'}
@@ -83,7 +87,7 @@ def search(kind, query):
             items.append({'title': title, 'creator': row.get('artistName', ''), 'year': row.get('releaseDate', '')[:4],
                           'type': kind, 'image': row.get('artworkUrl100', '').replace('100x100bb', '600x600bb'),
                           'source': provider, 'sourceUrl': row.get('collectionViewUrl', ''),
-                          'externalId': str(row.get('collectionId', ''))})
+                          'externalId': str(row.get('collectionId', '')), 'description': f"{title} is an album by {row.get('artistName', 'an unknown artist')}." + (f" Released in {row['releaseDate'][:4]}." if row.get('releaseDate') else '')})
     elif kind == 'tv':
         data = fetch('https://api.tvmaze.com/search/shows?' + urlencode({'q': query}), 'tvmaze')
         for result in data[:16]:
@@ -91,16 +95,16 @@ def search(kind, query):
             items.append({'title': row['name'], 'creator': (row.get('network') or row.get('webChannel') or {}).get('name', ''),
                           'year': (row.get('premiered') or '')[:4], 'type': kind,
                           'image': (row.get('image') or {}).get('medium', ''), 'source': provider,
-                          'sourceUrl': row.get('url', ''), 'externalId': str(row['id'])})
+                          'sourceUrl': row.get('url', ''), 'externalId': str(row['id']), 'description': html.unescape(re.sub(r'<[^>]*>', '', row.get('summary') or ''))})
     elif kind == 'anime':
         data = fetch('https://kitsu.io/api/edge/anime?' + urlencode({'filter[text]': query, 'page[limit]': 16}), 'kitsu')
         for row in data.get('data', []):
             attr = row.get('attributes', {})
             items.append({'title': attr.get('titles', {}).get('en') or attr.get('canonicalTitle', ''),
-                          'creator': '', 'year': (attr.get('startDate') or '')[:4], 'type': kind,
+                          'creator': '', 'year': (attr.get('startDate') or '')[:4], 'type': 'movie' if attr.get('subtype') == 'movie' else kind,
                           'image': (attr.get('posterImage') or {}).get('medium', ''),
                           'source': provider, 'sourceUrl': 'https://kitsu.app/anime/' + str(row['id']),
-                          'externalId': str(row['id'])})
+                          'externalId': str(row['id']), 'description': attr.get('synopsis') or ''})
     elif kind == 'book':
         data = fetch('https://openlibrary.org/search.json?' + urlencode({'q': query, 'limit': 16,
                      'fields': 'key,title,author_name,first_publish_year,cover_i'}), 'openlibrary')
@@ -115,12 +119,56 @@ def search(kind, query):
     return result
 
 
+def book_description(book_id):
+    if not re.fullmatch(r'/works/OL\d+W', book_id):
+        raise ValueError('Invalid book ID')
+    key = ('book-description', book_id)
+    if key in CACHE and time.time() - CACHE[key][0] < 3600:
+        return CACHE[key][1]
+    data = fetch('https://openlibrary.org' + book_id + '.json', 'openlibrary')
+    description = data.get('description', '')
+    if isinstance(description, dict):
+        description = description.get('value', '')
+    result = {'description': str(description or '')[:20000]}
+    CACHE[key] = (time.time(), result)
+    return result
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
+    def do_POST(self):
+        if urlparse(self.path).path != '/api/profile-connect':
+            return self.send_json({'error': 'Unknown endpoint.'}, 404)
+        try:
+            length = int(self.headers.get('Content-Length', '0'))
+            if not 0 < length <= 2048 or 'application/json' not in self.headers.get('Content-Type', ''):
+                return self.send_json({'error': 'Enter a profile URL.'}, 400)
+            payload = json.loads(self.rfile.read(length))
+            service = payload.get('service', '')
+            profile = payload.get('profile', '')
+            key = ('profile', str(service), str(profile))
+            if key in CACHE and time.time() - CACHE[key][0] < 300:
+                return self.send_json(CACHE[key][1])
+            result = read_profile_feed(service, profile, TLS_CONTEXT)
+            CACHE[key] = (time.time(), result)
+            return self.send_json(result)
+        except (ValueError, TypeError, AttributeError):
+            return self.send_json({'error': 'Use a Letterboxd member profile or a Goodreads member profile URL.'}, 400)
+        except (FeedUnavailable, HTTPError, URLError, TimeoutError, OSError):
+            return self.send_json({'error': 'This public profile feed is unavailable. Check that the profile is public, try again later, or import its CSV export.'}, 502)
+
     def do_GET(self):
         parsed = urlparse(self.path)
+        if parsed.path == '/api/book-description':
+            book_id = parse_qs(parsed.query).get('id', [''])[0]
+            if not re.fullmatch(r'/works/OL\d+W', book_id):
+                return self.send_json({'error': 'Invalid book ID.'}, 400)
+            try:
+                return self.send_json(book_description(book_id))
+            except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+                return self.send_json({'error': 'Description unavailable.'}, 502)
         if parsed.path == '/api/search':
             params = parse_qs(parsed.query)
             kind = params.get('type', ['book'])[0]
@@ -133,7 +181,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({'error': f'{PROVIDERS[kind]} is unavailable right now. Try again or add it manually.'}, 502)
         # Serve only app assets; never expose repository metadata or source/test files.
         clean = parsed.path
-        if clean not in ('/', '/index.html', '/styles.css', '/app.js', '/core.mjs', '/data.js') and not re.fullmatch(r'/assets/[\w.-]+', clean):
+        if clean not in ('/', '/index.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs') and not re.fullmatch(r'/assets/[\w.-]+', clean):
             return self.send_error(404)
         return super().do_GET()
 
