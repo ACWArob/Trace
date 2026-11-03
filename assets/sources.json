@@ -1,0 +1,92 @@
+{
+  "in-rainbows": {
+    "url": "https://is1-ssl.mzstatic.com/image/thumb/Music126/v4/dd/50/c7/dd50c790-99ac-d3d0-5ab8-e3891fb8fd52/634904032463.png/600x600bb.jpg",
+    "source": "Apple Music",
+    "sourceUrl": "https://music.apple.com/us/album/in-rainbows/1109714933?uo=4"
+  },
+  "blonde": {
+    "url": "https://en.wikipedia.org/wiki/Blonde_(Frank_Ocean_album)",
+    "source": "Wikipedia",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Blonde_(Frank_Ocean_album)"
+  },
+  "rumours": {
+    "url": "https://is1-ssl.mzstatic.com/image/thumb/Music124/v4/4d/13/ba/4d13bac3-d3d5-7581-2c74-034219eadf2b/081227970949.jpg/600x600bb.jpg",
+    "source": "Apple Music",
+    "sourceUrl": "https://music.apple.com/us/album/rumours/594061854?uo=4"
+  },
+  "the-bear": {
+    "url": "https://static.tvmaze.com/uploads/images/medium_portrait/629/1574642.jpg",
+    "source": "TVmaze",
+    "sourceUrl": "https://www.tvmaze.com/shows/54198/the-bear"
+  },
+  "norwegian-wood": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780375704024-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780375704024"
+  },
+  "just-kids": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780060936228-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780060936228"
+  },
+  "creative-act": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780593652886-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780593652886"
+  },
+  "crying-hmart": {
+    "url": "https://covers.openlibrary.org/b/isbn/9780525657743-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/isbn/9780525657743"
+  },
+  "cafe": {
+    "url": "https://images.unsplash.com/photo-1554118811-1e0d58224f24?w=550&h=650&fit=crop&auto=format&q=85",
+    "source": "Unsplash illustrative sample photo",
+    "sourceUrl": "https://images.unsplash.com/photo-1554118811-1e0d58224f24"
+  },
+  "kyoto": {
+    "url": "https://images.unsplash.com/photo-1493976040374-85c8e12f0c0e?w=550&h=650&fit=crop&auto=format&q=85",
+    "source": "Unsplash illustrative sample photo",
+    "sourceUrl": "https://images.unsplash.com/photo-1493976040374-85c8e12f0c0e"
+  },
+  "museum": {
+    "url": "https://images.unsplash.com/photo-1561214115-f2f134cc4912?w=550&h=650&fit=crop&auto=format&q=85",
+    "source": "Unsplash illustrative sample photo",
+    "sourceUrl": "https://images.unsplash.com/photo-1561214115-f2f134cc4912"
+  },
+  "coffee": {
+    "url": "https://images.unsplash.com/photo-1445116572660-236099ec97a0?w=550&h=650&fit=crop&auto=format&q=85",
+    "source": "Unsplash illustrative sample photo",
+    "sourceUrl": "https://images.unsplash.com/photo-1445116572660-236099ec97a0"
+  },
+  "coast": {
+    "url": "https://images.unsplash.com/photo-1518837695005-2083093ee35b?w=550&h=650&fit=crop&auto=format&q=85",
+    "source": "Unsplash illustrative sample photo",
+    "sourceUrl": "https://images.unsplash.com/photo-1518837695005-2083093ee35b"
+  },
+  "grand-budapest": {
+    "url": "https://image.tmdb.org/t/p/w500/eWdyYQreja6JGCzqHWXpWHDrrPo.jpg",
+    "source": "TMDB",
+    "sourceUrl": "https://www.themoviedb.org/movie/120467"
+  },
+  "cowboy-bebop": {
+    "url": "https://static.tvmaze.com/uploads/images/original_untouched/178/446548.jpg",
+    "source": "TVmaze",
+    "sourceUrl": "https://www.tvmaze.com/shows/4147/cowboy-bebop"
+  },
+  "perfect-days": {
+    "url": "https://upload.wikimedia.org/wikipedia/en/c/c9/Perfect_Days_poster.jpg",
+    "source": "Wikipedia",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Perfect_Days"
+  },
+  "past-lives": {
+    "url": "https://upload.wikimedia.org/wikipedia/en/d/da/Past_Lives_film_poster.png",
+    "source": "Wikipedia",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Past_Lives_(film)"
+  },
+  "spirited-away": {
+    "url": "https://upload.wikimedia.org/wikipedia/en/d/db/Spirited_Away_Japanese_poster.png",
+    "source": "Wikipedia",
+    "sourceUrl": "https://en.wikipedia.org/wiki/Spirited_Away"
+  }
+}
