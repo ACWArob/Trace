@@ -64,3 +64,9 @@ No installation or build step. Prefer the affected test file over the whole suit
 - 2026-11-03 — movie columns displaced the loved cinema view — retain the screen above columns and keep the TV room and mixed All shelf.
 - 2026-11-03 — Discover seeded a today date for unexperienced titles — want entries start undated; metadata updates retain available public scores and canceled composers clear their intent.
 - 2026-11-03 — malformed review types raised a handler error — validate JSON value types before set membership and return a bounded 400 response.
+- 2026-11-03 — standalone logo marks missed the requested identity — explore feature-inspired Trace letterforms; show options before changing the app logo.
+- 2026-11-03 — abstract monochrome letters were too subtle — logo concepts should use colorful, recognizable books, vinyl, film, photos, and TV objects as the actual letters.
+- 2026-11-03 — logo and app felt like separate styles — use the approved warm cartoon-vintage palette and illustrated frames consistently while retaining real cover art.
+- 2026-11-03 — heavy spine type, ghosted covers, and overlay previews made the bookcase awkward — use clean bindings and reserve a full-cover slot in every row before selection.
+
+- 2026-11-04 — Discover showed a raw fetch error while the local server was stopped — explain how to start the server; display the Trace score on the requested /10 scale.

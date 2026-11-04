@@ -1,10 +1,14 @@
 # Trace
 
+<img src="assets/trace-wordmark.png" alt="Trace — books, records, films, memories, and TV" width="460">
+
 A life, collected. Films in a cinema room, books on wooden shelves, records in a jukebox, and memories on a calendar.
 
 Trace brings your media, notes, ratings, and people into one warm little place. Built with browser JavaScript and Python’s standard library—no install step, API key, or paid service required for the core app.
 
 ![Trace cinema with DVD columns](assets/screenshots/cinema.png)
+
+The illustrated identity carries through the app: warm cream, terracotta, mustard, teal, and olive; soft brown outlines; simple shelves, record stands, photo frames, and a playful display serif. The wordmark is made from the five media objects; original covers and personal photos stay readable inside the illustrated frames.
 
 ## Make a little room for everything
 
@@ -12,7 +16,7 @@ Trace brings your media, notes, ratings, and people into one warm little place. 
 - **Dedicated spaces:** Cinema with vertically scrolling DVD/poster columns; a TV lounge; a wooden bookcase; a record-wheel jukebox; a memory calendar; and Diary chapters. All keeps the mixed shelves.
 - **Log it your way:** half-star ratings, notes, dates, favorites, For later lists, editable genres, and genre filters. A first tap previews the cover; a second opens details.
 - **Discover:** search real catalogs, choose the right release, and save it to your shelf. Results and attribution are cached in SQLite. Cover/genre enrichment preserves your personal ratings and notes.
-- **Trace rating:** available public scores are normalized to five stars and combined with a transparent, vote-aware weighting. Source values and the formula are visible. Missing scores stay missing, and your personal rating is separate.
+- **Trace score:** available public ratings are blended into a score out of 10 with transparent, vote-aware weighting. Source values and the formula are visible. Missing scores stay missing, and your personal rating is separate.
 - **Elsewhere:** IMDb, Letterboxd, Goodreads, and other community links on a title. Exact review links are used when IDs are known; otherwise the link is labeled as a search.
 - **Your circle:** profiles, following, a public review feed, likes, comments, spoiler controls, editing, and removal with undo. Reviews publish only when you choose to post; an existing private shelf is never published automatically.
 - **Tracewall:** make a monthly, yearly, or all-time recap and download it as a PNG.
@@ -52,6 +56,8 @@ Letterboxd exports/public feeds import your reviews with original links. **Two-w
 ## Catalogs and score sources
 
 The catalog grows through searches; it does not claim to contain every title locally. Fixed provider adapters are attributed, cached, and paced. Core providers are [Wikidata/Wikipedia](https://www.wikidata.org/), [TVmaze](https://www.tvmaze.com/api), [Kitsu](https://kitsu.docs.apiary.io/), [Open Library](https://openlibrary.org/dev/docs/api/search), and [Apple album search](https://developer.apple.com/library/archive/documentation/AudioVideo/Conceptual/iTuneSearchAPI/index.html). TVmaze data is CC BY-SA; retain its links and attribution.
+
+The Trace score normalizes available ratings to /10. Each platform counts once; weights use log₁₀(votes + 1) ÷ 4, bounded from 0.2 to 1, or 0.5 when the count is unknown. A single source is labeled “normalized”; multiple sources are labeled “blended.” [See the score and source breakdown](assets/screenshots/discover.png).
 
 Public scores currently come from TVmaze, Kitsu, Open Library, eligible IMDb records, and published Trace ratings. Availability varies by title; Goodreads and Letterboxd aggregate scores are not supplied by public profile feeds. Optional `OMDB_API_KEY` enables additional IMDb, Rotten Tomatoes, and Metacritic values via OMDb; the key stays on the server. No key is bundled.
 

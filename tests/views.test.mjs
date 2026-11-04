@@ -13,3 +13,14 @@ test('Album wheel wraps around and never repeats an album in a small collection'
  const items=Array.from({length:7},(_,id)=>({id}));const visible=wheelItems(items,0);assert.equal(visible.find(x=>x.offset===0).item.id,0);assert.equal(visible.find(x=>x.offset===-1).item.id,6);for(let n=1;n<5;n++){const small=wheelItems(items.slice(0,n),-1);assert.equal(new Set(small.map(x=>x.item.id)).size,n);}assert.deepEqual(wheelItems([],0),[]);
 });
 test('Dedicated bookcase creates vertical rows without dropping or repeating books',()=>{const items=Array.from({length:29},(_,id)=>({id}));for(const width of [320,390,900,1440]){const rows=bookRows(items,width);assert.ok(rows.length>1);assert.deepEqual(rows.flat(),items);assert.ok(rows.every(x=>x.length<=12));}});
+
+
+test('Book rows reserve a full-cover slot without moving selected books between rows',()=>{
+ const items=Array.from({length:29},(_,id)=>({id}));
+ for(const [width,reserved] of [[282,84],[352,84],[550,84],[760,107],[1100,107]]){
+  const rows=bookRows(items,width,reserved);
+  assert.deepEqual(rows.flat(),items);
+  for(const row of rows)assert.ok(row.length*44+Math.max(0,row.length-1)*3+reserved<=width-30,'Expanded cover must fit inside the shelf');
+ }
+ assert.equal(bookRows(items,352,84)[0].length,4);
+});
