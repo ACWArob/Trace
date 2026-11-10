@@ -5,6 +5,7 @@ from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
 from pathlib import Path
 import json
+import os
 import re
 import html
 import sys
@@ -14,29 +15,56 @@ import ssl
 import hmac
 import sqlite3
 from http.cookies import SimpleCookie
-from catalog_store import CatalogStore
+from catalog_store import CatalogStore, query_cache_ttl
+from music_catalog import search_albums, CATALOG_VERSION as MUSIC_CATALOG_VERSION
+from screen_catalog import search_wikidata, CATALOG_VERSION as SCREEN_CATALOG_VERSION
+from movie_catalog import is_movie_metadata, is_non_work_description, WIKIDATA_SOURCE
 from social import SocialStore, SocialError
-from ratings import RatingsStore, omdb_scores
+from library_store import LibraryStore
+from score_service import ScoreService
+from ratings import RatingsStore, omdb_scores, mdblist_scores, merge_scores, load_local_rating_key
 from profile_feeds import read_profile_feed, FeedUnavailable
 
 ROOT = Path(__file__).resolve().parent
 CACHE = {}
 LOCK = threading.Lock()
 LAST = {}
-TLS_CONTEXT = ssl.create_default_context()
-if not TLS_CONTEXT.get_ca_certs():
-    for bundle in ("/etc/ssl/cert.pem", "/etc/ssl/certs/ca-certificates.crt"):
-        if Path(bundle).is_file():
-            TLS_CONTEXT.load_verify_locations(bundle)
-            break
-PROVIDERS = {'movie': 'Wikidata / Wikipedia', 'tv': 'TVmaze', 'anime': 'Kitsu',
-             'book': 'Open Library', 'album': 'Apple Music'}
+def create_tls_context():
+    context = ssl.create_default_context()
+    # Some macOS Python installations have a partial CA directory but no CA file.
+    # Use an existing OS trust bundle; certificate and hostname checks stay enabled.
+    explicit_trust = os.environ.get('SSL_CERT_FILE') or os.environ.get('SSL_CERT_DIR')
+    if not explicit_trust and (not ssl.get_default_verify_paths().cafile or not context.get_ca_certs()):
+        for bundle in ('/etc/ssl/cert.pem', '/etc/ssl/certs/ca-certificates.crt'):
+            if Path(bundle).is_file():
+                context.load_verify_locations(bundle)
+                break
+    return context
+
+
+TLS_CONTEXT = create_tls_context()
+PROVIDERS = {'movie': 'Wikidata / Wikipedia', 'tv': 'TVmaze / Wikidata', 'anime': 'Kitsu',
+             'book': 'Open Library', 'album': 'Apple / MusicBrainz'}
 
 CATALOG_STORE = None
 SOCIAL_STORE = None
 RATINGS_STORE = None
+LIBRARY_STORE = None
 STORE_LOCK = threading.Lock()
 AUTH_ATTEMPTS = {}
+PUBLIC_FILES = frozenset(('/', '/index.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/social.js', '/library_sync.mjs', '/api_client.mjs', '/artwork.mjs', '/mobile.js', '/sw.js', '/manifest.webmanifest'))
+SCORE_SERVICE = None
+
+
+def public_origin():
+    value = os.environ.get('TRACE_PUBLIC_ORIGIN', '').strip().rstrip('/')
+    if not value:
+        return ''
+    parsed = urlparse(value)
+    if parsed.scheme != 'https' or not parsed.hostname or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+        raise ValueError('TRACE_PUBLIC_ORIGIN must be an HTTPS origin without a path.')
+    port = parsed.port
+    return 'https://' + parsed.hostname.lower() + (':' + str(port) if port and port != 443 else '')
 
 
 def get_catalog():
@@ -63,12 +91,34 @@ def get_ratings():
     return RATINGS_STORE
 
 
+def get_library():
+    get_social()  # Existing accounts own private library rows.
+    global LIBRARY_STORE
+    with STORE_LOCK:
+        if LIBRARY_STORE is None:
+            LIBRARY_STORE = LibraryStore()
+    return LIBRARY_STORE
+
+
 def attach_scores(result):
     for item in result.get('items', []):
         sources = list(item.get('publicScores') or [])
         sources.extend(get_ratings().lookup(item.get('imdbId', '')))
-        item['publicScores'] = list({s['source'].lower(): s for s in sources}.values())
+        item['publicScores'] = merge_scores(sources)
     return result
+
+
+def remote_scores(kind, title, imdb_id):
+    global SCORE_SERVICE
+    store = get_ratings()
+    with STORE_LOCK:
+        if SCORE_SERVICE is None or SCORE_SERVICE.store is not store:
+            SCORE_SERVICE = ScoreService(store)
+        service = SCORE_SERVICE
+    return service.lookup(kind, imdb_id, {
+        'omdb': {'enabled': bool(os.environ.get('OMDB_API_KEY')), 'load': lambda: omdb_scores(imdb_id, title, fetch)},
+        'mdblist': {'enabled': bool(os.environ.get('MDBLIST_API_KEY')), 'load': lambda: mdblist_scores(imdb_id, title, kind, fetch)},
+    })
 
 
 def title_scores(kind, title, year, imdb_id=''):
@@ -77,21 +127,12 @@ def title_scores(kind, title, year, imdb_id=''):
     if not re.fullmatch(r'tt\d{5,12}', imdb_id or ''):
         imdb_id = ''
     scores = list(item.get('publicScores') or []) + get_ratings().lookup(imdb_id)
-    key = ('score-lookup', imdb_id)
-    if imdb_id:
-        try:
-            if key in CACHE and time.time() - CACHE[key][0] < 86400:
-                extra = CACHE[key][1]
-            else:
-                extra = omdb_scores(imdb_id, title, fetch)
-                CACHE[key] = (time.time(), extra)
-            scores.extend(extra)
-        except (HTTPError, URLError, TimeoutError, ValueError, OSError):
-            pass
+    extra = remote_scores(kind, title, imdb_id)
+    scores.extend(extra['sources'])
     community = get_social().community_rating(item)
     if community:
         scores.append(community)
-    return {'sources': list({s['source'].lower(): s for s in scores}.values()), 'imdbId': imdb_id}
+    return {'sources': merge_scores(scores), 'imdbId': imdb_id, 'providerStatus': extra['providerStatus'], 'providerMeta': extra['providerMeta']}
 
 
 def fetch(url, provider):
@@ -101,84 +142,65 @@ def fetch(url, provider):
         if wait:
             time.sleep(wait)
         LAST[provider] = time.monotonic()
-    req = Request(url, headers={'User-Agent': 'TraceLocal/0.1 (personal collection prototype)', 'Accept': 'application/vnd.api+json' if provider == 'kitsu' else 'application/json'})
+    req = Request(url, headers={'User-Agent': 'Trace/0.1 (https://github.com/ACWArob/Trace)', 'Accept': 'application/vnd.api+json' if provider == 'kitsu' else 'application/json'})
     with urlopen(req, timeout=18, context=TLS_CONTEXT) as response:
         return json.load(response)
 
 
+def catalog_cache_current(kind, result):
+    if kind not in ('album', 'movie', 'tv'):
+        return True
+    return result.get('catalogVersion') == (MUSIC_CATALOG_VERSION if kind == 'album' else SCREEN_CATALOG_VERSION)
+
+
+def safe_cached_catalog(result):
+    def eligible(item):
+        if not is_movie_metadata(item):
+            return False
+        return not (item.get('type') == 'tv' and item.get('source') == WIKIDATA_SOURCE
+                    and is_non_work_description(item.get('description'), item.get('title', '')))
+    return {**result, 'items': [item for item in result.get('items', []) if isinstance(item, dict) and eligible(item)]}
+
+
 def search(kind, query):
     cache_key = (kind, query.casefold())
-    if cache_key in CACHE and time.time() - CACHE[cache_key][0] < 3600:
-        return attach_scores(CACHE[cache_key][1])
+    if cache_key in CACHE:
+        cached_at, cached_result = CACHE[cache_key]
+        lifetime = min(3600, query_cache_ttl(cached_result))
+        if time.time() - cached_at < lifetime and catalog_cache_current(kind, cached_result):
+            return attach_scores(cached_result)
     saved = get_catalog().cached(kind, query)
-    if saved:
+    if saved and catalog_cache_current(kind, saved):
         return attach_scores(saved)
     provider = PROVIDERS[kind]
     items = []
+    warnings = []
     if kind == 'movie':
-        data = fetch('https://www.wikidata.org/w/api.php?' + urlencode({
-            'action': 'wbsearchentities', 'search': query, 'language': 'en', 'format': 'json', 'limit': 20}), 'wikidata')
-        hits = [x for x in data.get('search', []) if re.search(r'\bfilm\b', x.get('description', ''), re.I)][:12]
-        if hits:
-            entities = fetch('https://www.wikidata.org/w/api.php?' + urlencode({
-                'action': 'wbgetentities', 'ids': '|'.join(x['id'] for x in hits),
-                'props': 'sitelinks|claims', 'format': 'json'}), 'wikidata').get('entities', {})
-            titles = [x.get('sitelinks', {}).get('enwiki', {}).get('title', '') for x in entities.values()]
-            titles = [x for x in titles if x]
-            images = {}
-            descriptions = {}
-            if titles:
-                try:
-                    pages = fetch('https://en.wikipedia.org/w/api.php?' + urlencode({
-                        'action': 'query', 'format': 'json', 'titles': '|'.join(titles), 'prop': 'pageimages|extracts', 'exintro': 1, 'explaintext': 1, 'exsentences': 5,
-                        'piprop': 'thumbnail', 'pithumbsize': 500, 'pilicense': 'any'}), 'wikipedia').get('query', {}).get('pages', {})
-                    images = {x['title']: x.get('thumbnail', {}).get('source', '') for x in pages.values()}
-                    descriptions = {x['title']: x.get('extract', '') for x in pages.values()}
-                except (HTTPError, URLError, TimeoutError, ValueError, OSError):
-                    pass  # A cover outage must not prevent logging a found film.
-            genre_ids = sorted({claim.get('mainsnak', {}).get('datavalue', {}).get('value', {}).get('id')
-                                for entity in entities.values() for claim in entity.get('claims', {}).get('P136', [])} - {None})
-            genre_labels = {}
-            if genre_ids:
-                try:
-                    genre_data = fetch('https://www.wikidata.org/w/api.php?' + urlencode({
-                        'action': 'wbgetentities', 'ids': '|'.join(genre_ids[:50]), 'props': 'labels',
-                        'languages': 'en', 'format': 'json'}), 'wikidata').get('entities', {})
-                    genre_labels = {key: val.get('labels', {}).get('en', {}).get('value', '').removesuffix(' film').title() for key, val in genre_data.items()}
-                except (HTTPError, URLError, TimeoutError, ValueError, OSError):
-                    pass
-            for hit in hits:
-                entity = entities.get(hit['id'], {})
-                wiki_title = entity.get('sitelinks', {}).get('enwiki', {}).get('title', '')
-                description = hit.get('description', '')
-                year_match = re.search(r'\b(18|19|20)\d{2}\b', description)
-                director = re.search(r'(?:directed by|film by) (.+)$', description)
-                items.append({'title': hit.get('label', ''), 'creator': director.group(1) if director else '',
-                              'year': year_match.group(0) if year_match else '', 'type': 'movie',
-                              'genres': [genre_labels[g] for claim in entity.get('claims', {}).get('P136', []) if (g := claim.get('mainsnak', {}).get('datavalue', {}).get('value', {}).get('id')) in genre_labels][:8],
-                              'imdbId': next((c.get('mainsnak', {}).get('datavalue', {}).get('value', '') for c in entity.get('claims', {}).get('P345', []) if re.fullmatch(r'tt\d{5,12}', str(c.get('mainsnak', {}).get('datavalue', {}).get('value', '')))), ''),
-                              'image': images.get(wiki_title, ''), 'description': descriptions.get(wiki_title, '') or description, 'source': provider,
-                              'sourceUrl': 'https://www.wikidata.org/wiki/' + hit['id'], 'externalId': hit['id']})
+        items = search_wikidata(query, 'movie', fetch)
     elif kind == 'album':
-        args = {'term': query, 'entity': 'album', 'media': 'music', 'limit': 30, 'country': 'US'}
-        data = fetch('https://itunes.apple.com/search?' + urlencode(args, quote_via=quote), 'apple')
-        for row in data.get('results', []):
-            # Some single releases are represented as Album collections by Apple.
-            title = row.get('collectionName', '')
-            if row.get('collectionType') != 'Album' or re.search(r' - (Single|EP)$', title, re.I):
-                continue
-            items.append({'title': title, 'creator': row.get('artistName', ''), 'year': row.get('releaseDate', '')[:4],
-                          'type': kind, 'image': row.get('artworkUrl100', '').replace('100x100bb', '600x600bb'),
-                          'source': provider, 'sourceUrl': row.get('collectionViewUrl', ''),
-                          'externalId': str(row.get('collectionId', '')), 'genres': [row['primaryGenreName']] if row.get('primaryGenreName') else [], 'description': f"{title} is an album by {row.get('artistName', 'an unknown artist')}." + (f" Released in {row['releaseDate'][:4]}." if row.get('releaseDate') else '')})
+        result = attach_scores(search_albums(query, fetch))
+        result = get_catalog().save(kind, query, result)
+        CACHE[cache_key] = (time.time(), result)
+        return result
     elif kind == 'tv':
-        data = fetch('https://api.tvmaze.com/search/shows?' + urlencode({'q': query}), 'tvmaze')
+        try:
+            data = fetch('https://api.tvmaze.com/search/shows?' + urlencode({'q': query}), 'tvmaze')
+        except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+            data = []
+            warnings.append('TVmaze is unavailable. Other television results are shown when available.')
         for result in data[:16]:
             row = result['show']
             items.append({'title': row['name'], 'creator': (row.get('network') or row.get('webChannel') or {}).get('name', ''),
                           'year': (row.get('premiered') or '')[:4], 'type': kind,
-                          'image': (row.get('image') or {}).get('medium', ''), 'source': provider,
+                          'image': (row.get('image') or {}).get('medium', ''), 'source': 'TVmaze',
                           'sourceUrl': row.get('url', ''), 'externalId': str(row['id']), 'genres': row.get('genres') or [], 'imdbId': (row.get('externals') or {}).get('imdb') or '', 'publicScores': [{'source':'TVmaze','value':row['rating']['average'],'max':10,'count':None,'url':row.get('url','')}] if (row.get('rating') or {}).get('average') is not None else [], 'description': html.unescape(re.sub(r'<[^>]*>', '', row.get('summary') or ''))})
+        if not any(row['title'].casefold() == query.casefold() for row in items):
+            try:
+                items.extend(search_wikidata(query, 'tv', fetch))
+            except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+                if not items and warnings:
+                    raise URLError('Television catalogs are unavailable.')
+                warnings.append('Wikidata is unavailable. Other television results are shown when available.')
     elif kind == 'anime':
         data = fetch('https://kitsu.io/api/edge/anime?' + urlencode({'filter[text]': query, 'page[limit]': 16, 'include': 'categories'}), 'kitsu')
         category_names = {r['id']: r.get('attributes', {}).get('title', '') for r in data.get('included', []) if r.get('type') == 'categories'}
@@ -198,8 +220,8 @@ def search(kind, query):
                           'image': f"https://covers.openlibrary.org/b/id/{row['cover_i']}-L.jpg" if row.get('cover_i') else '',
                           'source': provider, 'sourceUrl': 'https://openlibrary.org' + row['key'], 'externalId': row['key'], 'genres': (row.get('subject') or [])[:8], 'publicScores': [{'source':'Open Library','value':row['ratings_average'],'max':5,'count':row.get('ratings_count'),'url':'https://openlibrary.org'+row['key']}] if row.get('ratings_average') is not None else []})
     unique = list({(r['type'], r['externalId']): r for r in items}.values())
-    result = attach_scores({'items': unique, 'provider': provider})
-    get_catalog().save(kind, query, result)
+    result = attach_scores({'items': unique, 'provider': provider, 'warnings': warnings, **({'catalogVersion':SCREEN_CATALOG_VERSION} if kind in ('movie','tv') else {})})
+    result = get_catalog().save(kind, query, result)
     CACHE[cache_key] = (time.time(), result)
     return result
 
@@ -226,9 +248,52 @@ class Handler(SimpleHTTPRequestHandler):
     def valid_host(self):
         try:
             host = urlparse('http://' + self.headers.get('Host', '')).hostname
-            return host in ('localhost', '127.0.0.1', '::1')
+            configured = public_origin()
+            return host in ('localhost', '127.0.0.1', '::1') or bool(configured and 'https://' + self.headers.get('Host', '').lower().removesuffix(':443') == configured)
         except ValueError:
             return False
+
+    def request_origin(self):
+        configured = public_origin()
+        host = self.headers.get('Host', '')
+        if configured and 'https://' + host.lower().removesuffix(':443') == configured:
+            return configured
+        return 'http://' + host
+
+    def cookie_secure(self):
+        return '; Secure' if self.request_origin().startswith('https://') else ''
+
+    def library_get(self, parsed):
+        try:
+            session = get_social().session(self.session_token())
+            if not session['user']:
+                raise SocialError('Sign in to open your private library.', 401)
+            params = parse_qs(parsed.query)
+            result = get_library().pull(session['user']['id'], int(params.get('after', ['0'])[0]), int(params.get('limit', ['200'])[0]))
+            return self.send_json(result)
+        except SocialError as exc:
+            return self.send_json({'error': str(exc)}, exc.status)
+        except ValueError:
+            return self.send_json({'error': 'Invalid library cursor or page size.'}, 400)
+        except sqlite3.Error:
+            return self.send_json({'error': 'The library database is busy. Your device changes are still saved.'}, 503)
+
+    def library_post(self):
+        try:
+            if self.headers.get('Origin') != self.request_origin():
+                raise SocialError('This action must come from Trace.', 403)
+            session = get_social().session(self.session_token())
+            if not session['user']:
+                raise SocialError('Sign in to sync your private library.', 401)
+            csrf = self.headers.get('X-Trace-CSRF', '')
+            if not csrf or not hmac.compare_digest(csrf, session['csrf']):
+                raise SocialError('Refresh Trace and try again.', 403)
+            payload = self.read_json(10_000_000)
+            return self.send_json(get_library().sync(session['user']['id'], payload.get('changes')))
+        except SocialError as exc:
+            return self.send_json({'error': str(exc)}, exc.status)
+        except sqlite3.Error:
+            return self.send_json({'error': 'The library database is busy. Your device changes are still saved.'}, 503)
 
     def session_token(self):
         cookie = SimpleCookie()
@@ -254,7 +319,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def social_post(self, path):
         try:
-            if self.headers.get('Origin') != 'http://' + self.headers.get('Host', ''):
+            if self.headers.get('Origin') != self.request_origin():
                 raise SocialError('This action must come from Trace.', 403)
             payload = self.read_json()
             store, token = get_social(), self.session_token()
@@ -267,7 +332,7 @@ class Handler(SimpleHTTPRequestHandler):
                     AUTH_ATTEMPTS[key] = attempts + [now]
                 result, new_token = store.register(payload) if path.endswith('signup') else store.login(payload)
                 return self.send_json(result, 201 if path.endswith('signup') else 200,
-                                      {'Set-Cookie': f'trace_session={new_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000'})
+                                      {'Set-Cookie': f'trace_session={new_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{self.cookie_secure()}'})
             session = store.session(token)
             if not session['user']:
                 raise SocialError('Sign in to take part.', 401)
@@ -277,7 +342,7 @@ class Handler(SimpleHTTPRequestHandler):
             user_id = session['user']['id']
             if path == '/api/auth/logout':
                 store.logout(token)
-                return self.send_json({'user': None}, headers={'Set-Cookie': 'trace_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'})
+                return self.send_json({'user': None}, headers={'Set-Cookie': 'trace_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0' + self.cookie_secure()})
             if path == '/api/social/profile':
                 return self.send_json({'user': store.update_profile(user_id, payload)})
             if path == '/api/social/follow':
@@ -326,6 +391,8 @@ class Handler(SimpleHTTPRequestHandler):
         if not self.valid_host():
             return self.send_json({'error': 'Unknown host.'}, 403)
         path = urlparse(self.path).path
+        if path == '/api/library/sync':
+            return self.library_post()
         if path.startswith(('/api/social/', '/api/auth/')):
             return self.social_post(path)
         if path != '/api/profile-connect':
@@ -352,6 +419,8 @@ class Handler(SimpleHTTPRequestHandler):
         if not self.valid_host():
             return self.send_json({'error': 'Unknown host.'}, 403)
         parsed = urlparse(self.path)
+        if parsed.path == '/api/library':
+            return self.library_get(parsed)
         if parsed.path.startswith(('/api/social/', '/api/auth/')):
             return self.social_get(parsed)
         if parsed.path == '/api/ratings':
@@ -360,7 +429,10 @@ class Handler(SimpleHTTPRequestHandler):
             title, year = params.get('title', [''])[0][:300], params.get('year', [''])[0][:4]
             if kind not in PROVIDERS or not title:
                 return self.send_json({'error': 'Choose a catalog title.'}, 400)
-            return self.send_json(title_scores(kind, title, year, params.get('imdbId', [''])[0]))
+            try:
+                return self.send_json(title_scores(kind, title, year, params.get('imdbId', [''])[0]))
+            except sqlite3.Error:
+                return self.send_json({'error': 'The ratings database is busy. Try again shortly.'}, 503)
         if parsed.path == '/api/catalog':
             params = parse_qs(parsed.query)
             try:
@@ -386,11 +458,11 @@ class Handler(SimpleHTTPRequestHandler):
             except (HTTPError, URLError, TimeoutError, ValueError, KeyError, OSError):
                 saved = get_catalog().cached(kind, query, stale=True)
                 if saved:
-                    return self.send_json(saved)
+                    return self.send_json(safe_cached_catalog(saved))
                 return self.send_json({'error': f'{PROVIDERS[kind]} is unavailable right now. Try again or add it manually.'}, 502)
         # Serve only app assets; never expose repository metadata or source/test files.
         clean = parsed.path
-        if clean not in ('/', '/index.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/social.js') and not re.fullmatch(r'/assets/[\w.-]+', clean):
+        if clean not in PUBLIC_FILES and not re.fullmatch(r'/assets/[\w.-]+', clean):
             return self.send_error(404)
         return super().do_GET()
 
@@ -407,13 +479,17 @@ class Handler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         if not self.path.startswith('/api/'):
-            self.send_header('Cache-Control', 'no-store')
+            clean = urlparse(self.path).path
+            public = clean in PUBLIC_FILES or re.fullmatch(r'/assets/[\w.-]+', clean)
+            self.send_header('Cache-Control', 'public, max-age=0, must-revalidate' if public else 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('Referrer-Policy', 'strict-origin-when-cross-origin')
         super().end_headers()
 
 
 if __name__ == '__main__':
+    public_origin()  # Reject a malformed deployment origin before accepting requests.
+    load_local_rating_key()
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 5173
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     print(f'Trace is ready at http://localhost:{port}', flush=True)
