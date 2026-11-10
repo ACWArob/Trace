@@ -198,5 +198,59 @@
     "url": "https://covers.openlibrary.org/b/isbn/9780316769488-L.jpg",
     "source": "Open Library",
     "sourceUrl": "https://openlibrary.org/isbn/9780316769488"
+  },
+  "battle-of-algiers": {
+    "url": "https://upload.wikimedia.org/wikipedia/en/a/aa/The_Battle_of_Algiers_poster.jpg?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail_unscaled",
+    "source": "Wikidata / Wikipedia",
+    "sourceUrl": "https://www.wikidata.org/wiki/Q784812"
+  },
+  "papicha": {
+    "url": "https://upload.wikimedia.org/wikipedia/en/e/e0/Papicha_poster.jpg?utm_source=en.wikipedia.org&utm_campaign=api&utm_content=thumbnail_unscaled",
+    "source": "Wikidata / Wikipedia",
+    "sourceUrl": "https://www.festival-cannes.com/f/papicha/"
+  },
+  "berlin": {
+    "url": "https://static.tvmaze.com/uploads/images/medium_portrait/497/1243972.jpg",
+    "source": "TVmaze",
+    "sourceUrl": "https://www.tvmaze.com/shows/59241/berlin"
+  },
+  "frieren": {
+    "url": "https://media.kitsu.app/anime/46474/poster_image/medium-23e1293e41a0b54b6621eb589c3f0d62.jpeg",
+    "source": "Kitsu",
+    "sourceUrl": "https://kitsu.app/anime/46474"
+  },
+  "nedjma": {
+    "url": "https://covers.openlibrary.org/b/id/4030004-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/works/OL793980W"
+  },
+  "memory-in-the-flesh": {
+    "url": "https://covers.openlibrary.org/b/id/10525090-L.jpg",
+    "source": "Open Library",
+    "sourceUrl": "https://openlibrary.org/works/OL23759146W"
+  },
+  "raoui": {
+    "url": "https://is1-ssl.mzstatic.com/image/thumb/Music/v4/d2/58/a6/d258a691-b1f9-beb7-a7c8-330c90005c08/05060001270654_Cover.jpg/600x600bb.jpg",
+    "source": "Apple Music",
+    "sourceUrl": "https://music.apple.com/us/album/raoui/715413219?uo=4"
+  },
+  "diwan-2": {
+    "url": "https://coverartarchive.org/release-group/f28e53e3-fba8-3c17-a45b-46dc2d11eb70/front-500",
+    "source": "MusicBrainz",
+    "sourceUrl": "https://musicbrainz.org/release-group/f28e53e3-fba8-3c17-a45b-46dc2d11eb70"
+  },
+  "algiers-casbah": {
+    "url": "https://upload.wikimedia.org/wikipedia/commons/c/c3/The_Casbah_Of_Algiers.jpg",
+    "source": "Wikimedia Commons illustrative sample photo",
+    "sourceUrl": "https://commons.wikimedia.org/wiki/File:The_Casbah_Of_Algiers.jpg",
+    "credit": "Thiguemi Abersi",
+    "license": "https://creativecommons.org/licenses/by-sa/4.0/"
+  },
+  "hamma-garden": {
+    "url": "https://upload.wikimedia.org/wikipedia/commons/b/b4/Le_jardin_d%27essai_du_Hamma_%C3%A0_Alger.jpg",
+    "source": "Wikimedia Commons illustrative sample photo",
+    "sourceUrl": "https://commons.wikimedia.org/wiki/File:Le_jardin_d%27essai_du_Hamma_%C3%A0_Alger.jpg",
+    "credit": "Ikram kama",
+    "license": "https://creativecommons.org/licenses/by-sa/4.0/"
   }
 }

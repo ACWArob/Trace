@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Approved Trace book-letter mark, inset into Android's adaptive safe area. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <group android:translateX="18" android:translateY="18" android:scaleX="1.8" android:scaleY="1.8">
+        <path android:fillColor="#df703e" android:strokeColor="#482916" android:strokeWidth="2.4" android:strokeLineJoin="round"
+            android:pathData="M18,4H23Q27,4 27,8V32Q27,36 23,36H18Q14,36 14,32V8Q14,4 18,4Z" />
+        <path android:fillColor="#fff0cb" android:strokeColor="#482916" android:strokeWidth="2.4" android:strokeLineJoin="round"
+            android:pathData="M21,5H24Q26,5 26,7V12H21Z" />
+        <path android:fillColor="#4d9290" android:strokeColor="#482916" android:strokeWidth="2.4" android:strokeLineJoin="round"
+            android:pathData="M8,16H32Q36,16 36,20V23Q36,27 32,27H8Q4,27 4,23V20Q4,16 8,16Z" />
+        <path android:fillColor="#fff0cb" android:strokeColor="#482916" android:strokeWidth="2.4" android:strokeLineJoin="round"
+            android:pathData="M29,17H32Q35,17 35,20V23Q35,26 32,26H29Z" />
+        <path android:fillColor="#00000000" android:strokeColor="#482916" android:strokeWidth="1.2" android:strokeLineCap="round"
+            android:pathData="M23,7V10M31,20H33M31,23H33" />
+    </group>
+</vector>

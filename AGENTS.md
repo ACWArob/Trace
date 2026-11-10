@@ -15,7 +15,8 @@ node --input-type=module --check < data.js
 python3 -m py_compile server.py
 git diff --check
 ```
-No installation or build step. Prefer the affected test file over the whole suite.
+Web remains buildless. Optional native apps: `npm install`, `npm run native:sync`.
+Prefer the affected test file over the whole suite.
 
 ## Layout
 - `app.js`, `index.html`, `styles.css` — shelf, diary, imports, and recap UI.
@@ -24,6 +25,7 @@ No installation or build step. Prefer the affected test file over the whole suit
 - `server.py`, `profile_feeds.py` — fixed public catalog/feed adapters and local HTTP.
 - `catalog_store.py`, `social.py`, `social.js` — shared catalog and social features.
 - `tests/` — Node built-in tests and Python unittest; no package dependencies.
+- `native-entry.mjs`, `native_transport.mjs`, `scripts/`, `native/` — optional Capacitor packaging; see `docs/native-apps.md`.
 
 ## Workflow
 1. For multiple files, data, infrastructure, or hard-to-undo work, list files and
@@ -70,3 +72,20 @@ No installation or build step. Prefer the affected test file over the whole suit
 - 2026-11-03 — heavy spine type, ghosted covers, and overlay previews made the bookcase awkward — use clean bindings and reserve a full-cover slot in every row before selection.
 
 - 2026-11-04 — Discover showed a raw fetch error while the local server was stopped — explain how to start the server; display the Trace score on the requested /10 scale.
+
+- 2026-11-04 — a lone IMDb value looked like a multi-site Trace score — require two feeds for a movie blend, show all four source slots, and keep RT critics/audience distinct.
+- 2026-11-04 — a global cache lock serialized independent rating requests — keep network I/O outside the lock and coalesce only matching title/provider lookups.
+- 2026-11-04 — provider setup needed to survive local server restarts — load an ignored owner-only key file at startup, validate its permissions, and retain environment overrides.
+- 2026-11-04 — asynchronous UI snapshots could undo rapid edits — serialize saves and rebase changed fields onto the latest durable account state.
+- 2026-11-04 — HTTP-only origin checks rejected hosted sync — validate an explicit HTTPS deployment origin and use Secure session cookies there.
+- 2026-11-04 — static no-store headers prevented public shell precaching — keep APIs private/no-store and give only allowlisted app assets revalidatable public headers.
+- 2026-11-04 — separate tabs could replace a shared offline snapshot — read and update account queues in one IndexedDB transaction and propagate sign-out across tabs.
+- 2026-11-04 — native WebViews retain local storage when a build changes servers — pin the API origin and pause network access on changes so queued private data cannot cross servers.
+- 2026-11-04 — generated native tests retained Capacitor's template app ID — verify generated package assertions against Trace's actual application ID before shipping projects.
+- 2026-11-05 — starter queries overrepresented Western work — default to international discovery and verify Algerian, Arabic, French, and other original-language searches.
+- 2026-11-05 — descriptions mentioning films admitted games, soundtracks, and people — validate work types and reversibly exclude incorrect public catalog records.
+- 2026-11-05 — failed catalog covers borrowed the last opened entry's fallback — bind artwork failures to their own record and try only sizes of the same artwork ID.
+- 2026-11-05 — import order made recaps mostly films — balance automatic Tracewall picks across available media, preserve manual order, and share preview/export geometry.
+- 2026-11-08 — the full recap was too tall for social posts — compose fixed-size cards with room at the story edges and export the preview canvas directly.
+- 2026-11-09 — a flat list of text buttons made recap picks hard to scan — group cover tiles by category and show the pick order in a separate tray.
+- 2026-11-09 — the 3 MB upload limit rejected ordinary phone photos — bound the input and resize locally before saving.

@@ -134,6 +134,93 @@ export function recapEntries(entries,period) {
   return entries.filter(x=>x.status==='done' && (period==='all' || (x.date && x.date.startsWith(period))));
 }
 
+// Keep imports from one medium from crowding every other part of a recap out.
+// Explicit picks are an ordered list, including an intentionally empty one.
+export function selectTracewall(candidates, selected=null, limit=9) {
+  const unique=new Map();
+  for(const item of candidates)if(item.id&&!unique.has(item.id))unique.set(item.id,item);
+  if(Array.isArray(selected))return [...new Set(selected)].map(id=>unique.get(id)).filter(Boolean).slice(0,12);
+  const groups=['book','movie','album','memory','tv'].map(kind=>[...unique.values()].filter(item=>(item.type==='anime'?'tv':item.type)===kind));
+  const count=Math.max(0,Math.min(12,Math.floor(Number(limit)||0))), result=[];
+  for(let round=0;result.length<count;round++){
+    let added=false;
+    for(const group of groups)if(group[round]&&result.length<count){result.push(group[round]);added=true;}
+    if(!added)break;
+  }
+  return result;
+}
+
+export const TRACEWALL_THEMES=Object.freeze({paper:'#fff4df',sage:'#e5e9ce',rose:'#f1dfd1'});
+
+// Preview and PNG share these coordinates; artifact coordinates use a 320×374 tile.
+export function tracewallLayout(count, columns=3) {
+  count=Math.max(0,Math.min(12,Math.floor(Number(count)||0)));
+  columns=columns===2?2:3;
+  const width=1200, gap=48, tileWidth=(1060-(columns-1)*gap)/columns, scale=tileWidth/320;
+  const rows=Math.ceil(count/columns), height=Math.ceil(330+Math.max(1,rows)*400*scale+130);
+  const slots=Array.from({length:count},(_,i)=>{
+    const row=Math.floor(i/columns), rowCount=Math.min(columns,count-row*columns);
+    const left=(width-rowCount*tileWidth-(rowCount-1)*gap)/2;
+    return {x:left+(i%columns)*(tileWidth+gap),y:330+row*400*scale,width:tileWidth,height:374*scale,scale,tilt:[-2,2,-1,1,-2,2][i%6]};
+  });
+  return {width,height,columns,smallText:columns===2?24:16,slots};
+}
+
+export function tracewallArtifact(type) {
+  if(type==='book')return {kind:'book',label:'Book',image:{x:66,y:10,width:188,height:274}};
+  if(type==='album')return {kind:'album',label:'Album',image:{x:25,y:38,width:238,height:238}};
+  if(type==='memory')return {kind:'memory',label:'Memory',image:{x:46,y:14,width:228,height:228}};
+  return {kind:'dvd',label:type==='movie'?'Film':'TV',image:{x:68,y:14,width:184,height:264}};
+}
+
+const socialWallLayouts = {
+  story: {
+    height: 1920, top: 480, bottom: 1630,
+    slots: [[48, 0, 565, -4], [647, 48, 350, 4], [634, 481, 354, -4], [53, 704, 320, 4], [347, 746, 294, -4]],
+  },
+  portrait: {
+    height: 1350, top: 262, bottom: 1240,
+    slots: [[59, 20, 503, -4], [614, 7, 359, 4], [625, 449, 350, -4], [199, 622, 284, 5]],
+  },
+  square: {
+    height: 1080, top: 228, bottom: 984,
+    slots: [[58, 33, 500, -4], [627, 4, 294, 5], [631, 359, 283, -4]],
+  },
+};
+
+export const TRACEWALL_FORMATS = Object.freeze({
+  story: 'Story', portrait: 'Portrait post', square: 'Square post', full: 'Full keepsake',
+});
+
+export function tracewallShareCard(items, format, page = 0) {
+  if (!Object.hasOwn(socialWallLayouts, format)) return null;
+  const template = socialWallLayouts[format];
+  const pageSize = template.slots.length;
+  const pages = Math.max(1, Math.ceil(items.length / pageSize));
+  const index = Math.max(0, Math.min(pages - 1, Math.floor(Number(page) || 0)));
+  const picks = items.slice(index * pageSize, (index + 1) * pageSize);
+  const placements = picks.length === 1
+    ? [[format === 'story' ? 210 : 250, 0, format === 'story' ? 660 : 580, -4]]
+    : template.slots.slice(0, picks.length);
+  const slots = placements.map(([x, y, width, tilt]) => ({
+    x, y, width, height: width * 374 / 320, scale: width / 320, tilt,
+  }));
+  if (slots.length) {
+    // Center the occupied spread, including the corners of the tilted cards.
+    const extents = slots.map(slot => {
+      const radians = Math.abs(slot.tilt) * Math.PI / 180;
+      const halfHeight = (slot.height * Math.cos(radians) + slot.width * Math.sin(radians)) / 2;
+      const center = slot.y + slot.height / 2;
+      return [center - halfHeight, center + halfHeight];
+    });
+    const first = Math.min(...extents.map(([min]) => min));
+    const last = Math.max(...extents.map(([, max]) => max));
+    const offset = (template.top + template.bottom - first - last) / 2;
+    for (const slot of slots) slot.y += offset;
+  }
+  return {format, width: 1080, height: template.height, picks, index, pages, slots};
+}
+
 export function reviewLinks(item) {
  const query=encodeURIComponent([item.title,item.type==='book'||item.type==='album'?item.creator:item.year].filter(Boolean).join(' '));
  if(['movie','tv','anime'].includes(item.type)){
@@ -153,9 +240,20 @@ export function reviewLinks(item) {
  return [];
 }
 
+export const FILM_SCORE_SOURCES=['IMDb','Rotten Tomatoes critics','Rotten Tomatoes audience','Letterboxd'];
+function scoreSourceName(source){
+ const aliases={'imdb':'IMDb','internet movie database':'IMDb','rotten tomatoes':'Rotten Tomatoes critics','tomatoes':'Rotten Tomatoes critics','tomatoes-critics':'Rotten Tomatoes critics','rotten tomatoes critics':'Rotten Tomatoes critics','popcorn':'Rotten Tomatoes audience','tomatoesaudience':'Rotten Tomatoes audience','tomatoes-audience':'Rotten Tomatoes audience','rotten tomatoes audience':'Rotten Tomatoes audience','letterboxd':'Letterboxd'};
+ return Object.hasOwn(aliases,source.toLowerCase())?aliases[source.toLowerCase()]:source;
+}
 export function normalizePublicScores(input) {
  if(!Array.isArray(input))return [];
- const seen=new Set();return input.flatMap(row=>{if(!row||typeof row.source!=='string'||row.value===null||row.value===undefined||row.value===''||row.max===null||row.max===undefined||row.max==='')return [];let source=row.source.trim().slice(0,60);if(source.toLowerCase()==='internet movie database')source='IMDb';const key=source.toLowerCase();const value=Number(row.value),max=Number(row.max);const count=row.count===undefined||row.count===null||row.count===''?null:Number(row.count);if(!source||seen.has(key)||!Number.isFinite(value)||!Number.isFinite(max)||max<=0||max>100||value<0||value>max||count!==null&&(!Number.isFinite(count)||count<=0))return [];seen.add(key);return [{source,value,max,count:count===null?null:Math.floor(count),url:safeUrl(row.url||''),via:String(row.via||'').slice(0,60)}];}).slice(0,8);
+ const seen=new Set();return input.flatMap(row=>{if(!row||typeof row.source!=='string'||row.value===null||row.value===undefined||row.value===''||row.max===null||row.max===undefined||row.max==='')return [];const source=scoreSourceName(row.source.trim().slice(0,60));const key=source.toLowerCase();const value=Number(row.value),max=Number(row.max);const count=row.count===undefined||row.count===null||row.count===''?null:Number(row.count);if(!source||seen.has(key)||!Number.isFinite(value)||!Number.isFinite(max)||max<=0||max>100||value<0||value>max||count!==null&&(!Number.isFinite(count)||count<=0))return [];seen.add(key);return [{source,value,max,count:count===null?null:Math.floor(count),url:safeUrl(row.url||''),via:String(row.via||'').slice(0,60)}];}).slice(0,8);
+}
+export function filmConsensus(input){
+ const all=normalizePublicScores(input),sources=FILM_SCORE_SOURCES.flatMap(name=>all.filter(row=>row.source===name));
+ const missing=FILM_SCORE_SOURCES.filter(name=>!sources.some(row=>row.source===name));
+ const value=sources.length<2?null:Math.round(sources.reduce((total,row)=>total+row.value/row.max*10,0)/sources.length*10)/10;
+ return {value,count:sources.length,sources,missing,other:all.filter(row=>!FILM_SCORE_SOURCES.includes(row.source))};
 }
 export function blendRatings(input) {
  const sources=normalizePublicScores(input).map(row=>({...row,five:row.value/row.max*5,weight:row.count===null?.5:Math.max(.2,Math.min(1,Math.log10(row.count+1)/4))}));

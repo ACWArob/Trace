@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {parseCSV,normalizeImport,mergeEntries,recapEntries,dateOnly,safeUrl,normalizeGenres,normalizePublicScores,blendRatings,reviewLinks} from '../core.mjs';
+import {parseCSV,normalizeImport,mergeEntries,recapEntries,dateOnly,safeUrl,normalizeGenres,normalizePublicScores,blendRatings,filmConsensus,reviewLinks} from '../core.mjs';
 
 test('CSV preserves quoted commas, newlines, escaped quotes, CRLF and BOM',()=>{
  const rows=parseCSV('\uFEFFTitle,Notes\r\n"A, B","Line one\nShe said ""hello"""\r\n');
@@ -137,4 +137,27 @@ test('External review links use exact IDs when available and label title searche
  assert.equal(reviewLinks({type:'book',title:'Dune'} )[0].label,'Find on Goodreads');
  assert.equal(reviewLinks({type:'book',title:'Dune',source:'goodreads',externalId:'44767458'})[0].url,'https://www.goodreads.com/book/show/44767458');
  assert.deepEqual(reviewLinks({type:'memory',title:'A Sunday'}),[]);
+});
+
+test('Movie consensus gives four distinct rating feeds equal weight on /10',()=>{
+ const input=[{source:'IMDb',value:8,max:10,count:1_000_000},{source:'Rotten Tomatoes',value:90,max:100,count:300},{source:'popcorn',value:80,max:100},{source:'Letterboxd',value:4,max:5,count:20}];
+ const result=filmConsensus(input);
+ assert.equal(result.value,8.3);assert.equal(result.count,4);assert.deepEqual(result.missing,[]);
+ assert.deepEqual(result.sources.map(x=>x.source),['IMDb','Rotten Tomatoes critics','Rotten Tomatoes audience','Letterboxd']);
+ assert.equal(filmConsensus(input.map(x=>({...x,count:1}))).value,result.value,'Vote counts must not change the approved equal weights');
+ assert.equal(input[1].source,'Rotten Tomatoes');
+});
+test('Movie consensus excludes absent sources instead of treating them as zero',()=>{
+ const imdb={source:'IMDb',value:8,max:10};
+ const result=filmConsensus([imdb,{source:'Letterboxd',value:4.5,max:5},{source:'Rotten Tomatoes',value:null,max:100}]);
+ assert.equal(result.value,8.5);assert.equal(result.count,2);assert.equal(result.missing.length,2);
+ assert.equal(filmConsensus([imdb]).value,null,'A single rating is not a Trace blend');
+ assert.equal(filmConsensus([]).value,null);
+ assert.equal(filmConsensus([imdb,{source:'Rotten Tomatoes audience',value:0,max:100}]).value,4,'An actual zero is valid');
+});
+test('Movie consensus deduplicates provider aliases and excludes other scores',()=>{
+ const result=filmConsensus([{source:'IMDb',value:8,max:10},{source:'Internet Movie Database',value:9,max:10},{source:'popcorn',value:80,max:100},{source:'tomatoesaudience',value:90,max:100},{source:'Metacritic',value:100,max:100},{source:'Trace',value:5,max:5}]);
+ assert.equal(result.value,8);assert.equal(result.count,2);assert.equal(result.other.length,2);
+ assert.equal(filmConsensus([{source:'Metacritic',value:100,max:100}]).value,null);
+ assert.equal(normalizePublicScores([{source:'__proto__',value:4,max:5}])[0].source,'__proto__');
 });

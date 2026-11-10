@@ -1,0 +1,13 @@
+{
+  "appId": "com.acwarob.trace",
+  "appName": "Trace",
+  "webDir": "native/web",
+  "backgroundColor": "#fff3db",
+  "loggingBehavior": "none",
+  "ios": {"path": "native/ios"},
+  "android": {"path": "native/android", "allowMixedContent": false},
+  "plugins": {
+    "CapacitorHttp": {"enabled": false},
+    "CapacitorCookies": {"enabled": false}
+  }
+}

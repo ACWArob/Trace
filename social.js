@@ -1,15 +1,17 @@
+import {apiFetch} from './api_client.mjs';
 import {escapeHTML as e,safeUrl,safeImageUrl,reviewLinks,singular} from './core.mjs';
 
 const ratingText=n=>n?`${Number(n).toFixed(1)} / 5`:'Not rated';
 const initial=name=>Array.from(name||'T')[0].toUpperCase();
 const dateText=value=>new Date(value*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'});
 
-export function createSocial({main,entries,notify,openDraft}) {
+export function createSocial({main,entries,notify,openDraft,onSession=async()=>{}}) {
  let session={user:null,csrf:''},scope='everyone',profileName='',page=0,feed=[],version=0,lastRemoved=null,pending=null,editing=null,composeAfterAuth=false;
  const dialog=document.createElement('dialog');dialog.id='social-dialog';dialog.className='modal social-dialog';document.body.append(dialog);
  const isSocial=()=>location.hash==='\u0023social'||location.hash.startsWith('#social/');
- async function api(path,body){const response=await fetch(path,{method:body?'POST':'GET',credentials:'same-origin',headers:body?{'Content-Type':'application/json','X-Trace-CSRF':session.csrf}:{},...(body?{body:JSON.stringify(body)}:{})});let data;try{data=await response.json();}catch{throw Error('Trace could not read the server response.');}if(!response.ok)throw Error(data.error||'This action could not be completed.');return data;}
- async function refreshSession(){session=await api('/api/auth/session');return session;}
+ async function api(path,body){const response=await apiFetch(path,{method:body?'POST':'GET',credentials:'same-origin',headers:body?{'Content-Type':'application/json','X-Trace-CSRF':session.csrf}:{},...(body?{body:JSON.stringify(body)}:{})});let data;try{data=await response.json();}catch{throw Error('Trace could not read the server response.');}if(!response.ok)throw Error(data.error||'This action could not be completed.');return data;}
+ async function refreshSession(){session=await api('/api/auth/session');await onSession(session,{reason:'refresh'});return session;}
+ async function signOut(){await api('/api/auth/logout',{});session={user:null,csrf:''};await onSession(session,{reason:'logout'});}
  function avatar(user){return `<span class="circle-avatar" aria-hidden="true">${e(initial(user.displayName))}</span>`;}
  function profileLink(user){return `<a class="person-link" href="#social/${e(user.username)}">${avatar(user)}<span><strong>${e(user.displayName)}</strong><small>@${e(user.username)}</small></span></a>`;}
  function accountPanel(){return session.user?`<section class="circle-account">${profileLink(session.user)}<p>Your shelf is yours. Only reviews you choose to post appear in the circle.</p><button class="button primary" data-social="compose">Write a review +</button><button class="text-button" data-social="logout">Sign out</button></section>`:`<section class="circle-account"><span class="circle-wordmark">trace.</span><h2>A place for your people.</h2><p>Follow friends, trade reviews, and find something to keep.</p><button class="button primary" data-social="signup">Join Trace</button><button class="text-button" data-social="login">Already here? Sign in</button></section>`;}
@@ -31,7 +33,7 @@ export function createSocial({main,entries,notify,openDraft}) {
   if(action==='scope'){scope=value;page=0;await render();return;}
   if(action==='retry'){await render(profileName);return;}
   if(action==='next'||action==='previous'){page=Math.max(0,page+(action==='next'?1:-1));await render(profileName);return;}
-  if(action==='logout'){await api('/api/auth/logout',{});session={user:null,csrf:''};await render(profileName);return;}
+  if(action==='logout'){await signOut();await render(profileName);return;}
   if(action==='follow'){await api('/api/social/follow',{username,following:button.dataset.following!=='true'});await render(profileName);return;}
   const review=feed.find(x=>x.id===id);
   if(action==='keep'&&review){openDraft(review.item);return;}
@@ -43,7 +45,7 @@ export function createSocial({main,entries,notify,openDraft}) {
  }catch(err){notify(err.message);}finally{button.disabled=false;}}
  function replaceReview(review){const index=feed.findIndex(x=>x.id===review.id);if(index>=0)feed[index]=review;const old=main.querySelector(`[data-review="${review.id}"]`);if(old){const open=!old.querySelector('.review-comments').hidden;old.outerHTML=card(review);if(open)main.querySelector(`[data-comments="${review.id}"]`).hidden=false;}}
  async function handleSubmit(ev){const form=ev.target;if(!form.matches('[data-auth],[data-publish],[data-people-search],[data-profile-edit],[data-comment]'))return;ev.preventDefault();const submit=form.querySelector('[type="submit"]')||form.querySelector('button');submit.disabled=true;const data=new FormData(form);const error=dialog.querySelector('#social-error');if(error)error.textContent='';try{
-  if(form.dataset.auth){session=await api('/api/auth/'+(form.dataset.auth==='signup'?'signup':'login'),Object.fromEntries(data));if(composeAfterAuth){composeAfterAuth=false;compose(pending,editing);}else{dialog.close();if(isSocial())await render(profileName);}return;}
+  if(form.dataset.auth){session=await api('/api/auth/'+(form.dataset.auth==='signup'?'signup':'login'),Object.fromEntries(data));await onSession(session,{reason:'login'});if(composeAfterAuth){composeAfterAuth=false;compose(pending,editing);}else{dialog.close();if(isSocial())await render(profileName);}return;}
   if(form.hasAttribute('data-publish')){await api('/api/social/reviews',{...(editing?{id:editing.id}:{}),item:pending,text:data.get('text'),rating:Number(data.get('rating')),spoiler:data.get('spoiler')==='on'});dialog.close();pending=null;editing=null;page=0;scope='everyone';if(location.hash==='#social')await render();else location.hash='#social';notify('Your review is in the circle.');return;}
   if(form.hasAttribute('data-people-search')){const result=await api('/api/social/people?q='+encodeURIComponent(data.get('query')));const host=main.querySelector('#people-results');if(host)host.innerHTML=result.items.length?result.items.map(user=>`<div class="person-result">${profileLink(user)}${followButton(user)}</div>`).join(''):'<p class="source-hint">No profiles found yet.</p>';return;}
   if(form.hasAttribute('data-profile-edit')){await api('/api/social/profile',Object.fromEntries(data));await render(profileName);notify('Profile saved.');return;}
@@ -53,5 +55,5 @@ export function createSocial({main,entries,notify,openDraft}) {
  dialog.addEventListener('close',()=>{pending=null;editing=null;composeAfterAuth=false;});
  dialog.addEventListener('input',ev=>{if(ev.target.matches('[data-share-search]'))dialog.querySelector('#share-picker').innerHTML=entryPicker(ev.target.value);});
  dialog.addEventListener('click',ev=>{if(ev.target===dialog){dialog.close();pending=null;editing=null;}});
- return {render,share,refreshSession};
+ return {render,share,refreshSession,signOut,showAuth:()=>auth('login')};
 }

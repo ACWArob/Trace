@@ -8,7 +8,9 @@
   <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;500;600&family=Fraunces:wght@400;500;600;700&family=DM+Sans:wght@400;450;500;550;600;650;700&display=swap" rel="stylesheet">
   <link rel="icon" type="image/svg+xml" href="/assets/trace-icon.svg">
+  <link rel="manifest" href="/manifest.webmanifest"><link rel="apple-touch-icon" href="/assets/trace-app-192.png">
   <link rel="stylesheet" href="/styles.css?v=5"><script type="module" src="/app.js?v=5"></script>
+  <script type="module" src="/mobile.js"></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
@@ -28,6 +30,7 @@
   </aside>
   <div class="workspace">
     <header class="topbar"><a class="mobile-brand" href="#shelf" aria-label="Trace home"><img src="/assets/trace-wordmark.png" alt="" width="2159" height="728"></a><span class="topbar-caption">Collection</span><div><span class="local-badge"><i></i> Saved on this device</span><button class="button primary" id="log-top"><span data-icon="plus"></span> Add to shelf</button></div></header>
+    <section id="library-status" class="library-status" aria-label="Library and connection status"></section>
     <main id="main" tabindex="-1"></main>
     <footer class="site-footer"><span>Your collection, kept here.</span><span>trace <img class="footer-mark" src="/assets/trace-icon.svg" alt="" width="20" height="20"></span></footer>
   </div>

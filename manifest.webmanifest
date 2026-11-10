@@ -1,0 +1,15 @@
+{
+  "id": "/",
+  "name": "Trace — Your collection",
+  "short_name": "Trace",
+  "description": "A little shelf for the films, TV, books, albums, and memories that stay with you.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#fff3db",
+  "theme_color": "#f4e6cb",
+  "icons": [
+    { "src": "/assets/trace-app-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/assets/trace-app-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}
