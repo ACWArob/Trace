@@ -116,7 +116,7 @@ test('Private photo responses never pass through or enter the shell cache', asyn
   }
   assert.equal(app.request('/api/photos', {method: 'POST'}), undefined);
   assert.equal(app.writes.length, writes);
-  assert.match(workerSource, /const CACHE_NAME = `\$\{CACHE_PREFIX\}v17`;/);
+  assert.match(workerSource, /const CACHE_NAME = `\$\{CACHE_PREFIX\}v18`;/);
 });
 
 test('Activation deletes only obsolete Trace shell caches and requires explicit update message', async () => {

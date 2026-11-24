@@ -347,3 +347,62 @@ export function blendRatings(input) {
  const total=sources.reduce((n,x)=>n+x.five*x.weight,0),weight=sources.reduce((n,x)=>n+x.weight,0);
  return {value:Math.round(total/weight*10)/10,sources,count:sources.length};
 }
+
+// Automatic cover backfill: accept a catalog result only when it is clearly the same work.
+const COVER_HOSTS=new Set(['covers.openlibrary.org','coverartarchive.org','static.tvmaze.com','media.kitsu.app','media.kitsu.io']);
+const coverHostAllowed=host=>COVER_HOSTS.has(host)||/^(?:[a-z0-9-]+\.)*wikimedia\.org$/.test(host)||/^is\d+(?:-ssl)?\.mzstatic\.com$/.test(host);
+export function coverImageUrl(value){
+ const safe=safeImageUrl(typeof value==='string'?value.trim():'');
+ if(!safe.startsWith('https://')||/[\x00-\x20\x7f]/.test(safe))return '';
+ try{const url=new URL(safe);return url.protocol==='https:'&&!url.username&&!url.password&&!url.port&&coverHostAllowed(url.hostname)?url.href:'';}catch{return '';}
+}
+const coverCategory=type=>({movie:'movie',tv:'screen',anime:'screen',book:'book',album:'album'})[type]||'';
+const ARTICLES=/^(?:the|a|an|le|la|les|l'|el|los|las)\s+/;
+function coverTitle(value){
+ const plain=String(value||'').normalize('NFKD').replace(/\p{M}/gu,'').toLowerCase().replace(/[’`]/g,"'").replace(/&/g,' and ');
+ const stripped=plain.replace(ARTICLES,'');
+ return (stripped.replace(/[^\p{L}\p{N}]/gu,'')||plain.replace(/[^\p{L}\p{N}]/gu,''));
+}
+const creatorWords=value=>String(value||'').normalize('NFKD').replace(/\p{M}/gu,'').toLowerCase();
+const creatorParts=value=>creatorWords(value).split(/\s*(?:[,;&/]|\band\b|\bfeat\.?|\bft\.)\s*/).map(x=>x.replace(/[^\p{L}\p{N}\s]/gu,' ').trim()).filter(Boolean);
+function creatorsAgree(type,a,b){
+ if(!String(a||'').trim()||!String(b||'').trim())return true;
+ if(type==='album'){
+  const whole=v=>coverTitle(v),first=v=>coverTitle(creatorParts(v)[0]||'');
+  return whole(a)===whole(b)||(!!first(a)&&first(a)===first(b));
+ }
+ const surnames=v=>new Set(creatorParts(v).map(p=>p.split(/\s+/).filter(w=>w.length>1).pop()).filter(Boolean));
+ const left=surnames(a),right=surnames(b);
+ return [...left].some(x=>right.has(x));
+}
+const validImdb=v=>typeof v==='string'&&/^tt\d{5,12}$/.test(v)?v:'';
+export function coverMatch(entry,results){
+ if(!entry||entry.type==='memory'||!Array.isArray(results))return null;
+ const category=coverCategory(entry.type);if(!category)return null;
+ const screen=['movie','screen'].includes(category);
+ const entryImdb=screen?validImdb(entry.imdbId):'';
+ const entryIsbn=category==='book'?normalizeISBN(entry.isbn):'';
+ const title=coverTitle(entry.title),year=String(entry.year||'').slice(0,4);
+ const identity=[],titled=[];
+ for(const item of results){
+  if(!item||typeof item!=='object'||item.type==='memory')continue;
+  if(item.type&&coverCategory(item.type)!==category)continue;
+  const image=coverImageUrl(item.image);if(!image)continue;
+  const imdb=screen?validImdb(item.imdbId):'';
+  const isbn=category==='book'?normalizeISBN(item.isbn):'';
+  if(entryImdb&&imdb){if(imdb===entryImdb)identity.push({item,image,imdb});continue;}
+  if(entryIsbn&&isbn&&isbn===entryIsbn){identity.push({item,image,imdb});continue;}
+  if(!title||!year||coverTitle(item.title)!==title||String(item.year||'').slice(0,4)!==year)continue;
+  if(['book','album'].includes(category)&&!creatorsAgree(category,entry.creator,item.creator))continue;
+  titled.push({item,image,imdb});
+ }
+ let pick=identity[0];
+ if(!pick&&titled.length){
+  const ids=new Set(titled.map(x=>x.imdb).filter(Boolean));
+  if(ids.size>1)return null;
+  pick=titled.find(x=>x.imdb)||titled[0];
+  if(new Set(titled.map(x=>x.image)).size>1&&!ids.size)return null;
+ }
+ if(!pick)return null;
+ return {image:pick.image,...(screen&&!entryImdb&&pick.imdb?{imdbId:pick.imdb}:{})};
+}

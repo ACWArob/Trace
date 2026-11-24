@@ -1,8 +1,8 @@
 /* Only public, fixed app files belong here. Personal collections stay in IndexedDB. */
 const CACHE_PREFIX = 'trace-shell-';
-const CACHE_NAME = `${CACHE_PREFIX}v17`;
+const CACHE_NAME = `${CACHE_PREFIX}v18`;
 const SHELL_FILES = [
-  '/index.html', '/privacy.html', '/support.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/letterboxd_zip.mjs', '/tv_starters.mjs', '/collection_starters.mjs',
+  '/index.html', '/privacy.html', '/support.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/letterboxd_zip.mjs', '/tv_starters.mjs', '/collection_starters.mjs', '/cover_backfill.mjs',
   '/social.js', '/library_sync.mjs', '/api_client.mjs', '/artwork.mjs', '/mobile.js', '/manifest.webmanifest',
   '/assets/trace-app-192.png', '/assets/trace-app-512.png',
   '/assets/trace-wordmark.png', '/assets/trace-icon.svg',

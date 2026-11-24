@@ -62,7 +62,7 @@ LIBRARY_STORE = None
 STORE_LOCK = threading.RLock()
 AUTH_BUDGET = None  # DurableBudget shared by every instance; see auth_budget().
 API_BUDGET = RequestBudget()  # Per-instance burst limiter only.
-PUBLIC_FILES = frozenset(('/', '/index.html', '/privacy.html', '/support.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/social.js', '/library_sync.mjs', '/api_client.mjs', '/artwork.mjs', '/letterboxd_zip.mjs', '/tv_starters.mjs', '/collection_starters.mjs', '/mobile.js', '/sw.js', '/manifest.webmanifest'))
+PUBLIC_FILES = frozenset(('/', '/index.html', '/privacy.html', '/support.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/social.js', '/library_sync.mjs', '/api_client.mjs', '/artwork.mjs', '/letterboxd_zip.mjs', '/tv_starters.mjs', '/collection_starters.mjs', '/cover_backfill.mjs', '/mobile.js', '/sw.js', '/manifest.webmanifest'))
 SCORE_SERVICE = None
 
 

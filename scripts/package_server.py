@@ -20,7 +20,7 @@ BACKEND_FILES = (
 PUBLIC_FILES = (
     'index.html', 'styles.css', 'app.js', 'core.mjs', 'data.js', 'views.mjs',
     'social.js', 'library_sync.mjs', 'api_client.mjs', 'artwork.mjs',
-    'letterboxd_zip.mjs', 'tv_starters.mjs', 'collection_starters.mjs',
+    'letterboxd_zip.mjs', 'tv_starters.mjs', 'collection_starters.mjs', 'cover_backfill.mjs',
     'mobile.js', 'sw.js', 'manifest.webmanifest', 'privacy.html', 'support.html',
 )
 ASSET_FILES = (

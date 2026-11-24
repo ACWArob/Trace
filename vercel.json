@@ -57,7 +57,7 @@
       ]
     },
     {
-      "source": "/(api_client\\.mjs|app\\.js|artwork\\.mjs|collection_starters\\.mjs|core\\.mjs|data\\.js|index\\.html|letterboxd_zip\\.mjs|library_sync\\.mjs|manifest\\.webmanifest|mobile\\.js|privacy\\.html|social\\.js|styles\\.css|support\\.html|sw\\.js|tv_starters\\.mjs|views\\.mjs)",
+      "source": "/(api_client\\.mjs|app\\.js|artwork\\.mjs|collection_starters\\.mjs|core\\.mjs|cover_backfill\\.mjs|data\\.js|index\\.html|letterboxd_zip\\.mjs|library_sync\\.mjs|manifest\\.webmanifest|mobile\\.js|privacy\\.html|social\\.js|styles\\.css|support\\.html|sw\\.js|tv_starters\\.mjs|views\\.mjs)",
       "headers": [
         {
           "key": "Cache-Control",

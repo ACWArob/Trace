@@ -1,6 +1,7 @@
 import {artworkCandidates as providerArtwork,artworkFit} from './artwork.mjs';
 import {apiFetch} from './api_client.mjs';
 import {readLetterboxdZip} from './letterboxd_zip.mjs';
+import {runCoverBackfill,applyCovers,pruneCoverAttempts} from './cover_backfill.mjs';
 import {TYPES,singular,uid,today,escapeHTML as e,safeUrl,dateOnly,normalizeISBN,normalizeImport,mergeEntries,recapEntries,selectTracewall,tracewallLayout,tracewallArtifact,TRACEWALL_THEMES,TRACEWALL_FORMATS,tracewallShareCard,migrateEntry,normalizeAttachments,safeImageUrl,sameItem,normalizeGenres,reviewLinks,normalizePublicScores,blendRatings,filmConsensus,FILM_SCORE_SOURCES} from './core.mjs';
 import {DEMO} from './data.js';
 import {TV_STARTERS} from './tv_starters.mjs';
@@ -166,6 +167,44 @@ async function persist(next){
  if(storageProblem){notify(storageProblem);return false;}if(next.entries.length>30000){notify('A library can contain up to 30,000 items.');return false;}const userId=activeSession.user?.id||null;
  try{if(userId){if(!libraryReady)throw Error('Your account library is still loading.');const base=structuredClone(collection.entries),desired=structuredClone(next.entries);const save=librarySaveTail.then(async()=>{if(activeSession.user?.id!==userId)return false;await librarySync.replaceEntries(rebaseLibraryEntries(base,desired,librarySync.getState().entries));return activeSession.user?.id===userId;});librarySaveTail=save.catch(()=>{});return await save;}else{localStorage.setItem(KEY,JSON.stringify(next));guestCollection=next;collection=next;}return true;}
  catch(error){notify(userId?'Could not save this change on your device. '+error.message:'Browser storage is full or unavailable. Download a backup, then free space and try again.');return false;}
+}
+// Imported entries without artwork get public covers in the background; only image and a missing imdbId change.
+let coverRunning=false,coverAgain=false,coverTimer=0,coverProgress='';const coverAttemptsByAccount=new Map(),coverPaused=new Set();
+const coverAccount=()=>activeSession.user?.id||'guest';
+function coverAttempts(account){
+ if(!coverAttemptsByAccount.has(account)){let saved={};try{saved=JSON.parse(localStorage.getItem(preferenceKey('cover-attempts'))||'{}')||{};}catch{}coverAttemptsByAccount.set(account,pruneCoverAttempts(saved,new Set(collection.entries.map(x=>x.id)),Date.now()));}
+ return coverAttemptsByAccount.get(account);
+}
+function saveCoverAttempts(account,attempts){if(coverAccount()===account)try{localStorage.setItem(preferenceKey('cover-attempts'),JSON.stringify(attempts));}catch{}}
+async function coverSearch(entry){
+ const query=(entry.type==='book'&&normalizeISBN(entry.isbn))||entry.title.trim().slice(0,200);
+ const response=await apiFetch(`/api/search?type=${encodeURIComponent(entry.type)}&q=${encodeURIComponent(query)}`);
+ let items=[];if(response.ok){try{const data=await response.json();items=Array.isArray(data.items)?data.items:[];}catch{}}
+ return {status:response.status,items,retryAfter:Number(response.headers?.get?.('Retry-After'))||0};
+}
+function scheduleCoverBackfill(delay=4000){clearTimeout(coverTimer);coverTimer=setTimeout(startCoverBackfill,delay);}
+function setCoverProgress(text){if(coverProgress!==text){coverProgress=text;renderLibraryStatus();}}
+async function startCoverBackfill(){
+ if(coverRunning){coverAgain=true;return;}
+ const account=coverAccount(),epoch=sessionEpoch;
+ if(!collection.started||storageProblem||!libraryReady||coverPaused.has(account))return;
+ const attempts=coverAttempts(account),cancelled=()=>epoch!==sessionEpoch||coverAccount()!==account;
+ coverRunning=true;coverAgain=false;let shownAt=0;
+ try{
+  const result=await runCoverBackfill({entries:collection.entries,attempts,search:coverSearch,isCancelled:cancelled,
+   save:async matches=>{
+    if(cancelled()||!libraryReady)return false;
+    const ok=await persist({...collection,entries:applyCovers(collection.entries,matches)});saveCoverAttempts(account,attempts);
+    if(ok&&!activeSession.user&&!document.activeElement?.matches?.('input,textarea,select'))redrawLibrary();
+    return ok;
+   },
+   onProgress:({processed,total})=>{const at=Date.now();if(total>1&&processed<total&&at-shownAt>2000){shownAt=at;setCoverProgress(`Finding covers… ${processed}/${total}`);}}});
+  if(!cancelled()){
+   saveCoverAttempts(account,attempts);if(result.status==='auth')coverPaused.add(account);
+   if(result.matched)notify(`Added ${result.matched} ${result.matched===1?'cover':'covers'} to your shelf.`);
+  }
+ }catch{}
+ finally{coverRunning=false;setCoverProgress('');if(coverAgain)scheduleCoverBackfill();}
 }
 function saveWall(){try{localStorage.setItem(preferenceKey('wall'),JSON.stringify(wallConfig));}catch{notify('Recap settings could not be saved in this browser.');}}
 function validateEntries(rows){
@@ -367,7 +406,7 @@ function importsPage(){main.innerHTML=heading('Connections','Bring your public p
  <div id="import-feedback">${importFeedback()}</div><p class="import-help">Trace checks source IDs, then compares title, year, and creator when available. Imports keep existing ratings and notes. Viewing dates stay blank when the export does not include one.<br>Albums, memories, or exports from another service? Match the columns in the CSV template. Public feeds can omit older or private entries; exports remain available for a complete history.</p></details>`;$('#import-source').value=state.importSource;}
 function connectionsPanel(){return `<p class="connection-intro">Link a public profile to import available ratings, notes, and dates. Trace keeps your existing ratings and notes.</p><div class="connection-grid">${[['letterboxd','Letterboxd','Username or profile URL','letterboxd.com/yourname'],['goodreads','Goodreads','Profile URL or user ID','goodreads.com/user/show/12345']].map(([service,name,label,placeholder])=>{const saved=connections[service];return `<section class="connection-card"><header><h2>${name}</h2><span class="connection-state">${saved?'Public profile linked':'Not linked'}</span></header><form data-connect-service="${service}"><label class="field"><span>${label}</span><input name="profile" required maxlength="200" value="${e(saved?.profileUrl||'')}" placeholder="${placeholder}"></label><button class="button primary" type="submit">${saved?'Refresh profile':'Link profile'}</button>${saved?`<button class="text-button" type="button" data-action="unlink-profile" data-value="${service}">Unlink</button>`:''}</form>${saved?`<p class="connection-last">${saved.count} feed entries · Updated ${e(new Date(saved.syncedAt).toLocaleDateString())}<br><a href="${e(safeUrl(saved.profileUrl))}" target="_blank" rel="noopener noreferrer">Open public profile ↗</a></p>`:''}<div data-connection-feedback="${service}">${connectionErrors[service]?`<p class="error-message" role="alert">${e(connectionErrors[service])}</p>`:''}</div></section>`;}).join('')}</div><p class="connection-limit">Public feeds import recent entries and reviews. For every Letterboxd rating, import ratings.csv from your full export. Posting edits back to Letterboxd needs approved API access and OAuth; it is not enabled by a profile link.</p>`;}
 async function connectProfile(service,profile,button=null,quiet=false){delete connectionErrors[service];if(button){button.disabled=true;button.textContent='Connecting…';}const feedback=document.querySelector(`[data-connection-feedback="${service}"]`);if(feedback)feedback.textContent='';try{
- const response=await apiFetch('/api/profile-connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service,profile})});const data=await response.json();if(!response.ok)throw Error(data.error||'Could not read this public profile.');const incoming=validateEntries(data.items);const merged=mergeEntries(collection.started?collection.entries:[],incoming);if(!await persist({started:true,entries:merged.entries}))return;connections[service]={identifier:data.identifier,profileUrl:data.profileUrl,count:data.items.length,syncedAt:new Date().toISOString()};try{localStorage.setItem(preferenceKey('connections'),JSON.stringify(connections));}catch{notify('Entries imported, but the profile connection could not be saved.');return;}if(!quiet)notify(`Profile linked. ${merged.added} entries added, ${merged.merged} enriched.`);render();
+ const response=await apiFetch('/api/profile-connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service,profile})});const data=await response.json();if(!response.ok)throw Error(data.error||'Could not read this public profile.');const incoming=validateEntries(data.items);const merged=mergeEntries(collection.started?collection.entries:[],incoming);if(!await persist({started:true,entries:merged.entries}))return;connections[service]={identifier:data.identifier,profileUrl:data.profileUrl,count:data.items.length,syncedAt:new Date().toISOString()};try{localStorage.setItem(preferenceKey('connections'),JSON.stringify(connections));}catch{notify('Entries imported, but the profile connection could not be saved.');return;}if(!quiet)notify(`Profile linked. ${merged.added} entries added, ${merged.merged} enriched.`);render();scheduleCoverBackfill(1500);
  }catch(err){if(!quiet){connectionErrors[service]=err.message;const currentFeedback=document.querySelector(`[data-connection-feedback="${service}"]`);if(currentFeedback)currentFeedback.innerHTML=`<p class="error-message" role="alert">${e(err.message)}</p>`;else notify(err.message);}}finally{if(button){button.disabled=false;button.textContent=connections[service]?'Refresh profile':'Link profile';}}}
 main.addEventListener('submit',ev=>{const form=ev.target.closest('[data-connect-service]');if(!form)return;ev.preventDefault();connectProfile(form.dataset.connectService,form.elements.profile.value.trim(),form.querySelector('[type="submit"]'));});
 function importFeedback(){if(state.importError)return `<div class="error-message" role="alert">${e(state.importError)}</div>`;if(state.importNotice)return `<div class="success-message">${e(state.importNotice)}</div>`;if(!state.pending)return '';const p=state.pending;if(!p.preview||p.base!==collection.entries||p.started!==collection.started){p.preview=mergeEntries(collection.started?collection.entries:[],p.entries);p.base=collection.entries;p.started=collection.started;}const merged=p.preview;return `<div class="import-preview"><p class="eyebrow">READY WHEN YOU ARE</p><h2>A few familiar favorites.</h2><p>${p.entries.length} ${p.entries.length===1?'row':'rows'} · ${merged.added} new · ${merged.merged} enriched · ${merged.duplicates} unchanged${p.skipped?` · ${p.skipped} skipped`:''}</p><div class="preview-items">${p.entries.slice(0,60).map(x=>`<div class="preview-item"><span>${e(x.title)} <small>${x.year?`(${e(x.year)})`:''}</small></span><span>${singular[x.type]} · ${e(statusLabel(x))}${x.date?` · ${x.date}`:''}</span></div>`).join('')}${p.entries.length>60?`<p class="import-help">Showing the first 60 of ${p.entries.length} rows.</p>`:''}</div><button class="button primary" data-action="confirm-import">Add to my shelf ${icon('arrow')}</button> <button class="text-button" data-action="cancel-import">Cancel</button></div>`;}
@@ -706,7 +745,7 @@ main.addEventListener('click',async ev=>{const b=ev.target.closest('[data-action
  if(action==='start'){if(await persist({started:true,entries:collection.entries})){wallConfig.selected=null;render();openLog();}}
  if(action==='csv-template')download('trace-import-template.csv','Title,Type,Creator,Year,Rating,Date,Status,Notes,Favorite,Image,URL\nIn Rainbows,album,Radiohead,2007,5,2026-10-23,done,"A late-night favorite",true,,\nA rainy Sunday,memory,,,0,2026-11-01,done,A small day worth keeping,false,,\n','text/csv');
  if(action==='cancel-import'){importSequence++;state.pending=null;state.importError='';state.importNotice='';$('#import-feedback').innerHTML='';$('#import-file').value='';}
- if(action==='confirm-import'&&state.pending){const p=state.pending;const m=p.preview&&p.base===collection.entries&&p.started===collection.started?p.preview:mergeEntries(collection.started?collection.entries:[],p.entries);if(await persist({started:true,entries:m.entries})){state.pending=null;state.importNotice=`Import complete. ${m.added} added · ${m.merged} enriched · ${m.duplicates} unchanged.`;$('#import-feedback').innerHTML=importFeedback();$('#import-file').value='';notify('Your collection is home.');}}
+ if(action==='confirm-import'&&state.pending){const p=state.pending;const m=p.preview&&p.base===collection.entries&&p.started===collection.started?p.preview:mergeEntries(collection.started?collection.entries:[],p.entries);if(await persist({started:true,entries:m.entries})){state.pending=null;state.importNotice=`Import complete. ${m.added} added · ${m.merged} enriched · ${m.duplicates} unchanged.`;$('#import-feedback').innerHTML=importFeedback();$('#import-file').value='';notify('Your collection is home.');scheduleCoverBackfill(1500);}}
  if(action==='wall-mix'){wallConfig.selected=null;wallPageIndex=0;saveWall();renderWall();}
  if(action==='wall-card'){
   wallPageIndex+=Number(value);
@@ -913,7 +952,7 @@ async function exportWall(button){
  }catch(err){notify(`Image export failed. ${err.message}`);}finally{button.disabled=!selectedWall().length;button.innerHTML=`${icon('download')} Save as image`;}
 }
 let resizeTimer;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{if(state.page==='shelf'&&state.view==='shelf')renderShelfContents();else if(state.page==='wall'&&wallFormat()==='full'&&wallColumnsRendered!==wallColumns())renderWall();},120);});
-route();if(storageProblem)notify(storageProblem);
+route();if(storageProblem)notify(storageProblem);else scheduleCoverBackfill(8000);
 for(const [service,link] of Object.entries(connections))if(Date.now()-Date.parse(link.syncedAt||'')>6*60*60*1000)connectProfile(service,link.identifier,null,true);
 
 function preferenceKey(name){return activeSession.user?`trace.${name}.account.${activeSession.user.id}.v1`:`trace.${name}.v1`;}
@@ -927,7 +966,7 @@ function loadAccountPreferences(){
 function redrawLibrary(){if(['shelf','diary','wall','imports'].includes(state.page))render();}
 function receiveLibrary(snapshot){
  if(!snapshot.userId||snapshot.userId!==activeSession.user?.id)return;
- try{collection={started:true,entries:validateEntries(snapshot.entries)};redrawLibrary();}catch{storageProblem='This account library could not be read. Download a backup before changing it.';}
+ try{collection={started:true,entries:validateEntries(snapshot.entries)};redrawLibrary();scheduleCoverBackfill();}catch{storageProblem='This account library could not be read. Download a backup before changing it.';}
  renderLibraryStatus();
 }
 async function handleSession(next,context={}){
@@ -953,7 +992,7 @@ async function handleSession(next,context={}){
  entryDraft=null;editingId=null;searchResults=[];metadataMatches=[];
  try{if(id)localStorage.setItem('trace.active-account.v1',JSON.stringify({id,username:next.user.username,displayName:next.user.displayName}));else localStorage.removeItem('trace.active-account.v1');}catch{}
  redrawLibrary();renderLibraryStatus();
- try{await librarySync.setSession(next);if(epoch===sessionEpoch){libraryReady=true;renderLibraryStatus();redrawLibrary();}}
+ try{await librarySync.setSession(next);if(epoch===sessionEpoch){libraryReady=true;renderLibraryStatus();redrawLibrary();scheduleCoverBackfill();}}
  catch(error){if(epoch===sessionEpoch){libraryReady=false;notify(error.message);renderLibraryStatus();}}
 }
 async function verifiedSession(id){
@@ -990,7 +1029,7 @@ function renderLibraryStatus(){
  const pending=user&&syncStatus.pendingCount?` · ${syncStatus.pendingCount} pending`:'';
  const update=window.TraceMobile?.state?.updateAvailable||window.TraceMobile?.state?.refreshRequired;
  const installNote=mobileGuidance||(window.TraceMobile?.state?.offlineError?'Offline installation could not start. Open Trace in Safari or Chrome to try again.':'');
- host.innerHTML=`<div class="library-status-copy"><strong>${e(user?user.displayName||user.username:'Your device shelf')}</strong><span>${e(status+pending)}</span></div><div class="library-status-actions">${user?`<button type="button" data-library-action="sync" ${!libraryReady?'disabled':''}>Sync now</button>${syncStatus.conflictCount?`<button type="button" data-library-action="conflicts">Review ${syncStatus.conflictCount} changes</button>`:''}<button type="button" data-library-action="signout">Sign out</button>`:'<button type="button" data-library-action="signin">Sign in</button>'}<button type="button" data-install-trace ${window.TraceMobile?.state?.standalone?'hidden':''}>Install app</button><button type="button" data-update-trace ${update?'':'hidden'}>Update app</button></div>${syncStatus.state==='error'&&syncStatus.error?`<p class="library-status-error" role="alert">${e(syncStatus.error)}</p>`:''}<p data-install-trace-status class="install-guidance" role="status">${e(installNote)}</p>`;
+ host.innerHTML=`<div class="library-status-copy"><strong>${e(user?user.displayName||user.username:'Your device shelf')}</strong><span>${e(status+pending+(coverProgress?' · '+coverProgress:''))}</span></div><div class="library-status-actions">${user?`<button type="button" data-library-action="sync" ${!libraryReady?'disabled':''}>Sync now</button>${syncStatus.conflictCount?`<button type="button" data-library-action="conflicts">Review ${syncStatus.conflictCount} changes</button>`:''}<button type="button" data-library-action="signout">Sign out</button>`:'<button type="button" data-library-action="signin">Sign in</button>'}<button type="button" data-install-trace ${window.TraceMobile?.state?.standalone?'hidden':''}>Install app</button><button type="button" data-update-trace ${update?'':'hidden'}>Update app</button></div>${syncStatus.state==='error'&&syncStatus.error?`<p class="library-status-error" role="alert">${e(syncStatus.error)}</p>`:''}<p data-install-trace-status class="install-guidance" role="status">${e(installNote)}</p>`;
  $('#log-top').disabled=!!user&&!libraryReady;
  const badge=document.querySelector('.local-badge');if(badge)badge.textContent=user?(syncStatus.state==='synced'?'Synced':'Saved on device'):'Saved on this device';
  const profile=document.querySelector('.sidebar .profile');if(profile){profile.querySelector('.avatar').textContent=Array.from(user?.displayName||user?.username||'Y')[0].toUpperCase();profile.querySelector('strong').textContent=user?user.displayName||user.username:'Your collection';profile.querySelector('strong').nextElementSibling.textContent=user?'Private account library':'Saved on this browser';}

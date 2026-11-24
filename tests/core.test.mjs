@@ -189,3 +189,51 @@ test('Stable provider and ISBN identifiers distinguish same-name items and merge
    [{id:'b',type:'movie',title:'Same title',imdbId:'tt2345678'}]);
  assert.equal(movies.entries.length,2);
 });
+
+import {coverMatch} from '../core.mjs';
+const POSTER='https://upload.wikimedia.org/wikipedia/en/2/2a/Coherence_poster.jpg';
+test('coverMatch accepts an exact IMDb identity and fills a missing IMDb ID',()=>{
+ const entry={type:'movie',title:'Coherence (Director’s cut)',year:'2013',imdbId:'tt2866360'};
+ assert.deepEqual(coverMatch(entry,[{type:'movie',title:'Coherence',year:'2014',imdbId:'tt2866360',image:POSTER}]),{image:POSTER});
+ assert.deepEqual(coverMatch({type:'movie',title:'Coherence',year:'2013'},[{type:'movie',title:'Coherence',year:'2013',imdbId:'tt2866360',image:POSTER}]),{image:POSTER,imdbId:'tt2866360'});
+});
+test('coverMatch matches normalized titles with accents, punctuation and leading articles when years agree',()=>{
+ const image='https://static.tvmaze.com/uploads/images/medium_portrait/1/1.jpg';
+ assert.deepEqual(coverMatch({type:'movie',title:'Amelie',year:'2001'},[{type:'movie',title:'Amélie!',year:'2001',image}]),{image});
+ assert.deepEqual(coverMatch({type:'tv',title:'The Office',year:'2005'},[{type:'tv',title:'Office',year:'2005',image}]),{image});
+ assert.deepEqual(coverMatch({type:'anime',title:'Cowboy Bebop',year:'1998'},[{type:'tv',title:'Cowboy Bebop',year:'1998',image}]),{image},'TV and anime share a category');
+});
+test('coverMatch rejects year mismatches, missing years and conflicting IDs',()=>{
+ const r={type:'movie',title:'Solaris',year:'1972',imdbId:'tt0069293',image:POSTER};
+ assert.equal(coverMatch({type:'movie',title:'Solaris',year:'2002'},[r]),null);
+ assert.equal(coverMatch({type:'movie',title:'Solaris',year:''},[r]),null);
+ assert.equal(coverMatch({type:'movie',title:'Solaris',year:'1972',imdbId:'tt0307479'},[r]),null);
+});
+test('coverMatch rejects a different media category',()=>{
+ assert.equal(coverMatch({type:'movie',title:'Fargo',year:'2014'},[{type:'tv',title:'Fargo',year:'2014',image:POSTER}]),null);
+ assert.equal(coverMatch({type:'book',title:'Dune',year:'1965'},[{type:'movie',title:'Dune',year:'1965',image:POSTER}]),null);
+});
+test('coverMatch requires matching authors and artists when both are present',()=>{
+ const cover='https://covers.openlibrary.org/b/id/12345-L.jpg';
+ assert.equal(coverMatch({type:'book',title:'Beloved',year:'1987',creator:'Toni Morrison'},[{title:'Beloved',year:'1987',creator:'Jane Smith',image:cover}]),null);
+ assert.deepEqual(coverMatch({type:'book',title:'The Dispossessed',year:'1974',creator:'Le Guin, Ursula K.'},[{title:'Dispossessed',year:'1974',creator:'Ursula K. Le Guin',image:cover}]),{image:cover});
+ assert.deepEqual(coverMatch({type:'book',title:'Beloved',year:'1987'},[{title:'Beloved',year:'1987',creator:'Toni Morrison',image:cover}]),{image:cover});
+ const art='https://coverartarchive.org/release-group/0b2f6a4e-5f2f-4d6c-9f3e-1a2b3c4d5e6f/front-500';
+ assert.equal(coverMatch({type:'album',title:'Blue',year:'1971',creator:'Joni Mitchell'},[{type:'album',title:'Blue',year:'1971',creator:'Weezer',image:art}]),null);
+ assert.deepEqual(coverMatch({type:'album',title:'Blue',year:'1971',creator:'Joni Mitchell'},[{type:'album',title:'Blue',year:'1971',creator:'Joni Mitchell',image:art}]),{image:art});
+});
+test('coverMatch never matches memories',()=>{
+ assert.equal(coverMatch({type:'memory',title:'Coherence',year:'2013'},[{type:'memory',title:'Coherence',year:'2013',image:POSTER}]),null);
+});
+test('coverMatch accepts only HTTPS images from known catalog hosts',()=>{
+ const entry={type:'movie',title:'Coherence',year:'2013'};
+ for(const image of ['https://evil.example/poster.jpg','http://upload.wikimedia.org/x.jpg','javascript:alert(1)','https://user:pw@upload.wikimedia.org/x.jpg','https://upload.wikimedia.org.evil.example/x.jpg','/assets/coherence.jpg',''])
+  assert.equal(coverMatch(entry,[{type:'movie',title:'Coherence',year:'2013',image}]),null,image);
+ assert.deepEqual(coverMatch(entry,[{type:'movie',title:'Coherence',year:'2013',image:'https://is1-ssl.mzstatic.com/image/thumb/a/600x600bb.jpg'}]),{image:'https://is1-ssl.mzstatic.com/image/thumb/a/600x600bb.jpg'});
+});
+test('coverMatch prefers an identity match and refuses ambiguous title matches',()=>{
+ const a={type:'movie',title:'Crash',year:'2004',imdbId:'tt0375679',image:'https://upload.wikimedia.org/a.jpg'};
+ const b={type:'movie',title:'Crash',year:'2004',imdbId:'tt0999999',image:'https://upload.wikimedia.org/b.jpg'};
+ assert.equal(coverMatch({type:'movie',title:'Crash',year:'2004'},[a,b]),null);
+ assert.deepEqual(coverMatch({type:'movie',title:'Crash',year:'2004',imdbId:'tt0999999'},[a,b]),{image:'https://upload.wikimedia.org/b.jpg'});
+});
