@@ -1,13 +1,11 @@
 import http.client
 import json
-from pathlib import Path
-import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 
 import server
-from library_store import LibraryStore
+from tests.pg_support import PostgresTestCase, bind_server
 
 
 class QuietHandler(server.Handler):
@@ -15,16 +13,11 @@ class QuietHandler(server.Handler):
         pass
 
 
-class LibraryHTTPTests(unittest.TestCase):
+class LibraryHTTPTests(PostgresTestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        path = Path(directory.name) / 'test.sqlite3'
-        social = server.SocialStore(path)
-        for name, store in [('SOCIAL_STORE', social), ('CATALOG_STORE', server.CatalogStore(path)),
-                            ('RATINGS_STORE', server.RatingsStore(path)), ('LIBRARY_STORE', LibraryStore(path))]:
-            patcher = patch.object(server, name, store)
-            patcher.start(); self.addCleanup(patcher.stop)
+        super().setUp()
+        bind_server(self, self.database)
+        social = server.get_social()
         self.accounts = []
         for username in ['http_alice', 'http_bob']:
             session, token = social.register({'username': username, 'displayName': username, 'password': 'synthetic-password-for-tests'})

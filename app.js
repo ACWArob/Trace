@@ -1,14 +1,101 @@
-import {artworkCandidates,artworkFit} from './artwork.mjs';
+import {artworkCandidates as providerArtwork,artworkFit} from './artwork.mjs';
 import {apiFetch} from './api_client.mjs';
 import {readLetterboxdZip} from './letterboxd_zip.mjs';
-import {TYPES,singular,uid,today,escapeHTML as e,safeUrl,dateOnly,normalizeISBN,normalizeImport,mergeEntries,recapEntries,selectTracewall,tracewallLayout,tracewallArtifact,TRACEWALL_THEMES,TRACEWALL_FORMATS,tracewallShareCard,migrateEntry,normalizeAttachments,safeImageUrl as imageUrl,sameItem,normalizeGenres,reviewLinks,normalizePublicScores,blendRatings,filmConsensus,FILM_SCORE_SOURCES} from './core.mjs';
+import {TYPES,singular,uid,today,escapeHTML as e,safeUrl,dateOnly,normalizeISBN,normalizeImport,mergeEntries,recapEntries,selectTracewall,tracewallLayout,tracewallArtifact,TRACEWALL_THEMES,TRACEWALL_FORMATS,tracewallShareCard,migrateEntry,normalizeAttachments,safeImageUrl,sameItem,normalizeGenres,reviewLinks,normalizePublicScores,blendRatings,filmConsensus,FILM_SCORE_SOURCES} from './core.mjs';
 import {DEMO} from './data.js';
 import {TV_STARTERS} from './tv_starters.mjs';
 import {COLLECTION_STARTERS} from './collection_starters.mjs';
 import {mediaConsensus,MEDIA_SCORE_SOURCES} from './core.mjs';
 import {createSocial} from './social.js';
-import {createLibrarySync,rebaseLibraryEntries} from './library_sync.mjs';
+import {createLibrarySync,rebaseLibraryEntries,inlinePhotoRefs,decodePhotoDataUrl,photoDigest,photoRefId,isPhotoRef} from './library_sync.mjs';
 import {calendarDays,shiftMonth,monthLabel,chapters,wheelItems,bookRows,starterResults} from './views.mjs';
+
+// Synced memory photos are stored as trace-photo:<sha256> refs and served by /api/photos/<id>.
+const photoPath=id=>`/api/photos/${id}`;
+const photoIdFromSrc=src=>/^\/api\/photos\/([0-9a-f]{64})$/.exec(src||'')?.[1]||null;
+const imageUrl=value=>{const id=photoRefId(value);return id?photoPath(id):safeImageUrl(value);};
+const storedImage=value=>isPhotoRef(value)?value:safeImageUrl(value);
+const artworkCandidates=item=>{const id=photoRefId(typeof item==='string'?item:item?.image);return id?[photoPath(id)]:providerArtwork(item);};
+function attachmentKey(item){return typeof item?.id==='string'&&/^[a-zA-Z0-9_-]{1,100}$/.test(item.id)?item.id:`${item?.type}:${String(item?.title||'')}:${String(item?.year||'').slice(0,4)}`;}
+// normalizeAttachments keeps only public image URLs; restore each linked item's photo ref.
+function attachmentsWithPhotos(source){
+ const refs=new Map();for(const item of Array.isArray(source)?source:[])if(isPhotoRef(item?.image))refs.set(attachmentKey(item),item.image);
+ return normalizeAttachments(source).map(item=>!item.image&&refs.has(attachmentKey(item))?{...item,image:refs.get(attachmentKey(item))}:item);
+}
+const PHOTO_CACHE_LIMIT=200,PHOTO_URL_LIMIT=60,photoUrls=new Map();let photoDatabase;
+function openPhotoCache(){
+ if(!photoDatabase)photoDatabase=new Promise((resolve,reject)=>{
+  if(!globalThis.indexedDB){reject(Error('Photo storage is unavailable.'));return;}
+  const request=indexedDB.open('trace-photo-cache',1);
+  request.onupgradeneeded=()=>request.result.createObjectStore('photos').createIndex('at','at');
+  request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);request.onblocked=()=>reject(Error('Photo storage is blocked.'));
+ }).catch(error=>{photoDatabase=null;throw error;});
+ return photoDatabase;
+}
+async function photoTransaction(mode,work){
+ const db=await openPhotoCache();
+ return new Promise((resolve,reject)=>{const tx=db.transaction('photos',mode);let result=null;tx.oncomplete=()=>resolve(result);tx.onabort=tx.onerror=()=>reject(tx.error);work(tx.objectStore('photos'),value=>{result=value;});});
+}
+// Entries are keyed by account and photo ID and bounded to the most recently stored photos.
+async function cachedPhoto(key){try{return await photoTransaction('readonly',(store,done)=>{const read=store.get(key);read.onsuccess=()=>done(read.result?.blob||null);});}catch{return null;}}
+async function cachePhoto(key,blob){
+ try{await photoTransaction('readwrite',store=>{
+  store.put({blob,at:Date.now()},key);
+  const count=store.count();count.onsuccess=()=>{let extra=count.result-PHOTO_CACHE_LIMIT;if(extra<=0)return;store.index('at').openKeyCursor().onsuccess=event=>{const cursor=event.target.result;if(cursor&&extra-->0){store.delete(cursor.primaryKey);cursor.continue();}};};
+ });}catch{}
+}
+async function forgetCachedPhotos(userId){
+ for(const [key,url] of photoUrls)if(key.startsWith(userId+':')){URL.revokeObjectURL(url);photoUrls.delete(key);}
+ try{await photoTransaction('readwrite',store=>{store.delete(IDBKeyRange.bound(userId+':',userId+':\uffff'));});}catch{}
+}
+function photoBlobType(blob){const type=String(blob?.type||'').split(';')[0].trim().toLowerCase();return ['image/jpeg','image/png','image/webp'].includes(type)?new Blob([blob],{type}):null;}
+async function fetchPhoto(id){
+ try{
+  if(globalThis.TraceNative){const decoded=decodePhotoDataUrl(await globalThis.TraceMobile?.photo?.(id));return decoded?new Blob([decoded.bytes],{type:decoded.type}):null;}
+  const response=await apiFetch(photoPath(id),{credentials:'same-origin'});
+  return response.ok?photoBlobType(await response.blob()):null;
+ }catch{return null;}
+}
+async function photoBlob(id){
+ const owner=activeSession.user?.id;if(!owner||!/^[0-9a-f]{64}$/.test(id||''))return null;
+ const key=owner+':'+id;let blob=await cachedPhoto(key);
+ if(!blob){blob=await fetchPhoto(id);if(blob&&activeSession.user?.id===owner)await cachePhoto(key,blob);}
+ return activeSession.user?.id===owner?blob:null;
+}
+async function resolvePhoto(id){
+ const owner=activeSession.user?.id,key=owner+':'+id;
+ if(photoUrls.has(key))return photoUrls.get(key);
+ const blob=await photoBlob(id);if(!blob||activeSession.user?.id!==owner)return null;
+ if(photoUrls.has(key))return photoUrls.get(key);
+ const url=URL.createObjectURL(blob);photoUrls.set(key,url);
+ while(photoUrls.size>PHOTO_URL_LIMIT){const [oldest,old]=photoUrls.entries().next().value;URL.revokeObjectURL(old);photoUrls.delete(oldest);}
+ return url;
+}
+async function photoDataUrl(id){
+ const blob=await photoBlob(id);if(!blob)return null;
+ return new Promise(resolve=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result));reader.onerror=()=>resolve(null);reader.readAsDataURL(blob);});
+}
+// A photo that cannot load directly (offline, or a native WebView) is served from the device cache.
+function retryPhoto(img){
+ const id=photoIdFromSrc(img.getAttribute('src'));if(!id||img.dataset.photoRetry)return false;
+ img.dataset.photoRetry='1';
+ resolvePhoto(id).then(url=>{if(!img.isConnected)return;if(url)img.src=url;else if(img.matches('img[data-cover-title]'))failedCover(img);});
+ return true;
+}
+async function uploadPhoto(dataUrl){
+ const owner=activeSession.user?.id,photo=decodePhotoDataUrl(dataUrl);
+ if(!photo)throw Object.assign(Error('This photo format cannot be synced. Choose a JPEG, PNG, or WebP photo.'),{status:415});
+ const id=await photoDigest(photo.bytes),verified=await verifiedSession(owner),native=Boolean(globalThis.TraceNative);
+ // Native transport carries JSON text only, so native builds send the same bytes as base64.
+ const response=await apiFetch('/api/photos',{method:'POST',credentials:'same-origin',cache:'no-store',
+  headers:{'Content-Type':native?'application/json':photo.type,'X-Trace-Photo-Id':id,'X-Trace-CSRF':verified.csrf},
+  body:native?JSON.stringify({contentType:photo.type,data:dataUrl.slice(dataUrl.indexOf(',')+1)}):photo.bytes});
+ let data={};try{data=await response.json();}catch{}
+ if(!response.ok)throw Object.assign(Error(data.error||'Photo upload is temporarily unavailable.'),{status:response.status});
+ if(data.id!==undefined&&data.id!==id)throw Object.assign(Error('The server stored a different photo.'),{status:502});
+ if(activeSession.user?.id===owner)await cachePhoto(owner+':'+id,new Blob([photo.bytes],{type:photo.type}));
+ return 'trace-photo:'+id;
+}
 
 const $ = (s,root=document)=>root.querySelector(s);
 const paths={
@@ -46,7 +133,7 @@ let librarySaveTail=Promise.resolve();
 const guestStorageProblem=storageProblem;let guestCollection=collection;
 let syncStatus={state:'device',pendingCount:0,conflictCount:0};
 const libraryDialog=document.createElement('dialog');libraryDialog.id='library-dialog';libraryDialog.className='modal';libraryDialog.setAttribute('aria-label','Private library');document.body.append(libraryDialog);let pendingGuestCopy=null;
-const librarySync=createLibrarySync({request:libraryRequest,onChange:receiveLibrary,onStatus:status=>{syncStatus=status;renderLibraryStatus();}});
+const librarySync=createLibrarySync({request:libraryRequest,uploadPhoto,onChange:receiveLibrary,onStatus:status=>{syncStatus=status;renderLibraryStatus();}});
 const social=createSocial({main,onSession:handleSession,entries:()=>entries(),notify:message=>notify(message),openDraft:item=>{entryDraft={...item,id:uid(),status:'want',date:'',rating:0,notes:'',history:[],addedAt:new Date().toISOString()};renderEntryForm();logDialog.showModal();}});
 let logType='movie',searchResults=[],searchController=null,searchSequence=0,entryDraft=null,editingId=null,toastTimer;
 const entries=()=>collection.started?collection.entries:DEMO;
@@ -89,7 +176,7 @@ function validateEntries(rows){
   const out={id:typeof row.id==='string'&&/^[a-zA-Z0-9_-]{1,100}$/.test(row.id)?row.id:uid(),title:row.title.slice(0,500),type:row.type,status:['done','want','progress'].includes(row.status)?row.status:'done',favorite:!!row.favorite,forLater:!!row.forLater,rating:Math.max(0,Math.min(5,Number(row.rating)||0)),date:dateOnly(row.date),history:Array.isArray(row.history)?row.history.map(dateOnly).filter(Boolean):[]};
   for(const key of ['creator','year','notes','description','source','externalId','addedAt','imdbId'])out[key]=typeof row[key]==='string'?row[key].slice(0,['notes','description'].includes(key)?20000:500):'';
   if(row.type==='book'&&row.isbn)out.isbn=normalizeISBN(row.isbn);
-  out.publicScores=normalizePublicScores(row.publicScores);out.genres=normalizeGenres(row.genres||DEMO.find(x=>sameItem(x,row))?.genres);out.image=imageUrl(row.image);out.sourceUrl=safeUrl(row.sourceUrl||'');out.metadataSourceUrl=safeUrl(row.metadataSourceUrl||'');out.metadataSource=String(row.metadataSource||'').slice(0,100);out.attachments=normalizeAttachments(row.attachments);
+  out.publicScores=normalizePublicScores(row.publicScores);out.genres=normalizeGenres(row.genres||DEMO.find(x=>sameItem(x,row))?.genres);out.image=storedImage(row.image);out.sourceUrl=safeUrl(row.sourceUrl||'');out.metadataSourceUrl=safeUrl(row.metadataSourceUrl||'');out.metadataSource=String(row.metadataSource||'').slice(0,100);out.attachments=attachmentsWithPhotos(original.attachments);
   if(['restaurant','place'].includes(row.legacyType)){out.legacyType=row.legacyType;out.legacyRating=Number(row.legacyRating)||0;}
   return {...row,...out};
  });
@@ -102,9 +189,11 @@ const artClass=x=>x.type==='book'?'book':x.type==='album'?'vinyl':x.type==='memo
 const colorFor=x=>['#a84d32','#3f7472','#79414b','#8e6e29','#59683b'][Array.from(x.title).reduce((s,c)=>s+c.charCodeAt(0),0)%5];
 function fallback(x){return `<span class="cover-fallback" style="--cover-color:${colorFor(x)}"><span class="fallback-symbol">${x.type==='album'?'◉':x.type==='book'?'✴︎':'✧'}</span><span class="fallback-title" dir="auto">${e(x.title)}</span><span class="fallback-creator" dir="auto">${e(x.creator||singular[x.type])}</span><span class="cover-missing">${x.type==='memory'?'No photo added':'Cover unavailable'}</span></span>`;}
 function cover(x){const [url,...alternatives]=artworkCandidates(x);return url?`<img class="cover-art" src="${e(url)}" data-cover-alternatives="${e(JSON.stringify(alternatives))}" alt="${e(x.title)} cover" loading="lazy" data-cover-title="${e(x.title)}" data-cover-creator="${e(x.creator||'')}" data-cover-type="${e(x.type)}">`:fallback(x);}
-function failedCover(img){let alternatives=[];try{alternatives=JSON.parse(img.dataset.coverAlternatives||'[]');}catch{}const next=alternatives.shift();if(next){img.dataset.coverAlternatives=JSON.stringify(alternatives);img.src=next;return;}img.outerHTML=fallback({title:img.dataset.coverTitle,creator:img.dataset.coverCreator,type:img.dataset.coverType});}
-document.addEventListener('error',ev=>{if(ev.target.matches?.('img[data-cover-title]'))failedCover(ev.target);},true);
-document.addEventListener('load',ev=>{if(ev.target.matches?.('img[data-cover-title]')&&ev.target.naturalWidth<=2&&ev.target.naturalHeight<=2)failedCover(ev.target);},true);
+function failedCover(img){if(retryPhoto(img))return;let alternatives=[];try{alternatives=JSON.parse(img.dataset.coverAlternatives||'[]');}catch{}const next=alternatives.shift();if(next){img.dataset.coverAlternatives=JSON.stringify(alternatives);img.src=next;return;}img.outerHTML=fallback({title:img.dataset.coverTitle,creator:img.dataset.coverCreator,type:img.dataset.coverType});}
+document.addEventListener('error',ev=>{if(ev.target.matches?.('img[data-cover-title]'))failedCover(ev.target);else if(ev.target.matches?.('img[src^="/api/photos/"]'))retryPhoto(ev.target);},true);
+document.addEventListener('load',ev=>{if(ev.target.matches?.('img[data-cover-title]')&&ev.target.naturalWidth<=2&&ev.target.naturalHeight<=2)failedCover(ev.target);
+ // Keep viewed photos available offline.
+ else if(!globalThis.TraceNative&&ev.target.matches?.('img[src^="/api/photos/"]'))void photoBlob(photoIdFromSrc(ev.target.getAttribute('src')));},true);
 function artifact(x,orientation='face') {
  const kind=artClass(x);const spine=orientation==='spine'&&['book','dvd'].includes(kind);
  return `<span class="artifact ${kind} ${spine?'is-spine':''}" style="--cover-color:${colorFor(x)}">${kind==='vinyl'?`<span class="record"></span><span class="sleeve">${cover(x)}</span><span class="vinyl-stand" aria-hidden="true"></span>`:kind==='polaroid'?`${cover(x)}<span class="photo-caption">${e(x.title)}</span>`:`<span class="binding" aria-hidden="true"></span><span class="jacket">${kind==='dvd'?'<span class="case-label">DVD · VIDEO</span>':''}${cover(x)}</span><span class="page-block" aria-hidden="true"></span>${spine?`<span class="spine-type">${kind==='dvd'?'DVD':'✳︎'}</span><span class="spine-title" dir="auto">${e(x.title)}</span><span class="spine-author">${e(x.creator)}</span>`:''}`}</span>`;
@@ -482,7 +571,7 @@ function fields(x,isEdit=false){const memory=x.type==='memory';return `
  <details class="field photo-field" ${memory?'open':''}><summary class="source-hint">${memory?'A photo from the day':'Cover or photo'} <small>(optional)</small></summary><label class="field"><span>Choose a photo · up to 25 MB</span><input type="file" name="photo" accept="image/jpeg,image/png,image/webp"></label><label class="field" data-memory-only><span>Take a photo</span><input type="file" name="cameraPhoto" accept="image/*" capture="environment"></label><label class="field"><span>Or use an image URL</span><input type="url" name="image" value="${/^https?:/.test(x.image||'')?e(x.image):''}" placeholder="https://…"></label></details>
  <section class="memory-attachments" data-memory-only><h3>Attached media</h3><p>Choose up to 12 books, albums, films, or shows from your shelf.</p><label class="field"><span class="sr-only">Find something to attach</span><input type="search" data-attachment-search placeholder="Find a book, album, film, or show…"></label><div data-attachment-options></div><span class="source-hint" data-attachment-count></span></section>
  ${x.sourceUrl?`<p class="entry-source">${memory?'Original entry':'Found via'} <a href="${e(safeUrl(x.sourceUrl))}" target="_blank" rel="noopener noreferrer">${e(x.source||'Original source')} ↗</a></p>`:''}<div id="entry-error"></div><div class="form-actions"><label class="check-field"><input type="checkbox" name="favorite" ${x.favorite?'checked':''}> ${icon('heart')} ${'Favorite'}</label><div>${!isEdit?'<button type="button" class="text-button" data-action="back-search">Back</button>':''}<button class="button primary" type="submit">${isEdit?'Save changes':memory?'Keep this memory':'Add to my shelf'}</button></div></div>`;}
-function prepareForm(form,x){form.traceLinks=normalizeAttachments(x.attachments);updateFormKind(form);}
+function prepareForm(form,x){form.traceLinks=attachmentsWithPhotos(x.attachments);updateFormKind(form);}
 function updateFormKind(form){const memory=form.elements.type.value==='memory';form.elements.title.closest('label').querySelector('span').textContent='Title';form.elements.title.placeholder=memory?'That rainy Sunday…':'What would you like to remember?';if(memory)form.querySelector('.photo-field').open=true;form.querySelector('[type="submit"]').textContent=form.id==='edit-form'?'Save changes':memory?'Keep this memory':'Add to my shelf';form.querySelectorAll('[data-media-only]').forEach(el=>{el.hidden=memory;el.querySelectorAll('input,select,button').forEach(input=>input.disabled=memory);});form.querySelectorAll('[data-memory-only]').forEach(el=>{el.hidden=!memory;el.querySelectorAll('input').forEach(input=>input.disabled=!memory);});if(memory)renderAttachments(form);}
 function renderAttachments(form){const selected=form.traceLinks||[];const query=form.querySelector('[data-attachment-search]').value.toLowerCase();const shelf=entries().filter(x=>x.type!=='memory');const seen=new Set();const options=[...selected,...shelf].filter(x=>{const key=x.id||x.type+':'+x.title;if(seen.has(key))return false;seen.add(key);return true;});const filtered=options.filter(x=>`${x.title} ${x.creator}`.toLowerCase().includes(query));
  form.traceOptions=options;
@@ -495,7 +584,7 @@ for(const dialog of [logDialog,detailDialog]){
   const other=ev.target.name==='photo'?'cameraPhoto':'photo';
   form.elements[other].value='';
  }
- if(ev.target.matches('[data-attachment-id]')){const item=(form.traceOptions||[]).find(x=>(x.id||x.type+':'+x.title)===ev.target.dataset.attachmentId);if(!item)return;if(ev.target.checked){if(form.traceLinks.length>=12){ev.target.checked=false;notify('Choose up to 12 things for one memory.');return;}form.traceLinks=normalizeAttachments([...form.traceLinks,item]);}else form.traceLinks=form.traceLinks.filter(x=>!(x.id&&x.id===item.id||sameItem(x,item)));renderAttachments(form);}});
+ if(ev.target.matches('[data-attachment-id]')){const item=(form.traceOptions||[]).find(x=>(x.id||x.type+':'+x.title)===ev.target.dataset.attachmentId);if(!item)return;if(ev.target.checked){if(form.traceLinks.length>=12){ev.target.checked=false;notify('Choose up to 12 things for one memory.');return;}form.traceLinks=attachmentsWithPhotos([...form.traceLinks,item]);}else form.traceLinks=form.traceLinks.filter(x=>!(x.id&&x.id===item.id||sameItem(x,item)));renderAttachments(form);}});
  dialog.addEventListener('input',ev=>{if(ev.target.matches('[data-attachment-search]'))renderAttachments(ev.target.closest('form'));});
 }
 function renderEntryForm(){searchController?.abort();searchSequence++;const memory=entryDraft.type==='memory';$('#log-content').innerHTML=modalHead(memory?'Add a memory':'Log this title',memory?'Add a photo, a note, and media from your shelf.':'Add your rating, date, and notes.')+`<form id="entry-form" class="modal-body">${fields(entryDraft)}</form>`;prepareForm($('#entry-form'),entryDraft);}
@@ -526,7 +615,7 @@ async function saveEntry(form,edit){const submit=form.querySelector('[type="subm
  const photo=cameraPhoto?.size?cameraPhoto:data.get('photo');
  const uploaded=photo?.size?await photoData(photo):'';
  if(!form.isConnected||!form.closest('dialog')?.open||owner!==activeSession.user?.id)return;
- const item={...original,id:edit?editingId:uid(),title:String(data.get('title')).trim(),creator:String(data.get(memory?'memoryContext':'creator')||'').trim(),type,year:memory?'':data.get('year'),status:memory?'done':data.get('status'),date:dateOnly(data.get('date')),rating:memory?0:Number(data.get('rating')),genres:normalizeGenres(String(data.get('genres')||'')),notes:String(data.get('notes')).trim(),favorite:data.get('favorite')==='on',image:uploaded||safeUrl(String(data.get('image')||''))||original?.image||'',attachments:memory?normalizeAttachments(form.traceLinks):[],addedAt:original?.addedAt||new Date().toISOString()};
+ const item={...original,id:edit?editingId:uid(),title:String(data.get('title')).trim(),creator:String(data.get(memory?'memoryContext':'creator')||'').trim(),type,year:memory?'':data.get('year'),status:memory?'done':data.get('status'),date:dateOnly(data.get('date')),rating:memory?0:Number(data.get('rating')),genres:normalizeGenres(String(data.get('genres')||'')),notes:String(data.get('notes')).trim(),favorite:data.get('favorite')==='on',image:uploaded||safeUrl(String(data.get('image')||''))||original?.image||'',attachments:memory?attachmentsWithPhotos(form.traceLinks):[],addedAt:original?.addedAt||new Date().toISOString()};
  if(!item.title)throw Error('Give this memory a title.');if(item.date>today())throw Error('Choose today or an earlier date.');item.history=[...new Set([...(original?.history||[]),...(item.status==='done'&&item.date?[item.date]:[])])];const current=collection.started?collection.entries:[];
  const result=edit?current.map(x=>x.id===editingId?item:x):memory?[...current,item]:mergeEntries(current,[item]).entries;
  if(!await persist({started:true,entries:result}))return;await closeModal(edit?'#detail-dialog':'#log-dialog');render();notify(edit?'Changes saved.':memory?'Memory saved.':'Added to your shelf.');
@@ -660,9 +749,10 @@ main.addEventListener('click',async ev=>{const b=ev.target.closest('[data-action
 });
 $('#log-top').addEventListener('click',()=>openLog());
 function download(name,data,type){const url=URL.createObjectURL(new Blob([data],{type}));const a=document.createElement('a');a.href=url;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);}
-function backupCollection(){download(`trace-backup-${today()}.json`,JSON.stringify({format:'trace-backup-v1',exportedAt:new Date().toISOString(),entries:collection.entries},null,2),'application/json');notify(collection.entries.length?'Your collection backup is ready.':'Backup saved. Sample entries aren’t included in your personal collection.');}
+async function backupCollection(){const {entries,missing}=await inlinePhotoRefs(collection.entries,photoDataUrl);download(`trace-backup-${today()}.json`,JSON.stringify({format:'trace-backup-v1',exportedAt:new Date().toISOString(),entries},null,2),'application/json');if(missing){notify(`Backup saved, but ${missing} photo${missing===1?'':'s'} could not be included. Connect to the internet and try again.`);return;}notify(collection.entries.length?'Your collection backup is ready.':'Backup saved. Sample entries aren’t included in your personal collection.');}
 $('#backup').addEventListener('click',backupCollection);
-function loadImage(src){return new Promise(resolve=>{const urls=artworkCandidates(src);if(!urls.length)return resolve(null);const img=new Image();img.crossOrigin='anonymous';let settled=false;const finish=result=>{if(settled)return;settled=true;clearTimeout(timer);img.onload=img.onerror=null;if(!result)img.src='';resolve(result);};const timer=setTimeout(()=>finish(null),9000);const next=()=>{if(settled)return;if(urls.length)img.src=urls.shift();else finish(null);};img.onload=()=>{if(img.naturalWidth<=2&&img.naturalHeight<=2)next();else finish(img);};img.onerror=next;next();});}
+function loadImage(src){const id=photoRefId(typeof src==='string'?src:src?.image);if(id)return resolvePhoto(id).then(url=>url?loadImageUrls([url]):null);return loadImageUrls(artworkCandidates(src));}
+function loadImageUrls(urls){return new Promise(resolve=>{if(!urls.length)return resolve(null);const img=new Image();img.crossOrigin='anonymous';let settled=false;const finish=result=>{if(settled)return;settled=true;clearTimeout(timer);img.onload=img.onerror=null;if(!result)img.src='';resolve(result);};const timer=setTimeout(()=>finish(null),9000);const next=()=>{if(settled)return;if(urls.length)img.src=urls.shift();else finish(null);};img.onload=()=>{if(img.naturalWidth<=2&&img.naturalHeight<=2)next();else finish(img);};img.onerror=next;next();});}
 function fitCover(ctx,img,x,y,w,h){const box=artworkFit(img.naturalWidth||img.width,img.naturalHeight||img.height,w,h);if(!box)return;ctx.fillStyle='#fff4df';ctx.fillRect(x,y,w,h);ctx.drawImage(img,x+box.x,y+box.y,box.width,box.height);}
 function crop(ctx,img,x,y,w,h){const ratio=Math.max(w/img.width,h/img.height),sw=w/ratio,sh=h/ratio;ctx.drawImage(img,(img.width-sw)/2,(img.height-sh)/2,sw,sh,x,y,w,h);}
 function canvasText(ctx,text,x,y,maxWidth,lineHeight,maxLines=2){const words=String(text).split(/\s+/);let lines=[],line='';for(const word of words){const next=line?line+' '+word:word;if(ctx.measureText(next).width>maxWidth&&line){lines.push(line);line=word;}else line=next;}if(line)lines.push(line);lines=lines.slice(0,maxLines);lines.forEach((l,i)=>{if(ctx.measureText(l).width>maxWidth){while(ctx.measureText(l+'…').width>maxWidth&&l.length)l=l.slice(0,-1);l+='…';}ctx.fillText(l,x,y+i*lineHeight);});}
@@ -843,6 +933,7 @@ function receiveLibrary(snapshot){
 async function handleSession(next,context={}){
  if(context.reason==='delete'&&context.deletedUserId){
   const removed=context.deletedUserId;
+  void forgetCachedPhotos(removed);
   try{await librarySync.forgetAccount(removed);}catch{notify('Your server account was deleted. This device could not clear its offline copy. Clear Trace’s site data to remove it.');}
   try{
    for(const name of ['connections','wall'])localStorage.removeItem(`trace.${name}.account.${removed}.v1`);
@@ -865,10 +956,14 @@ async function handleSession(next,context={}){
  try{await librarySync.setSession(next);if(epoch===sessionEpoch){libraryReady=true;renderLibraryStatus();redrawLibrary();}}
  catch(error){if(epoch===sessionEpoch){libraryReady=false;notify(error.message);renderLibraryStatus();}}
 }
-async function libraryRequest(path,body){
- const id=activeSession.user?.id;if(!id)throw Object.assign(Error('Sign in to sync your library.'),{status:401});
+async function verifiedSession(id){
+ if(!id)throw Object.assign(Error('Sign in to sync your library.'),{status:401});
  const check=await apiFetch('/api/auth/session',{credentials:'same-origin',cache:'no-store'});if(!check.ok)throw Object.assign(Error('Sign in again to sync.'),{status:check.status});
  const verified=await check.json();if(activeSession.user?.id!==id||verified.user?.id!==id||localStorage.getItem('trace.pending-logout.v1'))throw Object.assign(Error('Your account changed. Sign in again before syncing.'),{status:401});
+ return verified;
+}
+async function libraryRequest(path,body){
+ const id=activeSession.user?.id,verified=await verifiedSession(id);
  const response=await apiFetch(path,{method:body?'POST':'GET',credentials:'same-origin',cache:'no-store',...(body?{headers:{'Content-Type':'application/json','X-Trace-CSRF':verified.csrf},body:JSON.stringify(body)}:{})});
  let data;try{data=await response.json();}catch{throw Error('The library server could not be reached. Changes remain saved on this device.');}
  if(!response.ok)throw Object.assign(Error(data.error||'Library sync is temporarily unavailable.'),{status:response.status});return data;

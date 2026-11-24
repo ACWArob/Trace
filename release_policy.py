@@ -18,17 +18,33 @@ def signup_mode():
 
 
 def client_ip(peer, headers):
-    """Only a separately configured loopback proxy may supply the client address."""
-    try:
-        address = ipaddress.ip_address(peer)
-    except ValueError:
-        return 'unknown'
-    if production_mode() and os.environ.get('TRACE_TRUST_PROXY') == '1' and address.is_loopback:
-        forwarded = headers.get('X-Trace-Client-IP', '')
+    """The rate-limit key for a request.
+
+    Only a configured proxy may supply the client address: the loopback Caddy
+    proxy (``TRACE_TRUST_PROXY=1``, header ``X-Trace-Client-IP``) or Vercel's
+    edge (``TRACE_TRUST_PROXY=vercel``, first entry of ``x-vercel-forwarded-for``,
+    which Vercel sets itself).  ``X-Real-IP`` and ``X-Forwarded-For`` are never
+    read.  IPv6 addresses are grouped by /64.
+    """
+    trust = os.environ.get('TRACE_TRUST_PROXY') if production_mode() else None
+    address = None
+    if trust == 'vercel':
+        forwarded = headers.get('X-Vercel-Forwarded-For', '') or ''
         try:
-            address = ipaddress.ip_address(forwarded)
+            address = ipaddress.ip_address(forwarded.split(',', 1)[0].strip())
         except ValueError:
             pass
+    if address is None:
+        try:
+            address = ipaddress.ip_address(peer)
+        except ValueError:
+            return 'unknown'
+        if trust == '1' and address.is_loopback:
+            forwarded = headers.get('X-Trace-Client-IP', '')
+            try:
+                address = ipaddress.ip_address(forwarded)
+            except ValueError:
+                pass
     if isinstance(address, ipaddress.IPv6Address):
         if address.ipv4_mapped is not None:
             return str(address.ipv4_mapped)

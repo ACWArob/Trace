@@ -90,13 +90,13 @@ class ScoreServiceTests(PostgresTestCase):
     def test_cron_drain_refreshes_queued_scores(self):
         self.seed_stale()
         service = self.service()
-        service.lookup('movie', 'tt1234567', self.providers(Mock()))
+        service.lookup('movie', 'tt1234567', self.providers(Mock()), title='A Film')
         seen = []
-        def loader_for(provider, kind, imdb_id):
-            seen.append((provider, kind, imdb_id))
+        def loader_for(provider, kind, imdb_id, title):
+            seen.append((provider, kind, imdb_id, title))
             return lambda: [{'source': 'Letterboxd', 'value': 4.3, 'max': 5}]
         self.assertEqual(service.refresh_queued(25, loader_for), {'claimed': 1, 'done': 1, 'failed': 0})
-        self.assertEqual(seen, [('mdblist', 'movie', 'tt1234567')])
+        self.assertEqual(seen, [('mdblist', 'movie', 'tt1234567', 'A Film')])
         self.assertEqual(self.queued(), [])
         refreshed = self.service().lookup('movie', 'tt1234567', self.providers(Mock()))
         self.assertEqual(refreshed['sources'][0]['value'], 4.3)

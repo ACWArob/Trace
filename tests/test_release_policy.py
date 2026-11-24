@@ -7,22 +7,23 @@ from unittest.mock import patch
 
 import server
 from release_policy import RequestBudget, client_ip, signup_mode, library_byte_limit
-from test_production import request
+from tests.test_production import request
 from scripts.manage_beta import write_invite
+from tests.pg_support import PostgresTestCase, bind_server
 
 
-class ReleasePolicyTests(unittest.TestCase):
+class ReleasePolicyTests(PostgresTestCase):
     def setUp(self):
+        super().setUp()
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.directory = Path(directory.name)
-        self.social = server.SocialStore(self.directory / 'test.sqlite3')
-        self.patches = [patch.object(server, 'SOCIAL_STORE', self.social),
-                        patch.object(server, 'CATALOG_STORE', server.CatalogStore(self.social.path)),
-                        patch.dict('os.environ', {'TRACE_ENV':'production', 'TRACE_PUBLIC_ORIGIN':'https://trace.example', 'TRACE_TRUST_PROXY':'1', 'TRACE_SIGNUP_MODE':'invite'})]
+        bind_server(self, self.database)
+        self.social = server.get_social()
+        self.patches = [patch.dict('os.environ', {'TRACE_ENV':'production', 'TRACE_PUBLIC_ORIGIN':'https://trace.example', 'TRACE_TRUST_PROXY':'1', 'TRACE_SIGNUP_MODE':'invite'})]
         for item in self.patches:
             item.start();self.addCleanup(item.stop)
-        server.AUTH_ATTEMPTS.clear();server.API_BUDGET.buckets.clear()
+        server.auth_budget().clear();server.API_BUDGET.buckets.clear()
 
     def call(self, path, payload=None, cookie='', csrf='', address='203.0.113.4'):
         return request(path, 'POST' if payload is not None else 'GET', payload,
@@ -33,6 +34,8 @@ class ReleasePolicyTests(unittest.TestCase):
         self.assertEqual(signup_mode(), 'invite')
         health = self.call('/api/health')
         self.assertEqual(json.loads(health['body']), {'status':'ok'})
+        deep = self.call('/api/health?deep=1')
+        self.assertEqual((deep['status'], json.loads(deep['body'])), (200, {'status':'ok', 'database':'ok'}))
         self.assertEqual(request('/api/health')['status'], 403)
         self.assertEqual(self.call('/api/search?type=book&q=Nedjma')['status'], 401)
         config = json.loads(self.call('/api/auth/config')['body'])
@@ -69,6 +72,69 @@ class ReleasePolicyTests(unittest.TestCase):
         for _ in range(15):self.call('/api/auth/login',{},address='203.0.113.8')
         self.assertEqual(self.call('/api/auth/login',{},address='203.0.113.8')['status'],429)
         self.assertEqual(self.call('/api/auth/login',{},address='203.0.113.9')['status'],401)
+
+    def test_shallow_health_never_opens_the_database(self):
+        with patch.object(server, 'get_database', side_effect=AssertionError('opened the database')):
+            self.assertEqual(json.loads(self.call('/api/health')['body']), {'status':'ok'})
+        with patch.object(server, 'get_database', return_value=server.database.Database('postgresql://127.0.0.1:1/none', connect_timeout=1)):
+            self.assertEqual(self.call('/api/health?deep=1')['status'], 503)
+
+    def test_auth_budget_is_durable_and_namespaced(self):
+        budget = server.auth_budget()
+        self.assertIsInstance(budget, server.DurableBudget)
+        self.assertIs(budget.database, self.database)
+        self.call('/api/auth/login', {}, address='203.0.113.7')
+        with self.database.connect() as db:
+            keys = [row[0] for row in db.execute('SELECT key FROM auth_budget')]
+        self.assertEqual(keys, [budget.digest('auth:203.0.113.7')])
+
+    def test_vercel_mode_keys_on_the_vercel_forwarded_address(self):
+        with patch.dict('os.environ', {'TRACE_TRUST_PROXY':'vercel'}):
+            self.assertEqual(client_ip('', {'X-Vercel-Forwarded-For':'203.0.113.9', 'X-Real-IP':'198.51.100.1'}), '203.0.113.9')
+            self.assertEqual(client_ip('10.0.0.1', {'X-Vercel-Forwarded-For':'203.0.113.9, 10.1.1.1'}), '203.0.113.9')
+            self.assertEqual(client_ip('10.0.0.1', {'X-Real-IP':'198.51.100.1'}), '10.0.0.1')
+            self.assertEqual(client_ip('10.0.0.1', {'X-Vercel-Forwarded-For':'not-an-ip'}), '10.0.0.1')
+            self.assertEqual(client_ip('', {'X-Vercel-Forwarded-For':'2001:db8:1:2::b'}), '2001:db8:1:2::/64')
+            self.assertEqual(client_ip('', {'X-Vercel-Forwarded-For':'::ffff:192.0.2.5'}), '192.0.2.5')
+            self.assertEqual(client_ip('127.0.0.1', {'X-Trace-Client-IP':'203.0.113.4'}), '127.0.0.1')
+        with patch.dict('os.environ', {'TRACE_TRUST_PROXY':'vercel', 'TRACE_ENV':'development'}):
+            self.assertEqual(client_ip('127.0.0.1', {'X-Vercel-Forwarded-For':'203.0.113.9'}), '127.0.0.1')
+
+    def test_vercel_auth_budget_ignores_a_spoofed_real_ip(self):
+        def login(real_ip):
+            return request('/api/auth/login', 'POST', {}, {'HTTP_HOST':'trace.example', 'HTTP_ORIGIN':'https://trace.example',
+                           'HTTP_X_VERCEL_FORWARDED_FOR':'203.0.113.20', 'HTTP_X_REAL_IP':real_ip})
+        with patch.dict('os.environ', {'TRACE_TRUST_PROXY':'vercel'}):
+            for index in range(15):
+                login(f'198.51.100.{index}')
+            self.assertEqual(login('198.51.100.99')['status'], 429)
+
+    def test_preview_deployments_accept_only_their_own_vercel_hosts(self):
+        preview = {'VERCEL_ENV':'preview', 'VERCEL_URL':'trace-abc123-team.vercel.app',
+                   'VERCEL_BRANCH_URL':'trace-git-beta-team.vercel.app'}
+        def get(host):
+            return request('/api/auth/config', headers={'HTTP_HOST':host, 'HTTP_X_TRACE_CLIENT_IP':'203.0.113.4'})
+        with patch.dict('os.environ', preview):
+            self.assertEqual(server.allowed_origins(), ('https://trace.example', 'https://trace-abc123-team.vercel.app',
+                                                        'https://trace-git-beta-team.vercel.app'))
+            self.assertEqual(get('trace-abc123-team.vercel.app')['status'], 200)
+            self.assertEqual(get('trace-git-beta-team.vercel.app')['status'], 200)
+            self.assertEqual(get('other-project.vercel.app')['status'], 403)
+            signup = request('/api/auth/signup', 'POST', {'username':'preview_user', 'password':'synthetic-password-1'},
+                             {'HTTP_HOST':'trace-abc123-team.vercel.app', 'HTTP_ORIGIN':'https://trace-abc123-team.vercel.app'})
+            self.assertEqual(signup['status'], 403)  # invite mode, but past the Origin check
+            self.assertIn('invitation', json.loads(signup['body'])['error'])
+            self.assertEqual(request('/api/auth/login', 'POST', {}, {'HTTP_HOST':'trace-abc123-team.vercel.app',
+                             'HTTP_ORIGIN':'https://trace.example'})['status'], 403)
+
+    def test_production_rejects_every_other_vercel_host(self):
+        production = {'VERCEL_ENV':'production', 'VERCEL_URL':'trace-abc123-team.vercel.app',
+                      'VERCEL_BRANCH_URL':'trace-git-main-team.vercel.app'}
+        with patch.dict('os.environ', production):
+            self.assertEqual(server.allowed_origins(), ('https://trace.example',))
+            for host in ['trace-abc123-team.vercel.app', 'trace-git-main-team.vercel.app', 'trace.vercel.app']:
+                self.assertEqual(request('/api/auth/config', headers={'HTTP_HOST':host})['status'], 403, host)
+            self.assertEqual(request('/api/auth/config', headers={'HTTP_HOST':'trace.example'})['status'], 200)
 
     def test_budgets_expire_and_bound_memory(self):
         now=[0];budget=RequestBudget(maximum_keys=2,clock=lambda:now[0])

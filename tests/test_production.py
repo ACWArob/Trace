@@ -1,7 +1,6 @@
 import io
 import json
 from contextlib import redirect_stdout
-from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -10,7 +9,7 @@ from wsgiref.validate import validator
 
 import production
 import server
-from social import SocialStore
+from tests.pg_support import PostgresTestCase, bind_server
 
 
 def request(path='/', method='GET', body=None, headers=None, validate=True):
@@ -39,20 +38,16 @@ def request(path='/', method='GET', body=None, headers=None, validate=True):
     return response
 
 
-class ProductionAdapterTests(unittest.TestCase):
+class ProductionAdapterTests(PostgresTestCase):
     def setUp(self):
+        super().setUp()
         self.directory = tempfile.TemporaryDirectory()
-        self.store = SocialStore(Path(self.directory.name) / 'test.sqlite3')
+        self.addCleanup(self.directory.cleanup)
+        bind_server(self, self.database)
         self.env = patch.dict('os.environ', {'TRACE_ENV': 'development',
                                             'TRACE_PUBLIC_ORIGIN': ''})
         self.env.start()
-        self.social = patch.object(server, 'SOCIAL_STORE', self.store)
-        self.social.start()
-
-    def tearDown(self):
-        self.social.stop()
-        self.env.stop()
-        self.directory.cleanup()
+        self.addCleanup(self.env.stop)
 
     def test_get_and_head_use_identical_public_allowlist(self):
         public = request('/core.mjs')
@@ -88,7 +83,9 @@ class ProductionAdapterTests(unittest.TestCase):
 
     def test_limits_and_unsupported_methods_are_rejected_before_dispatch(self):
         self.assertEqual(request('/', 'PUT')['status'], 405)
-        self.assertEqual(request('/', headers={'CONTENT_LENGTH': '10000001'})['status'], 413)
+        self.assertEqual(production.MAX_BODY_BYTES, 4_000_000)
+        self.assertEqual(request('/', headers={'CONTENT_LENGTH': '4000001'})['status'], 413)
+        self.assertEqual(request('/', headers={'CONTENT_LENGTH': '4000000'}, validate=False)['status'], 200)
         self.assertEqual(request('/', headers={'CONTENT_LENGTH': '-1'}, validate=False)['status'], 400)
         self.assertEqual(request('/', headers={'SCRIPT_NAME': '/trace'})['status'], 400)
 
@@ -100,6 +97,20 @@ class ProductionAdapterTests(unittest.TestCase):
                                       'TRACE_DATA_DIR': ''}):
             with self.assertRaises(SystemExit):
                 production.run()
+
+    def test_vercel_runtime_needs_no_data_directory_or_waitress(self):
+        output = io.StringIO()
+        vercel = {'TRACE_PUBLIC_ORIGIN': 'https://trace.example', 'TRACE_ENV': 'production',
+                  'TRACE_TRUST_PROXY': 'vercel', 'TRACE_DATA_DIR': '',
+                  'DATABASE_URL': 'postgresql://user@db.example/trace', 'TRACE_DATABASE_URL': ''}
+        with patch.dict('os.environ', vercel), redirect_stdout(output), \
+                patch.dict('sys.modules', {'waitress': None}):
+            production.run(check=True)
+            production.run()
+        self.assertIn('configuration is valid', output.getvalue())
+        with patch.dict('os.environ', {**vercel, 'DATABASE_URL': ''}), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                production.run(check=True)
 
     def test_preflight_does_not_open_a_socket_or_database(self):
         output = io.StringIO()

@@ -64,10 +64,11 @@ class ScoreService:
 
     def refresh_queued(self, limit, loader_for):
         """Drain up to ``limit`` queued keys (cron). ``loader_for(provider, kind,
-        imdb_id)`` returns a no-argument loader, or None to drop a provider that
-        is no longer configured. Keys that fail or hit a cooldown are re-queued."""
-        def load(provider, kind, imdb_id):
-            loader = loader_for(provider, kind, imdb_id)
+        imdb_id, title)`` returns a no-argument loader, or None to drop a provider
+        that is no longer configured; ``title`` is the display title queued with
+        the key, or None. Keys that fail, raise or hit a cooldown are re-queued."""
+        def load(provider, kind, imdb_id, title):
+            loader = loader_for(provider, kind, imdb_id, title)
             if loader is None:
                 return
             status = self.refresh(provider, kind, imdb_id, loader)
@@ -103,9 +104,9 @@ class ScoreService:
         finally:
             self._release_key_lock(key)
 
-    def _enqueue(self, provider, kind, imdb_id):
+    def _enqueue(self, provider, kind, imdb_id, title=None):
         try:
-            self.queue.enqueue(provider, kind, imdb_id)
+            self.queue.enqueue(provider, kind, imdb_id, title=title)
         except Exception:
             pass  # Queueing is best effort; the next stale read tries again.
 
@@ -115,7 +116,9 @@ class ScoreService:
                 'refreshAt': max(cached['refreshAt'] if cached else 0, backoff['refreshAt']) if backoff else cached['refreshAt'] if cached else None,
                 'stale': cached['stale'] if cached else False}
 
-    def lookup(self, kind, imdb_id, providers):
+    def lookup(self, kind, imdb_id, providers, title=None):
+        """``title`` is queued with stale keys so the cron can rebuild provider links."""
+        title = title[:500] if isinstance(title, str) and title else None
         sources, statuses, metadata = [], {}, {}
         valid = valid_score_identity(kind, imdb_id)
         deadline = self.clock() + self.load_budget
@@ -134,11 +137,11 @@ class ScoreService:
                 status = backoff['status']
             elif cached:
                 # Serve the stale scores now; the cron refreshes them.
-                self._enqueue(provider, kind, imdb_id)
+                self._enqueue(provider, kind, imdb_id, title)
                 status = 'available'
             elif self.clock() >= deadline:
                 # This lookup already spent its load budget: queue the rest.
-                self._enqueue(provider, kind, imdb_id)
+                self._enqueue(provider, kind, imdb_id, title)
                 status = 'unavailable'
             else:
                 status = self._load_now((provider, kind, imdb_id), spec['load'], deadline)

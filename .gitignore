@@ -26,3 +26,4 @@ xcuserdata/
 .venv/
 .vercel
 .env*
+public/

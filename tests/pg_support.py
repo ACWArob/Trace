@@ -102,3 +102,18 @@ class PostgresTestCase(unittest.TestCase):
     def setUp(self):
         super().setUp()
         truncate_all(self.database, self.schema)
+
+
+SERVER_GLOBALS = ('CATALOG_STORE', 'SOCIAL_STORE', 'RATINGS_STORE', 'LIBRARY_STORE',
+                  'SCORE_SERVICE', 'AUTH_BUDGET')
+
+
+def bind_server(case, bound):
+    """Point server.py's lazily built Database, stores and budgets at ``bound``
+    for one test; everything is rebuilt on first use and restored on cleanup."""
+    from unittest.mock import patch
+    import server
+    for name, value in (('DATABASE', bound),) + tuple((name, None) for name in SERVER_GLOBALS):
+        patcher = patch.object(server, name, value)
+        patcher.start()
+        case.addCleanup(patcher.stop)

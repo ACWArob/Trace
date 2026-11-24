@@ -67,10 +67,69 @@ function applyUpdate({ reload = false } = {}) {
   return false;
 }
 
+// Native WebViews cannot send the app's cookie jar with <img> requests, so
+// private memory photos are fetched as JSON and swapped in as data URLs.
+const PHOTO_PATH = /^\/api\/photos\/([0-9a-f]{64})$/;
+const PHOTO_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const PHOTO_LIMIT = 24;
+const photoCache = new Map();
+const photoRequests = new Map();
+
+function photo(id) {
+  if (!nativeApp || typeof window.TraceNative?.apiFetch !== 'function' || !/^[0-9a-f]{64}$/.test(id)) return Promise.resolve(null);
+  if (photoCache.has(id)) {
+    const url = photoCache.get(id);
+    photoCache.delete(id);
+    photoCache.set(id, url);
+    return Promise.resolve(url);
+  }
+  if (!photoRequests.has(id)) {
+    photoRequests.set(id, (async () => {
+      try {
+        const response = await window.TraceNative.apiFetch(`/api/photos/${id}?encoding=base64`, { method: 'GET', cache: 'no-store' });
+        if (!response.ok) return null;
+        const { contentType, data } = await response.json();
+        if (!PHOTO_TYPES.has(contentType) || typeof data !== 'string' || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return null;
+        const url = `data:${contentType};base64,${data}`;
+        photoCache.set(id, url);
+        while (photoCache.size > PHOTO_LIMIT) photoCache.delete(photoCache.keys().next().value);
+        return url;
+      } catch {
+        return null;
+      } finally {
+        photoRequests.delete(id);
+      }
+    })());
+  }
+  return photoRequests.get(id);
+}
+
+async function hydratePhotos(root = document) {
+  if (!nativeApp) return;
+  await Promise.all([...root.querySelectorAll('img[src^="/api/photos/"]')].map(async image => {
+    const id = PHOTO_PATH.exec(image.getAttribute('src') || '')?.[1];
+    if (!id) return;
+    const url = await photo(id);
+    if (url && image.getAttribute('src') === `/api/photos/${id}`) image.setAttribute('src', url);
+  }));
+}
+
+if (nativeApp && typeof MutationObserver === 'function') {
+  let queued = false;
+  new MutationObserver(() => {
+    if (queued) return;
+    queued = true;
+    queueMicrotask(() => { queued = false; hydratePhotos(); });
+  }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
+  hydratePhotos();
+}
+
 window.TraceMobile = Object.freeze({
   get state() { return { ...state }; },
   install,
   applyUpdate,
+  photo,
+  hydratePhotos,
 });
 
 window.addEventListener('beforeinstallprompt', event => {

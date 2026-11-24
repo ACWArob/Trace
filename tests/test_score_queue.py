@@ -36,6 +36,24 @@ class ScoreQueueTests(PostgresTestCase):
         self.assertFalse(small.enqueue('mdblist', 'movie', 'tt0000003'))
         self.assertEqual(small.size(), 2)
 
+    def test_titles_are_carried_to_the_loader_and_kept_on_retry(self):
+        self.assertTrue(self.queue.enqueue('omdb', 'movie', 'tt0000001', title='Nedjma', now=1))
+        self.queue.enqueue('mdblist', 'tv', 'tt0000002', now=2)
+        seen = []
+        def loader(provider, kind, external_id, title):
+            seen.append((external_id, title))
+            raise RuntimeError('provider down')
+        self.queue.drain(5, loader, now=50)
+        self.assertEqual(seen, [('tt0000001', 'Nedjma'), ('tt0000002', None)])
+        seen.clear()
+        self.queue.drain(5, lambda *row: seen.append(row))
+        self.assertEqual(sorted(seen), [('mdblist', 'tv', 'tt0000002', None), ('omdb', 'movie', 'tt0000001', 'Nedjma')])
+
+    def test_titles_are_bounded_text(self):
+        for title in [5, 'x' * 501]:
+            with self.assertRaises(ValueError):
+                self.queue.enqueue('omdb', 'movie', 'tt0000001', title=title)
+
     def test_drain_takes_the_oldest_rows_first_and_only_up_to_the_limit(self):
         for index in range(5):
             self.queue.enqueue('mdblist', 'movie', f'tt000000{index}', now=100 - index)
@@ -51,7 +69,7 @@ class ScoreQueueTests(PostgresTestCase):
     def test_failed_rows_are_requeued_at_the_back_and_others_continue(self):
         self.queue.enqueue('mdblist', 'movie', 'tt0000001', now=1)
         self.queue.enqueue('mdblist', 'movie', 'tt0000002', now=2)
-        def loader(provider, kind, external_id):
+        def loader(provider, kind, external_id, title):
             if external_id == 'tt0000001':
                 raise RuntimeError('provider down')
         result = self.queue.drain(5, loader, now=500)
@@ -62,7 +80,7 @@ class ScoreQueueTests(PostgresTestCase):
 
     def test_the_loader_runs_without_holding_a_transaction_or_row_lock(self):
         self.queue.enqueue('mdblist', 'movie', 'tt0000001', now=1)
-        def loader(provider, kind, external_id):
+        def loader(provider, kind, external_id, title):
             # A competing write to the same key must not block while we "load".
             self.assertTrue(ScoreQueue(self.database).enqueue(provider, kind, external_id, now=5))
         self.queue.drain(1, loader)

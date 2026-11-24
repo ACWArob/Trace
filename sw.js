@@ -1,6 +1,6 @@
 /* Only public, fixed app files belong here. Personal collections stay in IndexedDB. */
 const CACHE_PREFIX = 'trace-shell-';
-const CACHE_NAME = `${CACHE_PREFIX}v16`;
+const CACHE_NAME = `${CACHE_PREFIX}v17`;
 const SHELL_FILES = [
   '/index.html', '/privacy.html', '/support.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/letterboxd_zip.mjs', '/tv_starters.mjs', '/collection_starters.mjs',
   '/social.js', '/library_sync.mjs', '/api_client.mjs', '/artwork.mjs', '/mobile.js', '/manifest.webmanifest',
@@ -13,6 +13,8 @@ function shellPath(request) {
   if (request.method !== 'GET') return null;
   const url = new URL(request.url);
   if (url.origin !== self.location.origin || url.username || url.password) return null;
+  // Private photos and every other API response stay out of the worker and its cache.
+  if (url.pathname.startsWith('/api/')) return null;
   // Versioned script/style URLs share their fixed public file's offline copy.
   if (url.search && !/^\?v=[\w.-]+$/.test(url.search)) return null;
   if (url.pathname === '/' && request.mode === 'navigate') return '/index.html';

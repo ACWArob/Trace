@@ -1,5 +1,4 @@
 import json
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -23,15 +22,14 @@ class MediaScoreTests(PostgresTestCase):
         self.assertEqual(book_genres(['Fiction (fictional works by one author)','collection:Name','Fiction','New York Times reviewed']),['Fiction'])
 
     def test_community_scores_separate_same_named_books_and_albums_by_creator(self):
-        with tempfile.TemporaryDirectory() as folder:
-            store=server.SocialStore(Path(folder)/'db.sqlite3')
-            session,_=store.register({'username':'media_test','password':'synthetic-test-password'})
-            for kind in ('book','album'):
-                item={'type':kind,'title':'Same Title','creator':'First Creator','year':'2000'}
-                store.publish(session['user']['id'],{'item':item,'rating':4})
-                store.publish(session['user']['id'],{'item':{**item,'creator':'Second Creator'},'rating':1})
-                self.assertEqual(store.community_rating(item)['value'],4)
-                self.assertEqual(store.community_rating({**item,'creator':'Second Creator'})['value'],1)
+        store=server.SocialStore(self.database)
+        session,_=store.register({'username':'media_test','password':'synthetic-test-password'})
+        for kind in ('book','album'):
+            item={'type':kind,'title':'Same Title','creator':'First Creator','year':'2000'}
+            store.publish(session['user']['id'],{'item':item,'rating':4})
+            store.publish(session['user']['id'],{'item':{**item,'creator':'Second Creator'},'rating':1})
+            self.assertEqual(store.community_rating(item)['value'],4)
+            self.assertEqual(store.community_rating({**item,'creator':'Second Creator'})['value'],1)
 
     def test_openlibrary_work_ratings_and_isbn_resolution_keep_the_correct_work(self):
         item={'externalId':'/works/OL123W'}
@@ -59,30 +57,28 @@ class MediaScoreTests(PostgresTestCase):
         self.assertEqual(google_books_scores({**item,'isbn':'9780140328721'},fetch)[0]['value'],4)
 
     def test_verified_year_is_bound_to_its_record_and_survives_provider_refresh(self):
-        with tempfile.TemporaryDirectory() as folder:
-            store=CatalogStore(Path(folder)/'db.sqlite3')
-            item={'type':'book','title':'A Book','creator':'An Author','year':'1969',
-                  'source':'Open Library','externalId':'/works/OL123W'}
-            store.save('book',None,{'items':[item]})
-            with store.connect() as db:
-                db.execute("UPDATE catalog SET payload=json_set(payload,'$.year','2013','$.verifiedYear','2013')")
-            store.save('book',None,{'items':[item,{**item,'externalId':'/works/OL456W'}]})
-            self.assertEqual(store.identified('book','Open Library','/works/OL123W')['year'],'2013')
-            self.assertEqual(store.identified('book','Open Library','/works/OL456W')['year'],'1969')
+        store=CatalogStore(self.database)
+        item={'type':'book','title':'A Book','creator':'An Author','year':'1969',
+              'source':'Open Library','externalId':'/works/OL123W'}
+        store.save('book',None,{'items':[item]})
+        with store.connect() as db:
+            db.execute('''UPDATE catalog SET payload=payload||'{"year":"2013","verifiedYear":"2013"}'::jsonb''')
+        store.save('book',None,{'items':[item,{**item,'externalId':'/works/OL456W'}]})
+        self.assertEqual(store.identified('book','Open Library','/works/OL123W')['year'],'2013')
+        self.assertEqual(store.identified('book','Open Library','/works/OL456W')['year'],'1969')
 
     def test_tv_and_anime_keep_native_scores_after_details_refresh(self):
-        with tempfile.TemporaryDirectory() as folder:
-            catalog=CatalogStore(Path(folder)/'db.sqlite3')
-            catalog.save('tv',None,{'items':[{'type':'tv','title':'A Show','year':'2000','source':'TVmaze','externalId':'123',
-                'publicScores':[{'source':'TVmaze','value':8.5,'max':10}], 'imdbId':'tt1234567'}]})
-            with patch.object(server,'CATALOG_STORE',catalog),patch('server.get_ratings') as ratings,patch('server.get_social') as social,patch('server.remote_scores') as remote:
-                ratings.return_value.lookup.return_value=[]
-                social.return_value.community_rating.return_value=None
-                remote.return_value={'sources':[{'source':'IMDb','value':8,'max':10},{'source':'Letterboxd','value':4,'max':5}], 'providerStatus':{},'providerMeta':{}}
-                for kind in ('tv','anime'):
-                    result=server.title_scores(kind,'A Show','2000',source='TVmaze',external_id='123')
-                    self.assertEqual([x['source'] for x in result['sources']],['TVmaze','IMDb'])
-                    self.assertEqual(social.return_value.community_rating.call_args[0][0]['type'],kind)
+        catalog=CatalogStore(self.database)
+        catalog.save('tv',None,{'items':[{'type':'tv','title':'A Show','year':'2000','source':'TVmaze','externalId':'123',
+            'publicScores':[{'source':'TVmaze','value':8.5,'max':10}], 'imdbId':'tt1234567'}]})
+        with patch.object(server,'CATALOG_STORE',catalog),patch('server.get_ratings') as ratings,patch('server.get_social') as social,patch('server.remote_scores') as remote:
+            ratings.return_value.lookup.return_value=[]
+            social.return_value.community_rating.return_value=None
+            remote.return_value={'sources':[{'source':'IMDb','value':8,'max':10},{'source':'Letterboxd','value':4,'max':5}], 'providerStatus':{},'providerMeta':{}}
+            for kind in ('tv','anime'):
+                result=server.title_scores(kind,'A Show','2000',source='TVmaze',external_id='123')
+                self.assertEqual([x['source'] for x in result['sources']],['TVmaze','IMDb'])
+                self.assertEqual(social.return_value.community_rating.call_args[0][0]['type'],kind)
 
     def test_album_lookup_validates_identity_and_does_not_treat_nonratings_as_ratings(self):
         data={'id':MBID,'title':'An Album','primary-type':'Album','artist-credit':[{'name':'An Artist'}],
@@ -132,35 +128,33 @@ class MediaScoreTests(PostgresTestCase):
         self.assertEqual(result['sources'][0]['value'],4)
 
     def test_metadata_patch_keeps_newer_artwork_and_adds_verified_source_identity(self):
-        with tempfile.TemporaryDirectory() as folder:
-            store=CatalogStore(Path(folder)/'db.sqlite3')
-            original={'type':'album','source':'Apple Music','externalId':'123','title':'An Album',
-                      'image':'https://example.org/old.jpg','genres':['Rock']}
-            store.save('album',None,{'items':[{**original,'image':'https://example.org/new.jpg'}]})
-            source={'source':'MusicBrainz','externalId':MBID,'sourceUrl':'https://musicbrainz.org/release-group/'+MBID}
-            store.save('album',None,{'items':[{**original,'genres':['folk'],'catalogSources':[source]}]},metadata_only=True)
-            saved=store.identified('album','Apple Music','123')
-            self.assertEqual(saved['image'],'https://example.org/new.jpg')
-            self.assertEqual(saved['genres'],['Rock','folk'])
-            self.assertEqual(saved['catalogSources'],[source])
+        store=CatalogStore(self.database)
+        original={'type':'album','source':'Apple Music','externalId':'123','title':'An Album',
+                  'image':'https://example.org/old.jpg','genres':['Rock']}
+        store.save('album',None,{'items':[{**original,'image':'https://example.org/new.jpg'}]})
+        source={'source':'MusicBrainz','externalId':MBID,'sourceUrl':'https://musicbrainz.org/release-group/'+MBID}
+        store.save('album',None,{'items':[{**original,'genres':['folk'],'catalogSources':[source]}]},metadata_only=True)
+        saved=store.identified('album','Apple Music','123')
+        self.assertEqual(saved['image'],'https://example.org/new.jpg')
+        self.assertEqual(saved['genres'],['Rock','folk'])
+        self.assertEqual(saved['catalogSources'],[source])
 
     def test_old_cached_album_genres_are_cleaned_without_provider_requests(self):
-        with tempfile.TemporaryDirectory() as folder:
-            store=CatalogStore(Path(folder)/'db.sqlite3')
-            item={'type':'album','source':'MusicBrainz','externalId':MBID,'title':'An Album',
-                  'genres':['ambient','offizielle charts','1–4 wochen']}
-            store.save('album','old query',{'items':[item]})
-            with store.connect() as db:
-                db.execute('UPDATE catalog SET genres=?,payload=?',(json.dumps(item['genres']),json.dumps(item)))
-                db.execute('UPDATE catalog_queries SET payload=?',(json.dumps({'items':[item]}),))
-            self.assertEqual(store.cached('album','old query')['items'][0]['genres'],['ambient'])
-            self.assertEqual(store.identified('album','MusicBrainz',MBID)['genres'],['ambient'])
-            self.assertEqual(store.browse('album')['genres'],['ambient'])
-            self.assertEqual(store.browse('all')['genres'],['ambient'])
-            books=[{'type':'book','source':'Open Library','externalId':f'/works/OL{n}W','title':f'Book {n}',
-                    'genres':[f'Genre {n*4+j}' for j in range(4)]} for n in range(3)]
-            store.save('book',None,{'items':books})
-            self.assertEqual(len(store.browse('book')['genres']),12)
+        store=CatalogStore(self.database)
+        item={'type':'album','source':'MusicBrainz','externalId':MBID,'title':'An Album',
+              'genres':['ambient','offizielle charts','1–4 wochen']}
+        store.save('album','old query',{'items':[item]})
+        with store.connect() as db:
+            db.execute('UPDATE catalog SET genres=?,payload=?',(json.dumps(item['genres']),json.dumps(item)))
+            db.execute('UPDATE catalog_queries SET payload=?',(json.dumps({'items':[item]}),))
+        self.assertEqual(store.cached('album','old query')['items'][0]['genres'],['ambient'])
+        self.assertEqual(store.identified('album','MusicBrainz',MBID)['genres'],['ambient'])
+        self.assertEqual(store.browse('album')['genres'],['ambient'])
+        self.assertEqual(store.browse('all')['genres'],['ambient'])
+        books=[{'type':'book','source':'Open Library','externalId':f'/works/OL{n}W','title':f'Book {n}',
+                'genres':[f'Genre {n*4+j}' for j in range(4)]} for n in range(3)]
+        store.save('book',None,{'items':books})
+        self.assertEqual(len(store.browse('book')['genres']),12)
 
     def test_server_persists_album_genres_without_replacing_matched_cover_or_identity(self):
         catalog=CatalogStore(self.database);ratings=RatingsStore(self.database)

@@ -13,8 +13,10 @@ import time
 import threading
 import ssl
 import hmac
-import sqlite3
 from http.cookies import SimpleCookie
+import database
+import maintenance
+from durable_budget import DurableBudget
 from catalog_store import CatalogStore, query_cache_ttl, catalog_search_text
 from book_catalog import search_books, normalize_isbn, openlibrary_scores, google_books_scores, CATALOG_VERSION as BOOK_CATALOG_VERSION
 from music_catalog import search_albums, album_details, match_album, ALBUM_GENRES, CATALOG_VERSION as MUSIC_CATALOG_VERSION
@@ -50,14 +52,14 @@ TLS_CONTEXT = create_tls_context()
 PROVIDERS = {'movie': 'Wikidata / Wikipedia', 'tv': 'TVmaze / Wikidata', 'anime': 'Kitsu',
              'book': 'Open Library', 'album': 'Apple / MusicBrainz'}
 
+DATABASE = None
 CATALOG_STORE = None
 SOCIAL_STORE = None
 RATINGS_STORE = None
 LIBRARY_STORE = None
-STORE_LOCK = threading.Lock()
-AUTH_BUDGET = RequestBudget()
-AUTH_ATTEMPTS = AUTH_BUDGET.buckets
-API_BUDGET = RequestBudget()
+STORE_LOCK = threading.RLock()
+AUTH_BUDGET = None  # DurableBudget shared by every instance; see auth_budget().
+API_BUDGET = RequestBudget()  # Per-instance burst limiter only.
 PUBLIC_FILES = frozenset(('/', '/index.html', '/privacy.html', '/support.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/social.js', '/library_sync.mjs', '/api_client.mjs', '/artwork.mjs', '/letterboxd_zip.mjs', '/tv_starters.mjs', '/collection_starters.mjs', '/mobile.js', '/sw.js', '/manifest.webmanifest'))
 SCORE_SERVICE = None
 
@@ -73,11 +75,37 @@ def public_origin():
     return 'https://' + parsed.hostname.lower() + (':' + str(port) if port and port != 443 else '')
 
 
+def _vercel_origin(host):
+    host = (host or '').strip().lower()
+    if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?', host):
+        return ''
+    return 'https://' + host
+
+
+def allowed_origins():
+    """HTTPS origins this deployment answers on: TRACE_PUBLIC_ORIGIN, plus a
+    Vercel preview's own deployment and branch URLs. Production never accepts
+    other *.vercel.app aliases."""
+    origins = [public_origin()]
+    if os.environ.get('VERCEL_ENV') == 'preview':
+        origins += [_vercel_origin(os.environ.get('VERCEL_URL')), _vercel_origin(os.environ.get('VERCEL_BRANCH_URL'))]
+    return tuple(dict.fromkeys(origin for origin in origins if origin))
+
+
+def get_database():
+    """The one Database (connection settings only) shared by every store."""
+    global DATABASE
+    with STORE_LOCK:
+        if DATABASE is None:
+            DATABASE = database.Database.from_env()
+        return DATABASE
+
+
 def get_catalog():
     global CATALOG_STORE
     with STORE_LOCK:
         if CATALOG_STORE is None:
-            CATALOG_STORE = CatalogStore()
+            CATALOG_STORE = CatalogStore(get_database())
     return CATALOG_STORE
 
 
@@ -85,7 +113,7 @@ def get_social():
     global SOCIAL_STORE
     with STORE_LOCK:
         if SOCIAL_STORE is None:
-            SOCIAL_STORE = SocialStore()
+            SOCIAL_STORE = SocialStore(get_database())
     return SOCIAL_STORE
 
 
@@ -93,17 +121,25 @@ def get_ratings():
     global RATINGS_STORE
     with STORE_LOCK:
         if RATINGS_STORE is None:
-            RATINGS_STORE = RatingsStore()
+            RATINGS_STORE = RatingsStore(get_database())
     return RATINGS_STORE
 
 
 def get_library():
-    get_social()  # Existing accounts own private library rows.
     global LIBRARY_STORE
     with STORE_LOCK:
         if LIBRARY_STORE is None:
-            LIBRARY_STORE = LibraryStore(byte_limit=library_byte_limit() if production_mode() else None)
+            LIBRARY_STORE = LibraryStore(get_database(), byte_limit=library_byte_limit() if production_mode() else None)
     return LIBRARY_STORE
+
+
+def auth_budget():
+    """Login/signup/recovery budget shared by every instance (table auth_budget)."""
+    global AUTH_BUDGET
+    with STORE_LOCK:
+        if AUTH_BUDGET is None:
+            AUTH_BUDGET = DurableBudget(get_database())
+        return AUTH_BUDGET
 
 
 def attach_scores(result):
@@ -134,7 +170,23 @@ def remote_scores(kind, title, imdb_id):
     return score_service().lookup(kind, imdb_id, {
         'omdb': {'enabled': bool(os.environ.get('OMDB_API_KEY')), 'load': lambda: omdb_scores(imdb_id, title, fetch)},
         'mdblist': {'enabled': bool(os.environ.get('MDBLIST_API_KEY')), 'load': lambda: mdblist_scores(imdb_id, title, kind, fetch)},
-    })
+    }, title=title)
+
+
+def score_loader(provider, kind, external_id, title):
+    """Rebuild a queued key's provider loader for the cron, or None to drop it
+    (provider not configured, or one whose loader needs the full record)."""
+    title = title or ''
+    if provider == 'omdb' and os.environ.get('OMDB_API_KEY'):
+        return lambda: omdb_scores(external_id, title, fetch)
+    if provider == 'mdblist' and os.environ.get('MDBLIST_API_KEY'):
+        return lambda: mdblist_scores(external_id, title, kind, fetch)
+    if provider == 'openlibrary' and kind == 'book':
+        if re.fullmatch(r'/works/OL\d+W', external_id):
+            return lambda: openlibrary_scores({'externalId': external_id, 'title': title}, fetch)
+        if external_id.startswith('isbn:'):
+            return lambda: openlibrary_scores({'isbn': external_id[5:], 'title': title}, fetch)
+    return None
 
 
 def title_scores(kind, title, year, imdb_id='', *, creator='', source='', external_id='', isbn=''):
@@ -204,7 +256,7 @@ def media_scores(item, isbn=''):
                 get_ratings().save_provider_cache('musicbrainz', kind, target, details['publicScores'])
             return details['publicScores']
         providers['musicbrainz'] = {'enabled': True, 'load': load_album}
-    extra = score_service().lookup(kind, identifier, providers)
+    extra = score_service().lookup(kind, identifier, providers, title=item.get('title'))
     scores = merge_scores(item.get('publicScores') or [], extra['sources'])
     community = get_social().community_rating(item)
     if community:
@@ -228,7 +280,7 @@ def fetch(url, provider):
             time.sleep(wait)
         LAST[provider] = time.monotonic()
     req = Request(url, headers={'User-Agent': 'Trace/0.1 (https://github.com/ACWArob/Trace)', 'Accept': 'application/vnd.api+json' if provider == 'kitsu' else 'application/json'})
-    with urlopen(req, timeout=18, context=TLS_CONTEXT) as response:
+    with urlopen(req, timeout=9, context=TLS_CONTEXT) as response:
         return json.load(response)
 
 
@@ -366,18 +418,18 @@ class Handler(SimpleHTTPRequestHandler):
     def valid_host(self):
         try:
             host = urlparse('http://' + self.headers.get('Host', '')).hostname
-            configured = public_origin()
+            hosted = 'https://' + self.headers.get('Host', '').lower().removesuffix(':443') in allowed_origins()
             if production_mode():
-                return bool(configured and 'https://' + self.headers.get('Host', '').lower().removesuffix(':443') == configured)
-            return host in ('localhost', '127.0.0.1', '::1') or bool(configured and 'https://' + self.headers.get('Host', '').lower().removesuffix(':443') == configured)
+                return hosted
+            return host in ('localhost', '127.0.0.1', '::1') or hosted
         except ValueError:
             return False
 
     def request_origin(self):
-        configured = public_origin()
         host = self.headers.get('Host', '')
-        if configured and 'https://' + host.lower().removesuffix(':443') == configured:
-            return configured
+        origin = 'https://' + host.lower().removesuffix(':443')
+        if origin in allowed_origins():
+            return origin
         return 'http://' + host
 
     def cookie_secure(self):
@@ -397,7 +449,7 @@ class Handler(SimpleHTTPRequestHandler):
             if not get_social().session(self.session_token())['user']:
                 self.send_json({'error': 'Sign in to search the live catalogs and refresh scores.'}, 401)
                 return False
-        except sqlite3.Error:
+        except database.Error:
             self.send_json({'error': 'Trace is temporarily unavailable.'}, 503)
             return False
         return self.budget('catalog', 90)
@@ -414,7 +466,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({'error': str(exc)}, exc.status)
         except ValueError:
             return self.send_json({'error': 'Invalid library cursor or page size.'}, 400)
-        except sqlite3.Error:
+        except database.Error:
             return self.send_json({'error': 'The library database is busy. Your device changes are still saved.'}, 503)
 
     def library_post(self):
@@ -431,7 +483,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(get_library().sync(session['user']['id'], payload.get('changes')))
         except SocialError as exc:
             return self.send_json({'error': str(exc)}, exc.status)
-        except sqlite3.Error:
+        except database.Error:
             return self.send_json({'error': 'The library database is busy. Your device changes are still saved.'}, 503)
 
     def session_token(self):
@@ -463,7 +515,7 @@ class Handler(SimpleHTTPRequestHandler):
             payload = self.read_json()
             store, token = get_social(), self.session_token()
             if path in ('/api/auth/signup', '/api/auth/login', '/api/auth/recover'):
-                if not AUTH_BUDGET.allow(client_ip(self.client_address[0], self.headers), 15):
+                if not auth_budget().allow('auth:' + client_ip(self.client_address[0], self.headers), 15):
                     raise SocialError('Too many sign-in attempts. Try again in a minute.', 429)
                 if path.endswith('signup'):
                     mode = signup_mode()
@@ -487,11 +539,11 @@ class Handler(SimpleHTTPRequestHandler):
                 store.logout(token)
                 return self.send_json({'user': None}, headers={'Set-Cookie': 'trace_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0' + self.cookie_secure()})
             if path == '/api/auth/recovery-codes':
-                if not AUTH_BUDGET.allow(client_ip(self.client_address[0], self.headers), 15):
+                if not auth_budget().allow('auth:' + client_ip(self.client_address[0], self.headers), 15):
                     raise SocialError('Too many account requests. Try again in a minute.', 429)
                 return self.send_json(store.issue_recovery_codes(user_id, payload.get('password')))
             if path == '/api/auth/delete':
-                if not AUTH_BUDGET.allow(client_ip(self.client_address[0], self.headers), 15):
+                if not auth_budget().allow('auth:' + client_ip(self.client_address[0], self.headers), 15):
                     raise SocialError('Too many account requests. Try again in a minute.', 429)
                 if payload.get('confirmation') != session['user']['username']:
                     raise SocialError('Type your username to confirm account deletion.')
@@ -512,7 +564,7 @@ class Handler(SimpleHTTPRequestHandler):
             raise SocialError('Unknown social action.', 404)
         except SocialError as exc:
             return self.send_json({'error': str(exc)}, exc.status)
-        except sqlite3.Error:
+        except database.Error:
             return self.send_json({'error': 'The social database is busy. Please try again.'}, 503)
 
     def social_get(self, parsed):
@@ -538,7 +590,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({'error': str(exc)}, exc.status)
         except ValueError:
             return self.send_json({'error': 'Invalid page.'}, 400)
-        except sqlite3.Error:
+        except database.Error:
             return self.send_json({'error': 'The social database is busy. Please try again.'}, 503)
 
     def do_POST(self):
@@ -577,16 +629,35 @@ class Handler(SimpleHTTPRequestHandler):
         except (FeedUnavailable, HTTPError, URLError, TimeoutError, OSError):
             return self.send_json({'error': 'This public profile feed is unavailable. Check that the profile is public, try again later, or import its CSV export.'}, 502)
 
+    def cron_maintenance(self):
+        # Authenticated by the shared secret, not cookies, so it skips the Host
+        # check: Vercel's scheduler may call a deployment URL, not the domain.
+        secret = os.environ.get('CRON_SECRET', '')
+        supplied = self.headers.get('Authorization', '') or ''
+        if not secret or not hmac.compare_digest(supplied.encode(), ('Bearer ' + secret).encode()):
+            return self.send_json({'error': 'Unauthorized.'}, 401)
+        try:
+            return self.send_json(maintenance.run(get_database(), service=score_service(), loader_for=score_loader))
+        except database.Error:
+            return self.send_json({'error': 'Maintenance could not reach the database.'}, 503)
+
     def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == '/api/cron/maintenance':
+            return self.cron_maintenance()
         if not self.valid_host():
             return self.send_json({'error': 'Unknown host.'}, 403)
-        parsed = urlparse(self.path)
         if parsed.path == '/api/health':
-            try:
-                with get_catalog().connect() as db:
-                    db.execute('SELECT 1').fetchone()
+            # Shallow by default so uptime checks never wake the database.
+            if parse_qs(parsed.query).get('deep') != ['1']:
                 return self.send_json({'status': 'ok'})
-            except sqlite3.Error:
+            if production_mode() and not self.budget('read', 240):
+                return
+            try:
+                with get_database().connect() as db:
+                    db.execute('SELECT 1').fetchone()
+                return self.send_json({'status': 'ok', 'database': 'ok'})
+            except database.Error:
                 return self.send_json({'status': 'unavailable'}, 503)
         if production_mode() and parsed.path.startswith('/api/') and not self.budget('read', 240):
             return
@@ -608,7 +679,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(title_scores(kind, title, year, params.get('imdbId', [''])[0],
                     creator=params.get('creator', [''])[0][:500], source=params.get('source', [''])[0][:100],
                     external_id=params.get('externalId', [''])[0][:100], isbn=params.get('isbn', [''])[0][:40]))
-            except sqlite3.Error:
+            except database.Error:
                 return self.send_json({'error': 'The ratings database is busy. Try again shortly.'}, 503)
         if parsed.path == '/api/catalog':
             params = parse_qs(parsed.query)

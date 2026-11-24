@@ -3,12 +3,11 @@ import json
 from pathlib import Path
 import threading
 import unittest
-from unittest.mock import patch
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import server
 from social import SocialStore
-from tests.pg_support import PostgresTestCase
+from tests.pg_support import PostgresTestCase, bind_server
 
 
 class QuietHandler(server.Handler):
@@ -19,9 +18,8 @@ class QuietHandler(server.Handler):
 class SocialHTTPTests(PostgresTestCase):
     def setUp(self):
         super().setUp()
-        for name,store in [('SOCIAL_STORE',server.SocialStore),('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore)]:
-            patcher=patch.object(server,name,store(self.database));patcher.start();self.addCleanup(patcher.stop)
-        server.AUTH_ATTEMPTS.clear()
+        bind_server(self,self.database)
+        server.auth_budget().clear()
         self.http=server.ThreadingHTTPServer(('127.0.0.1',0),QuietHandler)
         self.thread=threading.Thread(target=self.http.serve_forever,daemon=True);self.thread.start()
         self.addCleanup(self.http.server_close);self.addCleanup(self.http.shutdown)

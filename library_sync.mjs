@@ -1,10 +1,46 @@
-const MAX_BYTES=9_500_000; // Below the server's decimal 10 MB request limit, including envelope.
+// Below the 4.5 MB hosted function body limit, including the JSON envelope.
+export const MAX_BYTES=4_000_000;
 const copy=value=>structuredClone(value);
 const same=(a,b)=>JSON.stringify(a)===JSON.stringify(b);
 const empty=()=>({entries:{},revisions:{},pending:{},conflicts:{},cursor:0,sequence:0});
 const own=(object,key)=>Object.hasOwn(object,key);
 const value=(object,key,fallback)=>own(object,key)?object[key]:fallback;
 const assign=(object,key,value)=>Object.defineProperty(object,key,{value,writable:true,enumerable:true,configurable:true});
+
+// Memory photos are uploaded once and referenced by the SHA-256 of their bytes.
+const PHOTO_REF=/^trace-photo:([0-9a-f]{64})$/;
+const PHOTO_DATA=/^data:(image\/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})$/;
+export const isPhotoRef=value=>typeof value==='string'&&PHOTO_REF.test(value);
+export const photoRefId=value=>typeof value==='string'?PHOTO_REF.exec(value)?.[1]||null:null;
+export const isPhotoData=value=>typeof value==='string'&&PHOTO_DATA.test(value);
+export function decodePhotoDataUrl(value){
+ const match=typeof value==='string'&&PHOTO_DATA.exec(value);if(!match)return null;
+ const binary=atob(match[2]),bytes=new Uint8Array(binary.length);
+ for(let index=0;index<binary.length;index++)bytes[index]=binary.charCodeAt(index);
+ return {type:match[1],bytes};
+}
+export async function photoDigest(bytes){
+ const subtle=globalThis.crypto?.subtle;
+ if(!subtle)throw Object.assign(new Error('Photo sync needs a secure HTTPS connection.'),{status:400});
+ return [...new Uint8Array(await subtle.digest('SHA-256',bytes))].map(byte=>byte.toString(16).padStart(2,'0')).join('');
+}
+// The entry image and each linked item's image may hold a photo.
+function photoFields(row){
+ if(!row||typeof row!=='object')return [];
+ const fields=[{owner:row,key:'image'}];
+ if(Array.isArray(row.attachments))for(const item of row.attachments)if(item&&typeof item==='object')fields.push({owner:item,key:'image'});
+ return fields;
+}
+// Exports must stand alone, so refs become inline data URLs. resolve(id) returns a data URL or null.
+export async function inlinePhotoRefs(entries,resolve){
+ const result=copy(entries),found=new Map();let missing=0;
+ for(const row of result)for(const {owner,key} of photoFields(row)){
+  const id=photoRefId(owner[key]);if(!id)continue;
+  if(!found.has(id)){let data=null;try{data=await resolve(id);}catch{}found.set(id,isPhotoData(data)?data:null);}
+  if(found.get(id))owner[key]=found.get(id);else missing++;
+ }
+ return {entries:result,missing};
+}
 
 // Rebase the user's changed fields onto the latest durable snapshot. Two UI
 // actions may start before either IndexedDB transaction has completed.
@@ -58,7 +94,7 @@ export function createIndexedDBStorage(indexedDB=globalThis.indexedDB){
  return {get:key=>transact('readonly',key),put:(key,value)=>transact('readwrite',key,value),update};
 }
 
-export function createLibrarySync({request,onChange=()=>{},onStatus=()=>{},storage=createIndexedDBStorage()}){
+export function createLibrarySync({request,uploadPhoto=null,onChange=()=>{},onStatus=()=>{},storage=createIndexedDBStorage()}){
  let current=null,epoch=0,storageTail=Promise.resolve(),destroyed=false;
  const active=context=>!destroyed&&current===context&&context.epoch===epoch;
  function snapshot(context=current){
@@ -132,24 +168,60 @@ export function createLibrarySync({request,onChange=()=>{},onStatus=()=>{},stora
    if(more&&result.cursor<=after)throw new Error('The library server returned an invalid cursor.');
   }
  }
- function batch(context){
+ // Upload pending data: photos and swap in their refs before batching. The
+ // pending version and baseRevision stay unchanged, so acknowledgments still match.
+ async function externalize(context,run){
+  if(typeof uploadPhoto!=='function')return;
+  for(const [id] of Object.entries(context.data.pending)){
+   if(!active(context))return;
+   if(own(context.data.conflicts,id)||run.failed.has(id))continue;
+   const photos=[...new Set(photoFields(value(context.data.entries,id,null)).map(({owner,key})=>owner[key]).filter(isPhotoData))];
+   if(!photos.length)continue;
+   const refs=new Map();
+   try{
+    for(const photo of photos){
+     if(!run.uploaded.has(photo)){
+      const ref=await uploadPhoto(photo);
+      if(!isPhotoRef(ref))throw Object.assign(new Error('The photo server returned an invalid photo reference.'),{status:502});
+      run.uploaded.set(photo,ref);
+     }
+     refs.set(photo,run.uploaded.get(photo));
+    }
+   }catch(error){
+    // Offline or signed out: stop now and retry the whole sync later.
+    if(!error?.status||error.status===401||error.status===403)throw error;
+    const failure=new Error(`A photo could not be uploaded. ${error.message||error} The entry stays saved on this device.`,{cause:error});
+    failure.status=error.status;run.failed.set(id,failure);continue;
+   }
+   if(!active(context))return;
+   await mutate(context,data=>{
+    let changed=false;
+    for(const {owner,key} of photoFields(value(data.entries,id,null)))if(refs.has(owner[key])){owner[key]=refs.get(owner[key]);changed=true;}
+    return changed;
+   });
+  }
+ }
+ function batch(context,failed=new Map()){
   const changes=[],versions={};let bytes=new TextEncoder().encode('{"changes":[]}').length;
   for(const [id,pending] of Object.entries(context.data.pending)){
-   if(own(context.data.conflicts,id))continue;
+   if(own(context.data.conflicts,id)||failed.has(id))continue;
    const change={id,entry:value(context.data.entries,id,null),baseRevision:pending.baseRevision};
    const size=new TextEncoder().encode(JSON.stringify(change)).length+(changes.length?1:0);
-   if(bytes+size>MAX_BYTES){if(!changes.length)throw new Error('An entry is too large to sync (10 MB maximum).');break;}
+   if(bytes+size>MAX_BYTES){if(!changes.length)throw Object.assign(new Error('An entry is too large to sync (4 MB maximum). Shorten its notes or remove a linked item, then try again. It stays saved on this device.'),{status:413});break;}
    changes.push(copy(change));assign(versions,id,pending.version);bytes+=size;
    if(changes.length===100)break;
   }
   return {changes,versions};
  }
- async function push(context){
+ async function push(context,run={uploaded:new Map(),failed:new Map()}){
   while(active(context)){
    await context.tail;
    if(!active(context))return;
-   const {changes,versions}=batch(context);
-   if(!changes.length)return;
+   await externalize(context,run);
+   if(!active(context))return;
+   await context.tail;
+   const {changes,versions}=batch(context,run.failed);
+   if(!changes.length){if(run.failed.size)throw run.failed.values().next().value;return;}
    const result=await request('/api/library/sync',{changes});
    if(!active(context))return;
    await mutate(context,data=>{
@@ -173,12 +245,13 @@ export function createLibrarySync({request,onChange=()=>{},onStatus=()=>{},stora
   status(context,'syncing');
   context.sync=(async()=>{
    try{
+    const run={uploaded:new Map(),failed:new Map()};
     await context.tail;
     await pull(context);
-    if(active(context))await push(context);
+    if(active(context))await push(context,run);
     if(active(context))await pull(context);
     // Edits queued during the final pull must also reach the server.
-    while(active(context)&&Object.keys(context.data.pending).some(id=>!own(context.data.conflicts,id)))await push(context);
+    while(active(context)&&Object.keys(context.data.pending).some(id=>!own(context.data.conflicts,id)))await push(context,run);
     if(active(context))settle(context);
    }catch(error){
     if(active(context)){

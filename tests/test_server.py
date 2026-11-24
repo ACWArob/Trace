@@ -1,5 +1,4 @@
 import unittest
-import tempfile
 from unittest.mock import patch
 import sys
 from pathlib import Path
@@ -8,13 +7,13 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier, Event
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import server
+from tests.pg_support import PostgresTestCase, bind_server
 
-class SearchTests(unittest.TestCase):
+class SearchTests(PostgresTestCase):
     def setUp(self):
+        super().setUp()
         server.CACHE.clear()
-        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
-        for name, store in [('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore),('SOCIAL_STORE',server.SocialStore)]:
-            patcher=patch.object(server,name,store(Path(directory.name)/'test.sqlite3'));patcher.start();self.addCleanup(patcher.stop)
+        bind_server(self,self.database)
 
     @patch('server.fetch')
     def test_album_adapter_rejects_tracks_and_keeps_source(self, fetch):
@@ -96,12 +95,11 @@ class SearchTests(unittest.TestCase):
         self.assertNotIn('place',server.PROVIDERS)
         self.assertNotIn('restaurant',server.PROVIDERS)
 
-class DescriptionTests(unittest.TestCase):
+class DescriptionTests(PostgresTestCase):
     def setUp(self):
+        super().setUp()
         server.CACHE.clear()
-        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
-        for name, store in [('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore),('SOCIAL_STORE',server.SocialStore)]:
-            patcher=patch.object(server,name,store(Path(directory.name)/'test.sqlite3'));patcher.start();self.addCleanup(patcher.stop)
+        bind_server(self,self.database)
 
     @patch('server.fetch')
     def test_openlibrary_description_formats_and_cache(self, fetch):
@@ -128,12 +126,11 @@ class DescriptionTests(unittest.TestCase):
         show=server.search('tv','a show')['items'][0]
         self.assertEqual(show['description'],'A & B')
 
-class GenreTests(unittest.TestCase):
+class GenreTests(PostgresTestCase):
     def setUp(self):
+        super().setUp()
         server.CACHE.clear()
-        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
-        for name, store in [('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore),('SOCIAL_STORE',server.SocialStore)]:
-            patcher=patch.object(server,name,store(Path(directory.name)/'test.sqlite3'));patcher.start();self.addCleanup(patcher.stop)
+        bind_server(self,self.database)
 
     @patch('server.fetch')
     def test_movie_claims_resolve_genres_without_guessing_from_description(self, fetch):
@@ -153,15 +150,14 @@ class GenreTests(unittest.TestCase):
         fetch.return_value={'docs':[{'key':'/works/OL9W','title':'Dune','subject':['Science Fiction']}]}
         self.assertEqual(server.search('book','dune')['items'][0]['genres'],['Science Fiction'])
 
-class PublicScoreTests(unittest.TestCase):
+class PublicScoreTests(PostgresTestCase):
     def setUp(self):
+        super().setUp()
         server.CACHE.clear()
-        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
-        for name, store in [('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore),('SOCIAL_STORE',server.SocialStore)]:
-            patcher=patch.object(server,name,store(Path(directory.name)/'test.sqlite3'));patcher.start();self.addCleanup(patcher.stop)
+        bind_server(self,self.database)
         patcher=patch.dict('os.environ',{'MDBLIST_API_KEY':'synthetic-mdblist','OMDB_API_KEY':'synthetic-omdb'},clear=True)
         patcher.start();self.addCleanup(patcher.stop)
-        with server.get_ratings().db() as db:
+        with self.database.connect() as db:
             db.execute('INSERT INTO public_scores VALUES(?,?,?,?,?,?,?)',('IMDb','tt1234567',8,10,1000,'https://www.imdb.com/title/tt1234567/ratings/',0))
 
     @patch('server.mdblist_scores')

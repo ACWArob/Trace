@@ -1,6 +1,7 @@
-"""Bounded WSGI hosting for Trace, behind the deployment's local HTTPS proxy.
+"""Bounded WSGI hosting for Trace: Vercel's Python runtime (api/index.py) or
+Waitress behind a local HTTPS proxy.
 
-Waitress parses HTTP. This adapter calls Trace's existing route methods directly;
+Vercel or Waitress parses HTTP. This adapter calls Trace's existing route methods directly;
 it never passes a reconstructed HTTP request through BaseHTTPRequestHandler.
 """
 from email.message import Message
@@ -16,7 +17,7 @@ from server import Handler, ROOT, public_origin
 from ratings import load_local_rating_key
 from release_policy import signup_mode, library_byte_limit
 
-MAX_BODY_BYTES = 10_000_000
+MAX_BODY_BYTES = 4_000_000  # Vercel caps request bodies at 4.5 MB.
 HOP_HEADERS = frozenset(('connection', 'keep-alive', 'proxy-authenticate',
                          'proxy-authorization', 'te', 'trailer',
                          'transfer-encoding', 'upgrade'))
@@ -151,10 +152,19 @@ def run(*, check=False):
         raise SystemExit('Set TRACE_ENV=production before starting the hosted runtime.')
     if not public_origin():
         raise SystemExit('Set TRACE_PUBLIC_ORIGIN to the hosted HTTPS origin before starting Trace.')
+    if os.environ.get('TRACE_TRUST_PROXY') == 'vercel':
+        # Vercel serves api/index.py; there is no local process, data directory or Waitress.
+        if not (os.environ.get('TRACE_DATABASE_URL') or os.environ.get('DATABASE_URL')):
+            raise SystemExit('Set TRACE_DATABASE_URL or DATABASE_URL to the Postgres connection URL.')
+        signup_mode()
+        library_byte_limit()
+        print('Trace production configuration is valid.' if check
+              else 'Vercel serves Trace through api/index.py; there is nothing to start here.')
+        return
     if not os.path.isabs(os.environ.get('TRACE_DATA_DIR', '')):
         raise SystemExit('Set TRACE_DATA_DIR to an absolute persistent private data directory.')
     if os.environ.get('TRACE_TRUST_PROXY') != '1':
-        raise SystemExit('Set TRACE_TRUST_PROXY=1 for the local Caddy proxy.')
+        raise SystemExit('Set TRACE_TRUST_PROXY=1 for the local Caddy proxy (or vercel on Vercel).')
     signup_mode()
     library_byte_limit()
     if check:
