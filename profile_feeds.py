@@ -1,10 +1,12 @@
 """Read-only public profile feeds. No passwords, OAuth tokens, or arbitrary URLs."""
 from urllib.parse import urlsplit, urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request, urlopen, build_opener, HTTPSHandler, HTTPRedirectHandler
+from urllib.error import HTTPError
 from email.utils import parsedate_to_datetime
 from datetime import date
 import xml.etree.ElementTree as ET
 import html
+import json
 import math
 import re
 
@@ -109,3 +111,124 @@ def read_profile_feed(service, identifier, context):
         payload = response.read(2 * 1024 * 1024 + 1)
     return {'items': parse_feed(service, payload), 'identifier': identifier, 'profileUrl': profile_url,
             'service': service, 'mode': 'public-feed', 'limited': True}
+
+
+# A Letterboxd film's own poster, used only when catalog matching found no cover.
+LETTERBOXD_PAGE_LIMIT = 600_000
+LETTERBOXD_TIMEOUT = 8
+_FILM_PATH = re.compile(r'/(?:[A-Za-z0-9_-]{1,40}/)?film/([A-Za-z0-9-]{1,200})/?')
+_MEMBER_FILM_PATH = re.compile(r'/(?:[A-Za-z0-9_-]{1,40}/)?film/([A-Za-z0-9-]{1,200})/(?:\d{1,4}/)?')
+
+
+def _https_parts(value, hosts):
+    value = value if isinstance(value, str) else ''
+    if not value or len(value) > 400 or re.search(r'[\x00-\x20\x7f\\]', value):
+        raise ValueError('Invalid URL.')
+    parsed = urlsplit(value)
+    if (parsed.scheme != 'https' or parsed.netloc not in hosts or parsed.query or parsed.fragment):
+        raise ValueError('Invalid URL.')
+    return parsed
+
+
+def letterboxd_film_url(value):
+    """Canonical https://boxd.it/<code> or https://letterboxd.com/film/<slug>/, else ValueError."""
+    parsed = _https_parts(value, ('boxd.it', 'letterboxd.com'))
+    if parsed.netloc == 'boxd.it':
+        match = re.fullmatch(r'/([A-Za-z0-9]{1,16})', parsed.path)
+        if match:
+            return 'https://boxd.it/' + match[1]
+    else:
+        match = _FILM_PATH.fullmatch(parsed.path)
+        if match:
+            return 'https://letterboxd.com/film/' + match[1].lower() + '/'
+    raise ValueError('Use a Letterboxd film link.')
+
+
+def letterboxd_redirect_target(value):
+    """A redirect may only land on a letterboxd.com film page (a member's page maps to the film)."""
+    parsed = _https_parts(value, ('letterboxd.com',))
+    match = _MEMBER_FILM_PATH.fullmatch(parsed.path)
+    if not match:
+        raise ValueError('Letterboxd redirected away from a film page.')
+    return 'https://letterboxd.com/film/' + match[1].lower() + '/'
+
+
+class LetterboxdRedirectHandler(HTTPRedirectHandler):
+    max_redirections = 4
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return Request(letterboxd_redirect_target(newurl), headers=dict(req.header_items()), method='GET')
+
+
+def letterboxd_poster_image(value):
+    if not isinstance(value, str):
+        return ''
+    value = html.unescape(value).strip()
+    try:
+        parsed = _https_parts(value, ('a.ltrbxd.com',))
+    except ValueError:
+        try:  # Poster URLs may carry a cache-busting query; nothing else.
+            base, _, query = value.partition('?')
+            if not re.fullmatch(r'[A-Za-z0-9=&._-]{1,80}', query):
+                return ''
+            parsed = _https_parts(base, ('a.ltrbxd.com',))
+        except ValueError:
+            return ''
+    if 'empty-poster' in parsed.path.lower() or not re.fullmatch(r'/[A-Za-z0-9/._-]{1,300}', parsed.path):
+        return ''
+    return value
+
+
+def _json_ld_image(data):
+    if isinstance(data, list):
+        return next((image for image in map(_json_ld_image, data[:8]) if image), '')
+    if not isinstance(data, dict):
+        return ''
+    image = data.get('image')
+    if isinstance(image, dict):
+        image = image.get('url')
+    if isinstance(image, list):
+        image = next((entry for entry in image[:4] if isinstance(entry, str)), '')
+    return letterboxd_poster_image(image) or _json_ld_image(data.get('@graph'))
+
+
+def letterboxd_poster_from_html(payload):
+    text = payload.decode('utf-8', 'replace') if isinstance(payload, bytes) else str(payload or '')
+    for block in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', text, re.S | re.I)[:4]:
+        block = re.sub(r'/\*.*?\*/', '', block, flags=re.S).strip()
+        try:
+            image = _json_ld_image(json.loads(block))
+        except ValueError:
+            continue
+        if image:
+            return image
+    for tag in re.findall(r'<meta\b[^>]*>', text, re.I)[:200]:
+        attrs = dict((name.lower(), content) for name, _, content in re.findall(r'([\w:-]+)\s*=\s*(["\'])(.*?)\2', tag, re.S))
+        if attrs.get('property', '').lower() == 'og:image':
+            image = letterboxd_poster_image(attrs.get('content'))
+            if image:
+                return image
+    return ''
+
+
+def fetch_letterboxd_poster(url, context, opener=None):
+    """Poster URL for a validated film link, '' when there is none; raises on provider failure."""
+    url = letterboxd_film_url(url)
+    opener = opener or build_opener(HTTPSHandler(context=context), LetterboxdRedirectHandler())
+    request = Request(url, headers={'User-Agent': 'Trace/0.1 (https://github.com/ACWArob/Trace)', 'Accept': 'text/html'})
+    try:
+        with opener.open(request, timeout=LETTERBOXD_TIMEOUT) as response:
+            final = response.geturl()
+            payload = response.read(LETTERBOXD_PAGE_LIMIT)
+    except ValueError:  # Redirected somewhere other than a Letterboxd film page.
+        return ''
+    except HTTPError as exc:
+        if exc.code in (404, 410):
+            return ''
+        raise
+    try:
+        if final != url:
+            letterboxd_redirect_target(final)
+    except ValueError:
+        return ''
+    return letterboxd_poster_from_html(payload)

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {coverCandidates,applyCovers,runCoverBackfill,pruneCoverAttempts,COVER_RETRY_MS} from '../cover_backfill.mjs';
+import {coverCandidates,applyCovers,runCoverBackfill,pruneCoverAttempts,COVER_RETRY_MS,letterboxdFilmUrl,letterboxdPosterUrl} from '../cover_backfill.mjs';
 
 const IMG = id => `https://upload.wikimedia.org/${id}.jpg`;
 const movie = (id, title, year, extra = {}) => ({id, type: 'movie', title, year, rating: 4, notes: 'kept', date: '2024-01-02', status: 'done', favorite: true, history: ['2024-01-02'], attachments: [], ...extra});
@@ -118,4 +118,67 @@ test('runner stops when a batch cannot be saved', async () => {
 test('pruneCoverAttempts keeps recent attempts for current entries only', () => {
   const now = 5 * COVER_RETRY_MS;
   assert.deepEqual(pruneCoverAttempts({a: now - 10, b: now - COVER_RETRY_MS - 1, c: now - 5, d: 'x'}, new Set(['a', 'b', 'd']), now), {a: now - 10});
+});
+
+const LB = id => `https://a.ltrbxd.com/resized/film-poster/1/2/3/${id}-0-230-0-345-crop.jpg`;
+
+function posterHarness(h, replies = {}) {
+  const posterCalls = [];
+  h.poster = async entry => {
+    posterCalls.push(entry.id);
+    const queue = replies[entry.id];
+    const next = Array.isArray(queue) ? queue.shift() : queue;
+    if (next instanceof Error) throw next;
+    return next || {status: 404};
+  };
+  return posterCalls;
+}
+
+test('letterboxdFilmUrl mirrors the server allowlist and canonicalizes film pages', () => {
+  assert.equal(letterboxdFilmUrl('https://boxd.it/AbCd'), 'https://boxd.it/AbCd');
+  assert.equal(letterboxdFilmUrl('https://letterboxd.com/film/heat-1995'), 'https://letterboxd.com/film/heat-1995/');
+  assert.equal(letterboxdFilmUrl('https://letterboxd.com/someone/film/heat-1995/'), 'https://letterboxd.com/film/heat-1995/');
+  for (const bad of ['http://boxd.it/AbCd', 'https://www.letterboxd.com/film/heat/', 'https://evil.example/film/heat/', 'https://boxd.it/a/b',
+    'https://letterboxd.com/film/heat/reviews/', 'https://letterboxd.com/film/heat/?x=1', '', undefined])
+    assert.equal(letterboxdFilmUrl(bad), '', String(bad));
+  assert.equal(letterboxdPosterUrl(LB('x')), LB('x'));
+  for (const bad of ['https://a.ltrbxd.com/resized/film-poster/empty-poster-230.png', 'https://s.ltrbxd.com/x.jpg', 'http://a.ltrbxd.com/x.jpg', IMG('x')])
+    assert.equal(letterboxdPosterUrl(bad), '', bad);
+});
+
+test('Letterboxd poster is a fallback only after no confident catalog match, and saves only the image', async () => {
+  const rows = [
+    movie('a', 'Coherence', '2013', {sourceUrl: 'https://boxd.it/AAAA'}),
+    movie('b', 'Obscure Short', '2019', {sourceUrl: 'https://boxd.it/BBBB'}),
+    movie('c', 'No Link', '2019'),
+    {id: 'd', type: 'book', title: 'Nedjma', sourceUrl: 'https://boxd.it/DDDD'},
+    {id: 'e', type: 'tv', title: 'Some Show', sourceUrl: 'https://letterboxd.com/film/some-show/'},
+    movie('f', 'Placeholder', '2001', {sourceUrl: 'https://boxd.it/FFFF'}),
+  ];
+  const h = harness({responses: {a: {status: 200, items: [{type: 'movie', title: 'Coherence', year: '2013', image: IMG('a'), imdbId: 'tt2866360'}]}}});
+  const posterCalls = posterHarness(h, {b: {status: 200, image: LB('b')}, e: {status: 200, image: LB('e')},
+    f: {status: 200, image: 'https://evil.example/f.jpg'}});
+  const attempts = {};
+  const result = await runCoverBackfill({entries: rows, attempts, ...h});
+  assert.equal(result.status, 'done');
+  assert.deepEqual(posterCalls, ['b', 'e', 'f']);
+  assert.deepEqual(h.saves, [[{id: 'a', image: IMG('a'), imdbId: 'tt2866360'}, {id: 'b', image: LB('b')}, {id: 'e', image: LB('e')}]]);
+  assert.deepEqual(h.progress.at(-1), {processed: 6, total: 6, matched: 3});
+  assert.deepEqual(Object.keys(attempts).sort(), ['a', 'b', 'c', 'd', 'e', 'f']);
+  const next = applyCovers(rows, h.saves[0]);
+  assert.deepEqual(next[1], {...rows[1], image: LB('b')});
+  assert.equal(applyCovers([movie('z', 'Z', '2000')], [{id: 'z', image: LB('z')}])[0].image, undefined, 'only Letterboxd entries take Letterboxd posters');
+});
+
+test('Letterboxd fallback shares backoff, auth, and attempt handling', async () => {
+  const rows = [movie('a', 'Obscure', '2019', {sourceUrl: 'https://boxd.it/AAAA'}), movie('b', 'Other', '2018', {sourceUrl: 'https://boxd.it/BBBB'})];
+  const h = harness();
+  const posterCalls = posterHarness(h, {a: [{status: 429, retryAfter: 30}, {status: 200, image: LB('a')}], b: {status: 401}});
+  const attempts = {};
+  const result = await runCoverBackfill({entries: rows, attempts, intervalMs: 1000, ...h});
+  assert.equal(result.status, 'auth');
+  assert.deepEqual(posterCalls, ['a', 'a', 'b']);
+  assert.ok(h.sleeps.includes(30000), 'Retry-After is honored');
+  assert.deepEqual(h.saves, [[{id: 'a', image: LB('a')}]]);
+  assert.deepEqual(Object.keys(attempts), ['a'], 'an interrupted fallback is retried later');
 });

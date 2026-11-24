@@ -28,7 +28,7 @@ from social import SocialStore, SocialError
 from library_store import LibraryStore
 from score_service import ScoreService
 from ratings import RatingsStore, omdb_scores, mdblist_scores, merge_scores, load_local_rating_key
-from profile_feeds import read_profile_feed, FeedUnavailable
+from profile_feeds import read_profile_feed, FeedUnavailable, letterboxd_film_url, fetch_letterboxd_poster
 from release_policy import production_mode, signup_mode, client_ip, RequestBudget, library_byte_limit
 
 ROOT = Path(__file__).resolve().parent
@@ -394,6 +394,30 @@ def search(kind, query, *, persist=True, genre=''):
     return result
 
 
+def letterboxd_poster(url):
+    """A Letterboxd film's poster URL ('' when it has none), cached by film link."""
+    url = letterboxd_film_url(url)
+    key = ('letterboxd-poster', url)
+    with CACHE_LOCK:
+        cached = CACHE.get(key)
+    if cached is not None and time.time() - cached[0] < cache_lifetime(key, cached[1]):
+        return cached[1]['image']
+    # boxd.it codes are case-sensitive but stored queries are casefolded, so hex-encode them.
+    cache_query = 'trace-letterboxd-poster:' + url.encode().hex()
+    saved = get_catalog().cached('movie', cache_query)
+    if saved is None:
+        with LOCK:
+            wait = max(0, LAST.get('letterboxd', 0) + 1.1 - time.monotonic())
+            if wait:
+                time.sleep(wait)
+            LAST['letterboxd'] = time.monotonic()
+        saved = get_catalog().save('movie', cache_query, {'items': [], 'provider': 'Letterboxd',
+                                                         'image': fetch_letterboxd_poster(url, TLS_CONTEXT)})
+    result = {'image': saved.get('image') if isinstance(saved.get('image'), str) else ''}
+    cache_put(key, result)
+    return result['image']
+
+
 def book_description(book_id):
     if not re.fullmatch(r'/works/OL\d+W', book_id):
         raise ValueError('Invalid book ID')
@@ -738,7 +762,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == '/api/auth/config':
             return self.send_json({'signupMode': signup_mode(), 'recovery': 'codes'})
-        if parsed.path in ('/api/search', '/api/ratings', '/api/book-description') and not self.hosted_catalog_access():
+        if parsed.path in ('/api/search', '/api/ratings', '/api/book-description', '/api/letterboxd-poster') and not self.hosted_catalog_access():
             return
         if parsed.path == '/api/library':
             return self.library_get(parsed)
@@ -772,6 +796,18 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(book_description(book_id))
             except (HTTPError, URLError, TimeoutError, ValueError, OSError):
                 return self.send_json({'error': 'Description unavailable.'}, 502)
+        if parsed.path == '/api/letterboxd-poster':
+            try:
+                image = letterboxd_poster(parse_qs(parsed.query).get('url', [''])[0])
+            except ValueError:
+                return self.send_json({'error': 'Use a Letterboxd film link.'}, 400)
+            except (HTTPError, URLError, TimeoutError, OSError):
+                return self.send_json({'error': 'Letterboxd is unavailable right now.'}, 502)
+            except database.Error:
+                return self.send_json({'error': 'The catalog database is busy. Try again shortly.'}, 503)
+            if not image:
+                return self.send_json({'error': 'No Letterboxd poster found.'}, 404)
+            return self.send_json({'image': image})
         if parsed.path == '/api/search':
             params = parse_qs(parsed.query)
             kind = params.get('type', ['book'])[0]

@@ -1,7 +1,7 @@
 import {artworkCandidates as providerArtwork,artworkFit} from './artwork.mjs';
 import {apiFetch} from './api_client.mjs';
 import {readLetterboxdZip} from './letterboxd_zip.mjs';
-import {runCoverBackfill,applyCovers,pruneCoverAttempts} from './cover_backfill.mjs';
+import {runCoverBackfill,applyCovers,pruneCoverAttempts,letterboxdFilmUrl} from './cover_backfill.mjs';
 import {TYPES,singular,uid,today,escapeHTML as e,safeUrl,dateOnly,normalizeISBN,normalizeImport,mergeEntries,dedupeEntries,recapEntries,selectTracewall,tracewallLayout,tracewallArtifact,TRACEWALL_THEMES,TRACEWALL_FORMATS,tracewallShareCard,migrateEntry,normalizeAttachments,safeImageUrl,sameItem,normalizeGenres,reviewLinks,normalizePublicScores,blendRatings,filmConsensus,FILM_SCORE_SOURCES} from './core.mjs';
 import {DEMO} from './data.js';
 import {TV_STARTERS} from './tv_starters.mjs';
@@ -189,6 +189,11 @@ async function coverSearch(entry){
  let items=[];if(response.ok){try{const data=await response.json();items=Array.isArray(data.items)?data.items:[];}catch{}}
  return {status:response.status,items,retryAfter:Number(response.headers?.get?.('Retry-After'))||0};
 }
+async function letterboxdPoster(entry){
+ const response=await apiFetch(`/api/letterboxd-poster?url=${encodeURIComponent(letterboxdFilmUrl(entry.sourceUrl))}`);
+ let image='';if(response.ok){try{const data=await response.json();image=typeof data.image==='string'?data.image:'';}catch{}}
+ return {status:response.status,image,retryAfter:Number(response.headers?.get?.('Retry-After'))||0};
+}
 function scheduleCoverBackfill(delay=4000){clearTimeout(coverTimer);coverTimer=setTimeout(startCoverBackfill,delay);}
 function setCoverProgress(text){if(coverProgress!==text){coverProgress=text;renderLibraryStatus();}}
 async function startCoverBackfill(){
@@ -198,7 +203,7 @@ async function startCoverBackfill(){
  const attempts=coverAttempts(account),cancelled=()=>epoch!==sessionEpoch||coverAccount()!==account;
  coverRunning=true;coverAgain=false;let shownAt=0;
  try{
-  const result=await runCoverBackfill({entries:collection.entries,attempts,search:coverSearch,isCancelled:cancelled,
+  const result=await runCoverBackfill({entries:collection.entries,attempts,search:coverSearch,poster:letterboxdPoster,isCancelled:cancelled,
    save:async matches=>{
     if(cancelled()||!libraryReady)return false;
     const ok=await persist({...collection,entries:applyCovers(collection.entries,matches)});saveCoverAttempts(account,attempts);
