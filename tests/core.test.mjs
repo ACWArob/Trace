@@ -237,3 +237,98 @@ test('coverMatch prefers an identity match and refuses ambiguous title matches',
  assert.equal(coverMatch({type:'movie',title:'Crash',year:'2004'},[a,b]),null);
  assert.deepEqual(coverMatch({type:'movie',title:'Crash',year:'2004',imdbId:'tt0999999'},[a,b]),{image:'https://upload.wikimedia.org/b.jpg'});
 });
+
+// Duplicate collapse and relaxed book/album cover matching.
+import {dedupeEntries,sameCreator,safeImageUrl,coverImageUrl} from '../core.mjs';
+test('mergeEntries merges into the best existing copy when several match instead of appending',()=>{
+ const plain={id:'a',type:'movie',title:'Heat',year:'1995',status:'done',history:[]};
+ const rated={id:'b',type:'movie',title:'Heat',year:'1995',status:'done',rating:4.5,date:'2026-01-02',history:['2026-01-02']};
+ const result=mergeEntries([plain,rated],[{type:'movie',title:'Heat',year:'1995',status:'done',notes:'Diner scene',date:'2026-03-04',history:['2026-03-04']}]);
+ assert.equal(result.entries.length,2);assert.equal(result.added,0);
+ const b=result.entries.find(x=>x.id==='b');assert.equal(b.notes,'Diner scene');assert.deepEqual(b.history,['2026-01-02','2026-03-04']);
+ const withId={id:'c',type:'movie',title:'Heat',year:'1995',imdbId:'tt0113277',history:[]};
+ const idResult=mergeEntries([rated,withId],[{type:'movie',title:'Heat',year:'1995',imdbId:'tt0113277',notes:'From IMDb'}]);
+ assert.equal(idResult.entries.length,2);assert.equal(idResult.entries.find(x=>x.id==='c').notes,'From IMDb');
+});
+test('dedupeEntries collapses copies and keeps every rating, note, date, history row and attachment',()=>{
+ const photo={id:'p1',type:'album',title:'Blue',creator:'Joni Mitchell',year:'1971',image:''};
+ const a={id:'a',type:'book',title:'Norwegian Wood',creator:'Haruki Murakami',year:'1987',status:'done',rating:3,date:'2024-05-01',history:['2024-05-01'],notes:'First read.',genres:['Fiction'],image:'https://covers.openlibrary.org/b/id/1-L.jpg',attachments:[photo]};
+ const b={id:'b',type:'book',title:'Norwegian wood',creator:'Murakami, Haruki',year:'1987',status:'done',rating:4.5,date:'2026-02-01',history:['2026-02-01'],notes:'Second read.',favorite:true,image:'trace-photo:'+'a'.repeat(64),attachments:[{...photo,id:'p2',title:'Kind of Blue'}],isbn:'9780375704024'};
+ const c={id:'c',type:'book',title:'Norwegian Wood',creator:'Haruki Murakami',year:'1987',status:'want',notes:'First read.',history:[]};
+ const other={id:'d',type:'book',title:'Kafka on the Shore',creator:'Haruki Murakami',year:'2002',history:[]};
+ const result=dedupeEntries([a,other,b,c]);
+ assert.equal(result.merged,2);assert.equal(result.entries.length,2);
+ const kept=result.entries.find(x=>x.title.toLowerCase()==='norwegian wood');
+ assert.equal(kept.rating,4.5,'most recent rating');assert.equal(kept.date,'2026-02-01');
+ assert.deepEqual(kept.history,['2024-05-01','2026-02-01']);
+ assert.equal(kept.notes,'First read.\n\nSecond read.');assert.equal(kept.favorite,true);assert.equal(kept.status,'done');
+ assert.equal(kept.image,b.image,'user photo wins');assert.equal(kept.isbn,'9780375704024');
+ assert.deepEqual(kept.attachments.map(x=>x.id),['p1','p2']);
+ assert.ok(result.entries.some(x=>x.id==='d'));
+ const again=dedupeEntries(result.entries);assert.equal(again.merged,0);assert.deepEqual(again.entries,result.entries);
+ assert.equal(dedupeEntries([a]).entries[0],a,'unchanged rows keep their identity');
+});
+test('dedupeEntries keeps Movies and TV, different years, conflicting IDs, and memories apart',()=>{
+ const rows=[
+  {id:'m',type:'movie',title:'Fargo',year:'1996'},{id:'t',type:'tv',title:'Fargo',year:'1996'},
+  {id:'y',type:'movie',title:'Dune',year:'1984'},{id:'z',type:'movie',title:'Dune',year:'2021'},
+  {id:'i1',type:'movie',title:'Crash',year:'2004',imdbId:'tt0375679'},{id:'i2',type:'movie',title:'Crash',year:'2004',imdbId:'tt0999999'},
+  {id:'r1',type:'memory',title:'Beach',date:'2026-01-01'},{id:'r2',type:'memory',title:'Beach',date:'2026-01-01'},
+  {id:'b1',type:'book',title:'Beloved',year:'1987',creator:'Toni Morrison'},{id:'b2',type:'book',title:'Beloved',year:'1987',creator:'Jane Smith'}];
+ const result=dedupeEntries(rows);assert.equal(result.merged,0);assert.equal(result.entries.length,rows.length);
+ const ids=dedupeEntries([{id:'x',type:'movie',title:'Hana-bi',year:'1997',imdbId:'tt0119250'},{id:'w',type:'movie',title:'Fireworks',year:'1998',imdbId:'tt0119250'}]);
+ assert.equal(ids.merged,1,'a shared IMDb ID collapses differently titled copies');
+});
+test('creator comparison handles inverted names and multiple authors by surname',()=>{
+ assert.equal(sameCreator('book','Murakami, Haruki','Haruki Murakami'),true);
+ assert.equal(sameCreator('book','García Márquez, Gabriel','Gabriel García Márquez'),true);
+ assert.equal(sameCreator('book','Neil Gaiman, Terry Pratchett','Terry Pratchett & Neil Gaiman'),true);
+ assert.equal(sameCreator('book','Neil Gaiman, Terry Pratchett','Neil Gaiman'),true);
+ assert.equal(sameCreator('book','Toni Morrison','Jane Smith'),false);
+ const merged=mergeEntries([{id:'a',type:'book',title:'Norwegian Wood',creator:'Murakami, Haruki',year:'1987'}],[{type:'book',title:'Norwegian Wood',creator:'Haruki Murakami',year:'1987'}]);
+ assert.equal(merged.entries.length,1);
+});
+test('coverMatch accepts a book whose edition year differs when title and author agree',()=>{
+ const cover='https://covers.openlibrary.org/b/id/777-L.jpg';
+ assert.deepEqual(coverMatch({type:'book',title:'Norwegian Wood',year:'2000',creator:'Murakami, Haruki'},[{type:'book',title:'Norwegian Wood',year:'1987',creator:'Haruki Murakami',image:cover}]),{image:cover});
+ assert.equal(coverMatch({type:'book',title:'Norwegian Wood',year:'2000',creator:'Jane Smith'},[{type:'book',title:'Norwegian Wood',year:'1987',creator:'Haruki Murakami',image:cover}]),null);
+ assert.equal(coverMatch({type:'book',title:'Norwegian Wood',year:'2000'},[{type:'book',title:'Norwegian Wood',year:'1987',creator:'Haruki Murakami',image:cover}]),null,'no author: year must agree');
+});
+test('coverMatch picks the year-matching edition image for books, else the first result',()=>{
+ const first='https://covers.openlibrary.org/b/id/1-L.jpg',second='https://covers.openlibrary.org/b/id/2-L.jpg';
+ const results=[{type:'book',title:'Dune',year:'1965',creator:'Frank Herbert',image:first},{type:'book',title:'Dune',year:'1990',creator:'Frank Herbert',image:second}];
+ const entry={type:'book',title:'Dune',creator:'Frank Herbert'};
+ assert.deepEqual(coverMatch({...entry,year:'1990'},results),{image:second});
+ assert.deepEqual(coverMatch({...entry,year:'2005'},results),{image:first});
+ const art='https://coverartarchive.org/release-group/1/front-500',reissue='https://coverartarchive.org/release-group/2/front-500';
+ const albums=[{type:'album',title:'Blue',year:'2007',creator:'Joni Mitchell',image:reissue},{type:'album',title:'Blue',year:'1971',creator:'Joni Mitchell',image:art}];
+ assert.deepEqual(coverMatch({type:'album',title:'Blue',year:'1971',creator:'Joni Mitchell'},albums),{image:art});
+ assert.deepEqual(coverMatch({type:'album',title:'Blue',year:'1999',creator:'Joni Mitchell'},albums),{image:reissue});
+});
+test('coverMatch stays strict for movies: year mismatch and ambiguous images return null',()=>{
+ const a={type:'movie',title:'Solaris',year:'1972',image:'https://upload.wikimedia.org/a.jpg'};
+ const b={type:'movie',title:'Solaris',year:'1972',image:'https://upload.wikimedia.org/b.jpg'};
+ assert.equal(coverMatch({type:'movie',title:'Solaris',year:'1973'},[a]),null);
+ assert.equal(coverMatch({type:'movie',title:'Solaris',year:'1972'},[a,b]),null);
+});
+test('existing Letterboxd poster CDN images survive for display but are not a backfill source',()=>{
+ const poster='https://a.ltrbxd.com/resized/film-poster/1/2/3/4/5/12345-heat-0-230-0-345-crop.jpg';
+ assert.equal(safeImageUrl(poster),poster);assert.equal(coverImageUrl(poster),'');
+ const kept=dedupeEntries([{id:'a',type:'movie',title:'Heat',year:'1995',image:poster},{id:'b',type:'movie',title:'Heat',year:'1995',rating:4}]);
+ assert.equal(kept.entries[0].image,poster);
+ assert.equal(mergeEntries([{id:'a',type:'movie',title:'Heat',year:'1995',image:poster}],[{type:'movie',title:'Heat',year:'1995',image:'https://upload.wikimedia.org/x.jpg'}]).entries[0].image,poster);
+});
+test('mergeEntries adds rather than guesses when matches are different works',()=>{
+ const old={id:'a',type:'movie',title:'Dune',year:'1984',rating:3,date:'2020-01-01',history:['2020-01-01']};
+ const remake={id:'b',type:'movie',title:'Dune',year:'2021',history:[]};
+ const result=mergeEntries([old,remake],[{type:'movie',title:'Dune',rating:5,date:'2024-05-05',history:['2024-05-05']}]);
+ assert.equal(result.added,1);assert.deepEqual(result.entries.find(x=>x.id==='a').history,['2020-01-01']);
+});
+test('dedupeEntries keeps a source paired with its own provider ID',()=>{
+ const lb={id:'a',type:'movie',title:'Heat',year:'1995',source:'letterboxd',sourceUrl:'https://letterboxd.com/film/heat-1995/',rating:4};
+ const tmdb={id:'b',type:'movie',title:'Heat',year:'1995',source:'tmdb',externalId:'949'};
+ const kept=dedupeEntries([lb,tmdb]).entries[0];
+ assert.equal(kept.source,'letterboxd');assert.equal(kept.externalId,undefined);
+ const csv=dedupeEntries([{id:'c',type:'movie',title:'Heat',year:'1995',rating:4},tmdb]).entries[0];
+ assert.equal(csv.source,'tmdb');assert.equal(csv.externalId,'949');
+});

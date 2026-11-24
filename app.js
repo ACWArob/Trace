@@ -2,7 +2,7 @@ import {artworkCandidates as providerArtwork,artworkFit} from './artwork.mjs';
 import {apiFetch} from './api_client.mjs';
 import {readLetterboxdZip} from './letterboxd_zip.mjs';
 import {runCoverBackfill,applyCovers,pruneCoverAttempts} from './cover_backfill.mjs';
-import {TYPES,singular,uid,today,escapeHTML as e,safeUrl,dateOnly,normalizeISBN,normalizeImport,mergeEntries,recapEntries,selectTracewall,tracewallLayout,tracewallArtifact,TRACEWALL_THEMES,TRACEWALL_FORMATS,tracewallShareCard,migrateEntry,normalizeAttachments,safeImageUrl,sameItem,normalizeGenres,reviewLinks,normalizePublicScores,blendRatings,filmConsensus,FILM_SCORE_SOURCES} from './core.mjs';
+import {TYPES,singular,uid,today,escapeHTML as e,safeUrl,dateOnly,normalizeISBN,normalizeImport,mergeEntries,dedupeEntries,recapEntries,selectTracewall,tracewallLayout,tracewallArtifact,TRACEWALL_THEMES,TRACEWALL_FORMATS,tracewallShareCard,migrateEntry,normalizeAttachments,safeImageUrl,sameItem,normalizeGenres,reviewLinks,normalizePublicScores,blendRatings,filmConsensus,FILM_SCORE_SOURCES} from './core.mjs';
 import {DEMO} from './data.js';
 import {TV_STARTERS} from './tv_starters.mjs';
 import {COLLECTION_STARTERS} from './collection_starters.mjs';
@@ -167,6 +167,13 @@ async function persist(next){
  if(storageProblem){notify(storageProblem);return false;}if(next.entries.length>30000){notify('A library can contain up to 30,000 items.');return false;}const userId=activeSession.user?.id||null;
  try{if(userId){if(!libraryReady)throw Error('Your account library is still loading.');const base=structuredClone(collection.entries),desired=structuredClone(next.entries);const save=librarySaveTail.then(async()=>{if(activeSession.user?.id!==userId)return false;await librarySync.replaceEntries(rebaseLibraryEntries(base,desired,librarySync.getState().entries));return activeSession.user?.id===userId;});librarySaveTail=save.catch(()=>{});return await save;}else{localStorage.setItem(KEY,JSON.stringify(next));guestCollection=next;collection=next;}return true;}
  catch(error){notify(userId?'Could not save this change on your device. '+error.message:'Browser storage is full or unavailable. Download a backup, then free space and try again.');return false;}
+}
+// Collapse saved copies of one work (personal data is kept) and save through the normal path so it syncs. Idempotent.
+async function collapseDuplicates(){
+ const epoch=sessionEpoch;if(!collection.started||storageProblem||!libraryReady)return;
+ let next,merged;try{({entries:next,merged}=dedupeEntries(collection.entries));}catch{return;}if(!merged)return;
+ if(!await persist({...collection,entries:next})||epoch!==sessionEpoch)return;
+ if(!activeSession.user)redrawLibrary();notify(`Merged ${merged} ${merged===1?'duplicate':'duplicates'}.`);
 }
 // Imported entries without artwork get public covers in the background; only image and a missing imdbId change.
 let coverRunning=false,coverAgain=false,coverTimer=0,coverProgress='';const coverAttemptsByAccount=new Map(),coverPaused=new Set();
@@ -745,7 +752,7 @@ main.addEventListener('click',async ev=>{const b=ev.target.closest('[data-action
  if(action==='start'){if(await persist({started:true,entries:collection.entries})){wallConfig.selected=null;render();openLog();}}
  if(action==='csv-template')download('trace-import-template.csv','Title,Type,Creator,Year,Rating,Date,Status,Notes,Favorite,Image,URL\nIn Rainbows,album,Radiohead,2007,5,2026-10-23,done,"A late-night favorite",true,,\nA rainy Sunday,memory,,,0,2026-11-01,done,A small day worth keeping,false,,\n','text/csv');
  if(action==='cancel-import'){importSequence++;state.pending=null;state.importError='';state.importNotice='';$('#import-feedback').innerHTML='';$('#import-file').value='';}
- if(action==='confirm-import'&&state.pending){const p=state.pending;const m=p.preview&&p.base===collection.entries&&p.started===collection.started?p.preview:mergeEntries(collection.started?collection.entries:[],p.entries);if(await persist({started:true,entries:m.entries})){state.pending=null;state.importNotice=`Import complete. ${m.added} added · ${m.merged} enriched · ${m.duplicates} unchanged.`;$('#import-feedback').innerHTML=importFeedback();$('#import-file').value='';notify('Your collection is home.');scheduleCoverBackfill(1500);}}
+ if(action==='confirm-import'&&state.pending){const p=state.pending;const m=p.preview&&p.base===collection.entries&&p.started===collection.started?p.preview:mergeEntries(collection.started?collection.entries:[],p.entries);if(await persist({started:true,entries:m.entries})){state.pending=null;state.importNotice=`Import complete. ${m.added} added · ${m.merged} enriched · ${m.duplicates} unchanged.`;$('#import-feedback').innerHTML=importFeedback();$('#import-file').value='';notify('Your collection is home.');await collapseDuplicates();scheduleCoverBackfill(1500);}}
  if(action==='wall-mix'){wallConfig.selected=null;wallPageIndex=0;saveWall();renderWall();}
  if(action==='wall-card'){
   wallPageIndex+=Number(value);
@@ -992,7 +999,7 @@ async function handleSession(next,context={}){
  entryDraft=null;editingId=null;searchResults=[];metadataMatches=[];
  try{if(id)localStorage.setItem('trace.active-account.v1',JSON.stringify({id,username:next.user.username,displayName:next.user.displayName}));else localStorage.removeItem('trace.active-account.v1');}catch{}
  redrawLibrary();renderLibraryStatus();
- try{await librarySync.setSession(next);if(epoch===sessionEpoch){libraryReady=true;renderLibraryStatus();redrawLibrary();scheduleCoverBackfill();}}
+ try{await librarySync.setSession(next);if(epoch===sessionEpoch){libraryReady=true;renderLibraryStatus();redrawLibrary();await collapseDuplicates();scheduleCoverBackfill();}}
  catch(error){if(epoch===sessionEpoch){libraryReady=false;notify(error.message);renderLibraryStatus();}}
 }
 async function verifiedSession(id){

@@ -162,8 +162,19 @@ export function sameItem(a,b) {
   if(matched)return true;
   if(norm(a.title)!==norm(b.title)) return false;
   if(a.year && b.year && String(a.year)!==String(b.year)) return false;
-  if(['book','album'].includes(a.type) && a.creator && b.creator && norm(a.creator)!==norm(b.creator)) return false;
+  if(['book','album'].includes(a.type) && !sameCreator(a.type,a.creator,b.creator)) return false;
   return true;
+}
+const personalScore=x=>(Number(x.rating)>0?4:0)+(x.date?2:0)+(String(x.notes||'').trim()?2:0)+((x.history||[]).length?1:0)+(x.favorite?1:0);
+// Several existing copies can match one incoming item. Merge only when the choice is safe: exactly one shares a
+// provider ID, or all matches are copies of one work (then prefer personal data, then list order). Otherwise add.
+function bestMatch(matches,item){
+  if(matches.length===1)return matches[0];
+  const ids=mediaIdentities(item);
+  const shared=matches.filter(x=>[...mediaIdentities(x)].some(([key,value])=>ids.get(key)===value));
+  if(shared.length===1)return shared[0];
+  if(!matches.every((x,i)=>matches.slice(i+1).every(y=>sameWork(x,y))))return null;
+  return matches.reduce((best,x)=>personalScore(x)>personalScore(best)?x:best,matches[0]);
 }
 export function mergeEntries(existing,incoming) {
   const entries=existing.map(x=>({...x,history:[...(x.history||[])]})); let added=0, merged=0;
@@ -177,7 +188,7 @@ export function mergeEntries(existing,incoming) {
   for(const item of incoming) {
     const direct=item.type==='memory'&&item.id?memoryIds.get(item.id):keys(item).map(key=>external.get(key)).find(x=>x&&sameItem(x,item));
     const matches=direct?[]:(titles.get(titleKey(item))||[]).filter(x=>sameItem(x,item));
-    const old=direct||(matches.length===1?matches[0]:null);
+    const old=direct||(matches.length?bestMatch(matches,item):null);
     if(!old) { const addedItem={...item,history:[...(item.history||[])]};entries.push(addedItem);index(addedItem);added++;continue; }
     let changed=false;
     for(const key of ['creator','year','date','rating','notes','description','image','sourceUrl','metadataSource','metadataSourceUrl','imdbId','isbn']) if(!old[key] && item[key]) {old[key]=item[key]; changed=true;}
@@ -195,6 +206,60 @@ export function mergeEntries(existing,incoming) {
     old.history=history;indexExternal(old);if(changed) merged++;
   }
   return {entries,added,merged,duplicates:incoming.length-added-merged};
+}
+// Collapse saved copies of one work without losing personal data. Memories keep their own identities.
+function sameWork(a,b){
+  if(a.type!==b.type||a.type==='memory')return false;
+  const aIds=mediaIdentities(a),bIds=mediaIdentities(b);let matched=false;
+  for(const [key,value] of aIds){if(!bIds.has(key))continue;if(bIds.get(key)!==value)return false;matched=true;}
+  if(matched)return true;
+  if(!norm(a.title)||norm(a.title)!==norm(b.title))return false;
+  if(String(a.year||'').slice(0,4)!==String(b.year||'').slice(0,4))return false;
+  return sameCreator(a.type,a.creator,b.creator);
+}
+const userImage=v=>typeof v==='string'&&(/^trace-photo:/.test(v)||/^data:image\//.test(v));
+const recency=x=>[x.date||'',...(x.history||[])].filter(Boolean).sort().pop()||'';
+const blank=v=>v===undefined||v===null||v===''||(Array.isArray(v)&&!v.length);
+const DEDUPE_SPECIAL=new Set(['id','source','externalId','rating','date','history','notes','favorite','forLater','status','attachments','image','genres']);
+function mergeCopies(members){
+  const primary=members.reduce((best,x)=>personalScore(x)>personalScore(best)?x:best,members[0]);
+  const out={...primary};
+  for(const row of members)if(row!==primary)for(const [key,value] of Object.entries(row))if(!DEDUPE_SPECIAL.has(key)&&blank(out[key])&&!blank(value))out[key]=value;
+  if(!out.externalId){const withId=members.find(x=>x.externalId&&(!out.source||providerName(out)===providerName(x)));if(withId){out.source=withId.source;out.externalId=withId.externalId;}}
+  const rated=members.filter(x=>Number(x.rating)>0);
+  if(rated.length){const ordered=[primary,...members.filter(x=>x!==primary)].filter(x=>Number(x.rating)>0);out.rating=ordered.reduce((best,x)=>recency(x)>recency(best)?x:best,ordered[0]).rating;}
+  const dates=members.map(x=>x.date).filter(Boolean).sort();if(dates.length)out.date=dates.pop();
+  out.history=[...new Set(members.flatMap(x=>[...(x.history||[]),...(x.date?[x.date]:[])]).filter(Boolean))].sort();
+  const notes=[...new Set(members.map(x=>String(x.notes||'').trim()).filter(Boolean))];if(notes.length)out.notes=notes.join('\n\n');
+  if(members.some(x=>x.favorite))out.favorite=true;
+  if(members.some(x=>x.forLater))out.forLater=true;
+  const ranks={want:0,progress:1,done:2};for(const row of members)if(ranks[row.status]>(ranks[out.status]??-1))out.status=row.status;
+  if(members.some(x=>Array.isArray(x.attachments)&&x.attachments.length)){
+    const seen=new Set();out.attachments=members.flatMap(x=>Array.isArray(x.attachments)?x.attachments:[]).filter(item=>{const key=item?.id||`${item?.type}:${item?.title}:${item?.year||''}`;if(seen.has(key))return false;seen.add(key);return true;});
+  }
+  out.image=[primary,...members].map(x=>x.image).find(userImage)||primary.image||members.map(x=>x.image).find(Boolean)||primary.image;
+  if(members.some(x=>!blank(x.genres)))out.genres=normalizeGenres(members.flatMap(x=>normalizeGenres(x.genres)));
+  return out;
+}
+function dedupePass(rows){
+  const clusters=[],byKey=new Map(),order=[];
+  const keysOf=x=>[`t:${x.type}:${norm(x.title)}`,...[...mediaIdentities(x)].map(([key,value])=>`i:${x.type}:${key}:${value}`)];
+  for(const row of rows){
+    if(!row||row.type==='memory'||!Object.hasOwn(TYPES,row.type)||typeof row.title!=='string'){order.push({row});continue;}
+    const keys=keysOf(row);let target=null;
+    for(const key of keys){target=(byKey.get(key)||[]).find(cluster=>cluster.members.every(member=>sameWork(member,row)));if(target)break;}
+    if(!target){target={members:[]};clusters.push(target);order.push({cluster:target});}
+    target.members.push(row);
+    for(const key of keys){if(!byKey.has(key))byKey.set(key,[]);if(!byKey.get(key).includes(target))byKey.get(key).push(target);}
+  }
+  let count=0;
+  const entries=order.map(slot=>{if(slot.row!==undefined)return slot.row;const {members}=slot.cluster;if(members.length===1)return members[0];count+=members.length-1;return mergeCopies(members);});
+  return {entries,count};
+}
+export function dedupeEntries(entries){
+  const list=Array.isArray(entries)?entries:[];let rows=list,merged=0;
+  for(let pass=0;pass<5;pass++){const result=dedupePass(rows);if(!result.count)break;rows=result.entries;merged+=result.count;}
+  return {entries:merged?rows:list,merged};
 }
 export function recapEntries(entries,period) {
   return entries.filter(x=>x.status==='done' && (period==='all' || (x.date && x.date.startsWith(period))));
@@ -365,13 +430,25 @@ function coverTitle(value){
 }
 const creatorWords=value=>String(value||'').normalize('NFKD').replace(/\p{M}/gu,'').toLowerCase();
 const creatorParts=value=>creatorWords(value).split(/\s*(?:[,;&/]|\band\b|\bfeat\.?|\bft\.)\s*/).map(x=>x.replace(/[^\p{L}\p{N}\s]/gu,' ').trim()).filter(Boolean);
-function creatorsAgree(type,a,b){
+// Initials ("K.", "J.R.R.") and suffixes never act as surnames.
+const nameWords=value=>String(value||'').split(/\s+/).filter(t=>t&&!/^(?:\p{L}\.)+$/u.test(t)).map(t=>t.replace(/[^\p{L}\p{N}]/gu,'')).filter(w=>w&&!/^(?:jr|sr|ii|iii|iv)$/.test(w));
+const NAME_LIST=/\s*(?:[,;&/]|\band\b|\bfeat\.?|\bft\.)\s*/;
+// People names: a single "Surname, Given" comma is an inverted name, not a list of two authors.
+function personNames(value){
+ const raw=creatorWords(value);
+ if(!/[;&/]|\band\b|\bfeat\.?|\bft\./.test(raw)){
+  const pieces=raw.split(',');
+  if(pieces.length===2&&pieces[1].trim()){const [last,first]=pieces.map(nameWords);if(last.length&&(last.length===1||first.length<=1))return [[...first,...last]];}
+ }
+ return raw.split(NAME_LIST).map(nameWords).filter(words=>words.length);
+}
+export function sameCreator(type,a,b){
  if(!String(a||'').trim()||!String(b||'').trim())return true;
  if(type==='album'){
   const whole=v=>coverTitle(v),first=v=>coverTitle(creatorParts(v)[0]||'');
   return whole(a)===whole(b)||(!!first(a)&&first(a)===first(b));
  }
- const surnames=v=>new Set(creatorParts(v).map(p=>p.split(/\s+/).filter(w=>w.length>1).pop()).filter(Boolean));
+ const surnames=v=>new Set(personNames(v).map(words=>words[words.length-1]));
  const left=surnames(a),right=surnames(b);
  return [...left].some(x=>right.has(x));
 }
@@ -383,6 +460,7 @@ export function coverMatch(entry,results){
  const entryImdb=screen?validImdb(entry.imdbId):'';
  const entryIsbn=category==='book'?normalizeISBN(entry.isbn):'';
  const title=coverTitle(entry.title),year=String(entry.year||'').slice(0,4);
+ const edition=['book','album'].includes(category);
  const identity=[],titled=[];
  for(const item of results){
   if(!item||typeof item!=='object'||item.type==='memory')continue;
@@ -392,11 +470,17 @@ export function coverMatch(entry,results){
   const isbn=category==='book'?normalizeISBN(item.isbn):'';
   if(entryImdb&&imdb){if(imdb===entryImdb)identity.push({item,image,imdb});continue;}
   if(entryIsbn&&isbn&&isbn===entryIsbn){identity.push({item,image,imdb});continue;}
-  if(!title||!year||coverTitle(item.title)!==title||String(item.year||'').slice(0,4)!==year)continue;
-  if(['book','album'].includes(category)&&!creatorsAgree(category,entry.creator,item.creator))continue;
-  titled.push({item,image,imdb});
+  if(!title||coverTitle(item.title)!==title)continue;
+  const yearMatch=!!year&&String(item.year||'').slice(0,4)===year;
+  if(edition){
+   // Books and albums: title plus a shared author/artist is enough; catalogs list original years, imports list editions.
+   if(!sameCreator(category,entry.creator,item.creator))continue;
+   if(!yearMatch&&!(String(entry.creator||'').trim()&&String(item.creator||'').trim()))continue;
+  }else if(!yearMatch)continue;
+  titled.push({item,image,imdb,yearMatch});
  }
  let pick=identity[0];
+ if(!pick&&titled.length&&edition)pick=titled.find(x=>x.yearMatch)||titled[0];
  if(!pick&&titled.length){
   const ids=new Set(titled.map(x=>x.imdb).filter(Boolean));
   if(ids.size>1)return null;

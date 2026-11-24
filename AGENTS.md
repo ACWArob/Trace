@@ -104,3 +104,4 @@ Prefer the affected test file over the whole suite.
 - 2026-11-24 — a web file input can open the native iPhone camera — include a camera purpose string and verify it in the built app’s Info.plist.
 - 2026-11-24 — the Sensitive CRON_SECRET pulls as a bracketed placeholder, so a pulled-env cron call returned 401 — verify the authorized path with `vercel crons run /api/cron/maintenance` and the function logs; auth 429s also carry Retry-After.
 - 2026-11-24 — Letterboxd ZIP and CSV imports carry no artwork, so a fresh hosted shelf showed no covers — backfill missing covers from catalog search with strict ID or title/year matching, adding only the image.
+- 2026-11-24 — Open Library returns original publication years while imports carry edition years, and multiple matches appended duplicates — match books on title plus author surname regardless of year, and merge into the best existing copy instead of appending.
