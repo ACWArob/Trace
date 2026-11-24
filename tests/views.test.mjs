@@ -1,6 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {calendarDays,shiftMonth,chapters,wheelItems,bookRows} from '../views.mjs';
+import {calendarDays,shiftMonth,chapters,wheelItems,bookRows,starterResults} from '../views.mjs';
+
+test('offline starters match title and creator across accents without mixing categories or pages',()=>{
+ const book={type:'book',title:'Nedjma',creator:'Kateb Yacine',genres:['Fiction'],publicScores:[]};
+ const album={type:'album',title:'Déb',creator:'Souad Massi',genres:['Raï'],publicScores:[]};
+ assert.deepEqual(starterResults([book,album],{kind:'album',query:'deb massi',genre:'rai'}),[album]);
+ assert.deepEqual(starterResults([book,album],{kind:'book',query:'nedjma yacine'}),[book]);
+ assert.deepEqual(starterResults([book,album],{kind:'book',query:'unrelated title'}),[]);
+ assert.deepEqual(starterResults([book,album],{kind:'book',genre:'Jazz'}),[]);
+ assert.deepEqual(starterResults([book,album],{kind:'book',page:1}),[]);
+ const result=starterResults([book],{kind:'book'});result[0].genres.push('Changed');
+ assert.deepEqual(book.genres,['Fiction']);
+});
 
 test('Calendar uses six Monday-first weeks, includes leap day, and has unique dates',()=>{
  const days=calendarDays('2024-02');assert.equal(days.length,42);assert.equal(days[0].date,'2024-01-29');assert.equal(new Set(days.map(x=>x.date)).size,42);assert.equal(days.filter(x=>x.inMonth).length,29);assert.ok(days.some(x=>x.date==='2024-02-29'&&x.inMonth));assert.throws(()=>calendarDays('2024-13'));

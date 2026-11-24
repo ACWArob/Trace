@@ -4,3 +4,9 @@ export function monthLabel(month){return new Date(month+'-01T12:00:00').toLocale
 export function chapters(entries){const groups=new Map();for(const item of entries.filter(x=>x.status==='done')){const key=item.date?item.date.slice(0,7):'undated';if(!groups.has(key))groups.set(key,[]);groups.get(key).push(item);}return [...groups].sort(([a],[b])=>a==='undated'?1:b==='undated'?-1:b.localeCompare(a)).map(([month,items],i,all)=>({month,title:month==='undated'?'Undated':monthLabel(month),number:all.length-i,entries:items.sort((a,b)=>(b.date||'').localeCompare(a.date||''))}));}
 export function wheelItems(items,index){if(!items.length)return [];const center=((index%items.length)+items.length)%items.length;const left=Math.min(2,Math.floor((items.length-1)/2));const right=Math.min(2,items.length-1-left);return Array.from({length:left+right+1},(_,i)=>{const offset=i-left;return {item:items[(center+offset+items.length)%items.length],offset};});}
 export function bookRows(items,width,reserved=0){const count=Math.max(3,Math.min(12,Math.floor((width-64-reserved)/48)));return Array.from({length:Math.ceil(items.length/count)},(_,i)=>items.slice(i*count,(i+1)*count));}
+export function starterResults(items,{kind,query='',genre='',page=0}){
+ if(page!==0)return [];
+ const key=value=>String(value||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLocaleLowerCase().replace(/[-–]/g,' ').replace(/\s+/g,' ').trim();
+ const words=key(query).split(' ').filter(Boolean),selected=key(genre);
+ return items.filter(item=>item.type===kind&&words.every(word=>key(`${item.title} ${item.creator} ${item.isbn||''}`).includes(word))&&(!selected||(item.genres||[]).some(g=>key(g)===selected))).map(item=>structuredClone(item));
+}

@@ -39,7 +39,7 @@ export function dateOnly(value) {
   const d = new Date(`${out}T12:00:00Z`);
   return !Number.isNaN(d.valueOf()) && d.toISOString().slice(0,10) === out ? out : '';
 }
-export function parseCSV(text) {
+export function parseCSV(text, {allowEmpty=false}={}) {
   const rows = []; let row = [], cell = '', quoted = false;
   text = String(text).replace(/^\uFEFF/, '');
   for (let i=0; i<text.length; i++) {
@@ -53,52 +53,113 @@ export function parseCSV(text) {
   }
   if (quoted) throw new Error('A quoted field is unfinished. Please upload the original CSV export.');
   row.push(cell); if (row.some(x=>x.trim())) rows.push(row);
-  if (rows.length < 2) throw new Error('This CSV has no entries. Choose a file with a header and at least one item.');
+  if (rows.length < 2) {
+    if (allowEmpty) return [];
+    throw new Error('This CSV has no entries. Choose a file with a header and at least one item.');
+  }
   const headers = rows.shift().map(x=>x.trim());
   if (new Set(headers.map(x=>x.toLowerCase())).size !== headers.length) throw new Error('This CSV has duplicate column names.');
   return rows.map((r,index)=>{ if(r.length !== headers.length) throw new Error(`Row ${index+2} has ${r.length} fields; expected ${headers.length}. Check the CSV formatting.`); return Object.fromEntries(headers.map((h,i)=>[h,r[i].trim()])); });
 }
 function textReview(s) { return String(s || '').replace(/<br\s*\/?\s*>/gi,'\n').replace(/<[^>]*>/g,'').replace(/&quot;/g,'"').replace(/&amp;/g,'&'); }
 function numericRating(v, max=5) { const n = Number(v); return Number.isFinite(n) ? Math.round(Math.max(0,Math.min(5,n*5/max))*2)/2 : 0; }
-export function normalizeImport(text, fileName='', source='auto') {
-  const rows = parseCSV(text); const columns = Object.keys(rows[0]);
+export function normalizeISBN(value) {
+  const raw=String(value||'').trim().replace(/^ISBN(?:-1[03])?\s*:?\s*/i,'').replace(/[="\s-]/g,'').toUpperCase();
+  if (/^\d{9}[0-9X]$/.test(raw)) {
+    const sum=Array.from(raw,(digit,index)=>(digit==='X'?10:Number(digit))*(10-index)).reduce((a,b)=>a+b,0);
+    if (sum%11!==0) return '';
+    const prefix='978'+raw.slice(0,9);
+    const sum13=Array.from(prefix,(digit,index)=>Number(digit)*(index%2?3:1)).reduce((a,b)=>a+b,0);
+    return prefix+((10-sum13%10)%10);
+  }
+  if (!/^97[89]\d{10}$/.test(raw)) return '';
+  const sum=Array.from(raw,(digit,index)=>Number(digit)*(index%2?3:1)).reduce((a,b)=>a+b,0);
+  return sum%10===0?raw:'';
+}
+
+export function normalizeImport(text, fileName='', source='auto', options={}) {
+  const rows = parseCSV(text, options);
+  if (!rows.length) return {entries:[],source,skipped:0};
+  const columns = Object.keys(rows[0]);
   const has = h => columns.some(x=>x.toLowerCase()===h.toLowerCase());
-  if(source === 'auto') source = has('Book Id') || has('Exclusive Shelf') ? 'goodreads' : has('Letterboxd URI') || has('Name') ? 'letterboxd' : has('Const') && has('Title') ? 'imdb' : 'generic';
+  const discogs=has('release_id')&&has('Title')&&has('Artist')&&has('Format');
+  if(source === 'auto') source = has('Book Id') || has('Exclusive Shelf') ? 'goodreads' : discogs ? 'discogs' : has('Letterboxd URI') || has('Name') ? 'letterboxd' : has('Const') && has('Title') ? 'imdb' : 'generic';
+  if(source==='discogs'&&!discogs)throw Error('Choose a Discogs Collection CSV with release_id, Artist, Title, and Format columns.');
   if(source==='letterboxd' && !has('Name')) throw new Error('Choose a Letterboxd movie CSV: diary, ratings, watched, watchlist, reviews, or a list.');
   if(!has('Name') && !has('Title')) throw new Error('No Title or Name column found. Use a supported export or the Trace CSV template.');
   let skipped=0;
   const entries = rows.flatMap(row=>{
     const get = (...keys) => { for(const key of keys){ const k=Object.keys(row).find(x=>x.toLowerCase()===key.toLowerCase()); if(k && row[k]) return row[k]; } return ''; };
     const title = get('Name','Title'); if(!title) { skipped++; return []; }
-    let type='movie', status='done', date='', rating=0;
+    let type='movie', status='done', date='', rating=0, sourceUrl='', externalId='';
     if(source==='goodreads') {
       type='book'; const shelf=get('Exclusive Shelf'); status=shelf==='to-read'?'want':shelf==='currently-reading'?'progress':'done';
       date=dateOnly(get('Date Read')); rating=numericRating(get('My Rating'));
+      externalId=get('Book Id');
+      if(/^\d+$/.test(externalId))sourceUrl='https://www.goodreads.com/book/show/'+externalId;
     } else if(source==='letterboxd') {
       status=/watchlist/i.test(fileName)?'want':'done';
       // Date in watched.csv / ratings.csv is an activity date, not a watch date.
       date=dateOnly(get('Watched Date') || (/diary/i.test(fileName)?get('Date'):'')); rating=numericRating(get('Rating'));
     } else if(source==='imdb') {
       type=/tv|series/i.test(get('Title Type'))?'tv':'movie'; rating=numericRating(get('Your Rating'),10);
+      externalId=get('Const');
+      if(/^tt\d{5,12}$/.test(externalId))sourceUrl='https://www.imdb.com/title/'+externalId+'/';
+    } else if(source==='discogs') {
+      const format=get('Format');
+      externalId=get('release_id');
+      if(!/^\d{1,12}$/.test(externalId)||!/\b(?:album|lp)\b/i.test(format)||/\b(?:single|ep)\b/i.test(format)){
+        skipped++; return [];
+      }
+      type='album'; status='want'; rating=numericRating(get('Rating'));
+      sourceUrl='https://www.discogs.com/release/'+externalId;
     } else {
       const candidate=get('Type').toLowerCase(); type=Object.hasOwn(TYPES,candidate)||['restaurant','place'].includes(candidate)?candidate:'book';
       status=['want','progress','done'].includes(get('Status'))?get('Status'):'done';
       date=dateOnly(get('Date')); rating=numericRating(get('Rating'));
     }
-    const isbn=get('ISBN13','ISBN').replace(/[="\s]/g,'');
-    return [migrateEntry({id:uid(),title,type,status,date,rating,creator:get('Author','Creator','Directors'),year:get('Year','Original Publication Year','Year Published'),
+    const isbn=type==='book'?(normalizeISBN(get('ISBN13'))||normalizeISBN(get('ISBN'))):'';
+    return [migrateEntry({id:uid(),title,type,status,date,rating,creator:get('Author','Creator','Directors','Artist'),year:get('Year','Original Publication Year','Year Published','Released'),
       genres:normalizeGenres(get('Genres','Genre')),notes:textReview(get('Review','My Review','Notes')),favorite:/^(true|yes|1)$/i.test(get('Favorite','Liked')),
-      image:safeUrl(get('Image')) || (type==='book' && /^(\d{10}|\d{13})$/.test(isbn)?`https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`:''),
-      source:source==='generic'?'CSV':source,sourceUrl:safeUrl(get('Letterboxd URI','URL','Source URL')),externalId:get('Book Id','Const'),
+      image:safeUrl(get('Image')) || (isbn?`https://covers.openlibrary.org/b/isbn/${isbn}-L.jpg`:''),
+      source:source==='generic'?'CSV':source,sourceUrl:sourceUrl||safeUrl(get('Letterboxd URI','URL','Source URL')),externalId,
+      ...(isbn?{isbn}:{}),
+      ...(source==='imdb'&&sourceUrl?{imdbId:externalId}:{}),
       addedAt:new Date().toISOString(),history:date?[date]:[]})];
   });
   return {entries, source, skipped};
 }
 const norm = s => String(s||'').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]/gu,'');
+const providerName = item => String(item.source||'').trim().toLowerCase();
+function mediaIdentities(item) {
+  const ids=new Map();
+  const source=providerName(item);
+  if(source&&item.externalId)ids.set('provider:'+source,item.externalId);
+  if(item.type==='book'){
+    const isbn=normalizeISBN(item.isbn);
+    if(isbn)ids.set('isbn',isbn);
+  }
+  if(['movie','tv','anime'].includes(item.type)){
+    const imdb=item.imdbId||(source==='imdb'?item.externalId:'');
+    if(/^tt\d{5,12}$/.test(imdb||''))ids.set('imdb',imdb);
+  }
+  if(item.type==='movie'&&source==='letterboxd'){
+    const match=String(item.sourceUrl||'').match(/^https?:\/\/(?:www\.)?letterboxd\.com\/(?:[\w-]+\/)?film\/([a-z0-9-]+)\/?(?:[?#].*)?$/i);
+    if(match)ids.set('letterboxd-film',match[1].toLowerCase());
+  }
+  return ids;
+}
 export function sameItem(a,b) {
   if(a.type!==b.type) return false;
   if(a.type==='memory') return !!(a.id&&a.id===b.id) || !!(a.date && a.date===b.date && norm(a.title)===norm(b.title) && (a.notes||'')===(b.notes||'') && (a.image||'')===(b.image||''));
-  if(a.source && a.source===b.source && a.externalId && a.externalId===b.externalId) return true;
+  const aIds=mediaIdentities(a), bIds=mediaIdentities(b);
+  let matched=false;
+  for(const [key,value] of aIds){
+    if(!bIds.has(key))continue;
+    if(bIds.get(key)!==value)return false;
+    matched=true;
+  }
+  if(matched)return true;
   if(norm(a.title)!==norm(b.title)) return false;
   if(a.year && b.year && String(a.year)!==String(b.year)) return false;
   if(['book','album'].includes(a.type) && a.creator && b.creator && norm(a.creator)!==norm(b.creator)) return false;
@@ -109,15 +170,20 @@ export function mergeEntries(existing,incoming) {
   // Restrict identity matching to this title or a provider ID, rather than the whole library.
   const titles=new Map(), external=new Map(), memoryIds=new Map();
   const titleKey=x=>`${x.type}:${norm(x.title)}`;
-  const externalKey=x=>x.type!=='memory'&&x.source&&x.externalId?`${x.type}:${x.source}:${x.externalId}`:'';
-  const index=x=>{if(x.type==='memory'&&x.id&&!memoryIds.has(x.id))memoryIds.set(x.id,x);const key=titleKey(x);if(!titles.has(key))titles.set(key,[]);titles.get(key).push(x);const ext=externalKey(x);if(ext&&!external.has(ext))external.set(ext,x);};
+  const keys=x=>x.type==='memory'?[]:[...mediaIdentities(x)].map(([key,value])=>JSON.stringify([x.type,key,value]));
+  const indexExternal=x=>{for(const key of keys(x))if(!external.has(key))external.set(key,x);};
+  const index=x=>{if(x.type==='memory'&&x.id&&!memoryIds.has(x.id))memoryIds.set(x.id,x);const key=titleKey(x);if(!titles.has(key))titles.set(key,[]);titles.get(key).push(x);indexExternal(x);};
   entries.forEach(index);
   for(const item of incoming) {
-    const direct=item.type==='memory'&&item.id?memoryIds.get(item.id):external.get(externalKey(item));
-    const old=direct||(titles.get(titleKey(item))||[]).find(x=>sameItem(x,item));
+    const direct=item.type==='memory'&&item.id?memoryIds.get(item.id):keys(item).map(key=>external.get(key)).find(x=>x&&sameItem(x,item));
+    const matches=direct?[]:(titles.get(titleKey(item))||[]).filter(x=>sameItem(x,item));
+    const old=direct||(matches.length===1?matches[0]:null);
     if(!old) { const addedItem={...item,history:[...(item.history||[])]};entries.push(addedItem);index(addedItem);added++;continue; }
     let changed=false;
-    for(const key of ['creator','year','date','rating','notes','description','image','sourceUrl','externalId','metadataSource','metadataSourceUrl','imdbId']) if(!old[key] && item[key]) {old[key]=item[key]; changed=true;}
+    for(const key of ['creator','year','date','rating','notes','description','image','sourceUrl','metadataSource','metadataSourceUrl','imdbId','isbn']) if(!old[key] && item[key]) {old[key]=item[key]; changed=true;}
+    if(!old.externalId&&item.externalId&&(!old.source||providerName(old)===providerName(item))){
+      old.source=item.source;old.externalId=item.externalId;changed=true;
+    }
     const genres=normalizeGenres([...normalizeGenres(old.genres),...normalizeGenres(item.genres)]);if(JSON.stringify(genres)!==JSON.stringify(old.genres||[])){old.genres=genres;changed=true;}
     if(!old.publicScores?.length&&item.publicScores?.length){old.publicScores=normalizePublicScores(item.publicScores);changed=true;}
     if(item.forLater&&!old.forLater){old.forLater=true;changed=true;}
@@ -126,7 +192,7 @@ export function mergeEntries(existing,incoming) {
     if(old.type==='memory'){const combined=normalizeAttachments([...(old.attachments||[]),...(item.attachments||[])]);if(JSON.stringify(combined)!==JSON.stringify(old.attachments||[])){old.attachments=combined;changed=true;}}
     const history=[...new Set([...(old.history||[]),...(item.history||[])])].sort();
     if(history.length!==(old.history||[]).length) changed=true;
-    old.history=history;const ext=externalKey(old);if(ext&&!external.has(ext))external.set(ext,old);if(changed) merged++;
+    old.history=history;indexExternal(old);if(changed) merged++;
   }
   return {entries,added,merged,duplicates:incoming.length-added-merged};
 }
@@ -196,9 +262,16 @@ export function tracewallShareCard(items, format, page = 0) {
   if (!Object.hasOwn(socialWallLayouts, format)) return null;
   const template = socialWallLayouts[format];
   const pageSize = template.slots.length;
-  const pages = Math.max(1, Math.ceil(items.length / pageSize));
+  const groups=[[]];
+  for(const item of items){
+    const current=groups.at(-1);
+    if(current.length===pageSize||(item.type==='memory'&&current.some(pick=>pick.type==='memory'))){
+      groups.push([item]);
+    }else current.push(item);
+  }
+  const pages=groups.length;
   const index = Math.max(0, Math.min(pages - 1, Math.floor(Number(page) || 0)));
-  const picks = items.slice(index * pageSize, (index + 1) * pageSize);
+  const picks=groups[index];
   const placements = picks.length === 1
     ? [[format === 'story' ? 210 : 250, 0, format === 'story' ? 660 : 580, -4]]
     : template.slots.slice(0, picks.length);
@@ -241,6 +314,19 @@ export function reviewLinks(item) {
 }
 
 export const FILM_SCORE_SOURCES=['IMDb','Rotten Tomatoes critics','Rotten Tomatoes audience','Letterboxd'];
+export const MEDIA_SCORE_SOURCES={
+ movie:FILM_SCORE_SOURCES,
+ tv:['IMDb','Rotten Tomatoes critics','Rotten Tomatoes audience','TVmaze'],
+ anime:['IMDb','Rotten Tomatoes critics','Rotten Tomatoes audience','TVmaze','Kitsu'],
+ book:['Open Library','Google Books'],
+ album:['MusicBrainz','Trace']
+};
+export function mediaConsensus(input,kind){
+ const names=MEDIA_SCORE_SOURCES[kind]||[],all=normalizePublicScores(input).filter(row=>!['tv','anime'].includes(kind)||row.source!=='Letterboxd');
+ const sources=names.flatMap(name=>all.filter(row=>row.source===name));
+ const value=sources.length<2?null:Math.round(sources.reduce((total,row)=>total+row.value/row.max*10,0)/sources.length*10)/10;
+ return {value,count:sources.length,sources,missing:names.filter(name=>!sources.some(row=>row.source===name)),other:all.filter(row=>!names.includes(row.source))};
+}
 function scoreSourceName(source){
  const aliases={'imdb':'IMDb','internet movie database':'IMDb','rotten tomatoes':'Rotten Tomatoes critics','tomatoes':'Rotten Tomatoes critics','tomatoes-critics':'Rotten Tomatoes critics','rotten tomatoes critics':'Rotten Tomatoes critics','popcorn':'Rotten Tomatoes audience','tomatoesaudience':'Rotten Tomatoes audience','tomatoes-audience':'Rotten Tomatoes audience','rotten tomatoes audience':'Rotten Tomatoes audience','letterboxd':'Letterboxd'};
  return Object.hasOwn(aliases,source.toLowerCase())?aliases[source.toLowerCase()]:source;

@@ -6,7 +6,7 @@ from urllib.error import HTTPError
 import re
 import time
 
-from ratings import merge_scores
+from ratings import merge_scores, valid_score_identity
 
 
 class ScoreService:
@@ -77,7 +77,7 @@ class ScoreService:
 
     def lookup(self, kind, imdb_id, providers):
         sources, statuses, metadata = [], {}, {}
-        valid = kind in ('movie', 'tv', 'anime') and isinstance(imdb_id, str) and re.fullmatch(r'tt\d{5,12}', imdb_id)
+        valid = valid_score_identity(kind, imdb_id)
         for provider, spec in providers.items():
             if not valid:
                 statuses[provider] = 'unmatched' if spec['enabled'] else 'not_configured'

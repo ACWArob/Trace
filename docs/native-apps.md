@@ -31,7 +31,7 @@ npx --no-install cap sync
 
 Replace the example domain with the actual deployment. `--release` rejects a missing origin, development mode, plain HTTP, and loopback servers. It does not sign, upload, or submit anything. The app identifier `com.acwarob.trace` is a development identifier; confirm ownership and store registration before distribution.
 
-`npm run native:sync` runs the builder again. Keep `TRACE_NATIVE_API_ORIGIN` set for that command too, or it will produce the default offline-only configuration.
+`npm run native:sync` runs the builder again. Keep `TRACE_NATIVE_API_ORIGIN` set for that command too. A connected bundle refuses an accidental offline rebuild; an intentional development downgrade requires `TRACE_NATIVE_ALLOW_OFFLINE=1`. For hosted builds use [the friends-beta release workflow](friends-beta.md), which checks the server and verifies both copied configurations.
 
 The API origin is pinned per installation so a later build cannot silently send one server's queued private edits to another server. Use a separate app installation/identifier for another server and preserve any pending edits first.
 

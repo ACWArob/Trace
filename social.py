@@ -86,6 +86,14 @@ class SocialStore:
                     created_at REAL NOT NULL, deleted_at REAL
                 );
                 CREATE INDEX IF NOT EXISTS comments_review ON comments(review_id,created_at);
+                CREATE TABLE IF NOT EXISTS beta_invites (
+                    invite_hash TEXT PRIMARY KEY, expires_at REAL NOT NULL,
+                    claimed_at REAL, claimed_by TEXT
+                );
+                CREATE TABLE IF NOT EXISTS account_recovery_codes (
+                    user_id TEXT NOT NULL REFERENCES users(id), code_hash TEXT NOT NULL,
+                    created_at REAL NOT NULL, PRIMARY KEY(user_id,code_hash)
+                );
             ''')
 
     @contextmanager
@@ -116,24 +124,131 @@ class SocialStore:
         db.execute('INSERT INTO sessions VALUES(?,?,?,?)', (sha256(token.encode()).hexdigest(), user_id, csrf, time.time() + 30 * 86400))
         return token, csrf
 
-    def register(self, payload):
+    @staticmethod
+    def _password(value):
+        if not isinstance(value, str) or not 10 <= len(value) <= 128:
+            raise SocialError('Choose a password with 10–128 characters.')
+        try:
+            value.encode('utf-8')
+        except UnicodeEncodeError as exc:
+            raise SocialError('Choose a password with valid text characters.') from exc
+        return value
+
+    @staticmethod
+    def _check_password(row, password):
+        if not isinstance(password, str) or len(password) > 128:
+            raise SocialError('Your password is incorrect.', 401)
+        try:
+            encoded = password.encode('utf-8')
+        except UnicodeEncodeError as exc:
+            raise SocialError('Your password is incorrect.', 401) from exc
+        digest = scrypt(encoded, salt=row['salt'] if row else bytes(16), n=16384, r=8, p=1, dklen=32)
+        if not hmac.compare_digest(digest, row['password_hash'] if row else bytes(32)) or not row:
+            raise SocialError('Your password is incorrect.', 401)
+
+    def create_invite(self, expires_in=7 * 86400):
+        """Owner-only provisioning API. Return the raw invite once; persist its hash."""
+        if isinstance(expires_in, bool) or not isinstance(expires_in, (int, float)) or not math.isfinite(expires_in) or not 60 <= expires_in <= 30 * 86400:
+            raise SocialError('An invitation must expire in 1 minute to 30 days.')
+        code = secrets.token_urlsafe(32)
+        with self.db() as db:
+            db.execute('INSERT INTO beta_invites VALUES(?,?,NULL,NULL)', (sha256(code.encode()).hexdigest(), time.time() + expires_in))
+        return code
+
+    @staticmethod
+    def _new_recovery_codes(db, user_id):
+        codes = ['-'.join(raw[i:i + 4] for i in range(0, 24, 4)) for raw in (secrets.token_hex(12).upper() for _ in range(8))]
+        db.execute('DELETE FROM account_recovery_codes WHERE user_id=?', (user_id,))
+        db.executemany('INSERT INTO account_recovery_codes VALUES(?,?,?)',
+                       [(user_id, sha256((user_id + ':' + code.replace('-', '')).encode()).hexdigest(), time.time()) for code in codes])
+        return codes
+
+    def register(self, payload, *, invite_required=False):
+        if not isinstance(payload, dict):
+            raise SocialError('Send an account object.')
         username = text(payload.get('username'), 25).lower()
-        password = payload.get('password')
+        password = self._password(payload.get('password'))
         if not re.fullmatch(r'[a-z0-9_]{3,24}', username):
             raise SocialError('Use 3–24 letters, numbers, or underscores for your username.')
-        if not isinstance(password, str) or not 10 <= len(password) <= 128:
-            raise SocialError('Choose a password with 10–128 characters.')
+        invite = payload.get('inviteCode', '')
+        if invite_required and (not isinstance(invite, str) or not re.fullmatch(r'[A-Za-z0-9_-]{43}', invite)):
+            raise SocialError('This invitation is invalid, expired, or already used.', 403)
         salt = secrets.token_bytes(16)
         digest = scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
         uid = secrets.token_hex(16)
         try:
             with self.db() as db:
+                db.execute('BEGIN IMMEDIATE')
+                if invite_required:
+                    invite_hash = sha256(invite.encode()).hexdigest()
+                    invitation = db.execute('SELECT * FROM beta_invites WHERE invite_hash=?', (invite_hash,)).fetchone()
+                    if not invitation or invitation['claimed_at'] is not None or invitation['expires_at'] <= time.time():
+                        raise SocialError('This invitation is invalid, expired, or already used.', 403)
                 db.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?)', (uid, username, text(payload.get('displayName'), 60) or username, '', salt, digest, time.time()))
+                if invite_required:
+                    db.execute('UPDATE beta_invites SET claimed_at=?,claimed_by=? WHERE invite_hash=?', (time.time(), uid, invite_hash))
+                recovery_codes = self._new_recovery_codes(db, uid)
                 token, csrf = self._new_session(db, uid)
                 user = self._profile(db, db.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone())
         except sqlite3.IntegrityError as exc:
             raise SocialError('That username is already in use.', 409) from exc
-        return {'user': user, 'csrf': csrf}, token
+        return {'user': user, 'csrf': csrf, 'recoveryCodes': recovery_codes}, token
+
+    def issue_recovery_codes(self, user_id, password):
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+            self._check_password(row, password)
+            return {'recoveryCodes': self._new_recovery_codes(db, user_id)}
+
+    def recover(self, payload):
+        """Consume a recovery code and invalidate every prior session and code."""
+        if not isinstance(payload, dict):
+            raise SocialError('Username or recovery code is incorrect.', 401)
+        password = self._password(payload.get('newPassword'))
+        username, code = payload.get('username'), payload.get('recoveryCode')
+        if not isinstance(username, str) or not re.fullmatch(r'[a-zA-Z0-9_]{3,24}', username) or not isinstance(code, str) or len(code) > 64:
+            raise SocialError('Username or recovery code is incorrect.', 401)
+        code = code.replace('-', '').upper()
+        if not re.fullmatch(r'[A-F0-9]{24}', code):
+            raise SocialError('Username or recovery code is incorrect.', 401)
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+            user_id = row['id'] if row else 'unavailable-account'
+            candidate = sha256((user_id + ':' + code).encode()).hexdigest()
+            hashes = [x['code_hash'] for x in db.execute('SELECT code_hash FROM account_recovery_codes WHERE user_id=? LIMIT 8', (user_id,))]
+            matches = [hmac.compare_digest(candidate, saved) for saved in hashes + ['0' * 64] * (8 - len(hashes))]
+            if not row or not any(matches):
+                raise SocialError('Username or recovery code is incorrect.', 401)
+            salt = secrets.token_bytes(16)
+            digest = scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
+            db.execute('UPDATE users SET salt=?,password_hash=? WHERE id=?', (salt, digest, user_id))
+            db.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+            codes = self._new_recovery_codes(db, user_id)
+            token, csrf = self._new_session(db, user_id)
+            user = self._profile(db, row)
+        return {'user': user, 'csrf': csrf, 'recoveryCodes': codes}, token
+
+    def delete_account(self, user_id, password, confirmation=None):
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+            self._check_password(row, password)
+            if confirmation is not None and (not isinstance(confirmation, str) or len(confirmation) > 24 or not confirmation.isascii() or not hmac.compare_digest(confirmation.encode(), row['username'].encode())):
+                raise SocialError('Type your username to confirm account deletion.')
+            db.execute('DELETE FROM comments WHERE user_id=? OR review_id IN (SELECT id FROM reviews WHERE user_id=?)', (user_id, user_id))
+            db.execute('DELETE FROM likes WHERE user_id=? OR review_id IN (SELECT id FROM reviews WHERE user_id=?)', (user_id, user_id))
+            db.execute('DELETE FROM follows WHERE follower=? OR target=?', (user_id, user_id))
+            db.execute('DELETE FROM reviews WHERE user_id=?', (user_id,))
+            db.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+            db.execute('DELETE FROM account_recovery_codes WHERE user_id=?', (user_id,))
+            for table in ('private_library_entries', 'private_library_state'):
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                    db.execute(f'DELETE FROM {table} WHERE user_id=?', (user_id,))
+            db.execute('UPDATE beta_invites SET claimed_by=NULL WHERE claimed_by=?', (user_id,))
+            db.execute('DELETE FROM users WHERE id=?', (user_id,))
+        return {'deleted': True}
 
     def login(self, payload):
         username, password = text(payload.get('username'), 24).lower(), payload.get('password')
@@ -141,10 +256,10 @@ class SocialStore:
             raise SocialError('Username or password is incorrect.', 401)
         with self.db() as db:
             row = db.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
-            salt = row['salt'] if row else bytes(16)
-            digest = scrypt(password.encode(), salt=salt, n=16384, r=8, p=1, dklen=32)
-            if not row or not hmac.compare_digest(digest, row['password_hash']):
-                raise SocialError('Username or password is incorrect.', 401)
+            try:
+                self._check_password(row, password)
+            except SocialError as exc:
+                raise SocialError('Username or password is incorrect.', 401) from exc
             token, csrf = self._new_session(db, row['id'])
             return {'user': self._profile(db, row), 'csrf': csrf}, token
 
@@ -284,11 +399,15 @@ class SocialStore:
         return {'id': review_id, 'hidden': hidden}
 
     def community_rating(self, item):
+        creator = text(item.get('creator'), 300)
+        creator_filter = " AND lower(json_extract(item,'$.creator'))=lower(?)" if item.get('type') in ('book', 'album') else ''
+        args = [item.get('type'), text(item.get('title'), 300), text(item.get('year'), 4)]
+        if creator_filter:
+            args.append(creator)
         with self.db() as db:
             rows = db.execute('''SELECT user_id,rating FROM reviews WHERE deleted_at IS NULL
                 AND json_extract(item,'$.type')=? AND lower(json_extract(item,'$.title'))=lower(?)
-                AND json_extract(item,'$.year')=? ORDER BY updated_at DESC,id DESC''',
-                (item.get('type'), text(item.get('title'), 300), text(item.get('year'), 4))).fetchall()
+                AND json_extract(item,'$.year')=?''' + creator_filter + ' ORDER BY updated_at DESC,id DESC', args).fetchall()
         latest = {}
         for row in rows:
             if row['user_id'] not in latest:

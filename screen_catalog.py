@@ -25,6 +25,48 @@ def _text(value, limit=500):
     return value.strip()[:limit] if isinstance(value, str) else ''
 
 
+def tvmaze_item(row):
+    if not isinstance(row, dict) or type(row.get('id')) is not int or row['id'] < 1:
+        return None
+    title = _text(row.get('name'))
+    if not title:
+        return None
+    url = f"https://www.tvmaze.com/shows/{row['id']}"
+    network = row.get('network') or row.get('webChannel') or {}
+    image = row.get('image') or {}
+    image_url = _text(image.get('medium'), 2048) if isinstance(image, dict) else ''
+    if not image_url.startswith('https://static.tvmaze.com/'):
+        image_url = ''
+    externals = row.get('externals') or {}
+    rating = row.get('rating') or {}
+    average = rating.get('average') if isinstance(rating, dict) else None
+    summary = html.unescape(re.sub(r'<[^>]*>', '', _text(row.get('summary'), 10000)))
+    genres = row.get('genres')
+    return {'title': title, 'type': 'tv', 'externalId': str(row['id']),
+            'creator': _text(network.get('name')) if isinstance(network, dict) else '',
+            'year': _text(row.get('premiered'), 4), 'image': image_url,
+            'source': 'TVmaze', 'sourceUrl': url, 'description': summary,
+            'genres': [g for g in genres[:8] if isinstance(g, str)] if isinstance(genres, list) else [],
+            'imdbId': _text(externals.get('imdb')) if isinstance(externals, dict) else '',
+            'publicScores': [{'source': 'TVmaze', 'value': average, 'max': 10, 'count': None, 'url': url}]
+            if type(average) in (int, float) and 0 <= average <= 10 else []}
+
+
+def tvmaze_index(page, fetch):
+    if type(page) is not int or not 0 <= page <= 10000:
+        raise ValueError('Choose a TVmaze index page from 0 to 10000.')
+    rows = fetch('https://api.tvmaze.com/shows?' + urlencode({'page': page}), 'tvmaze')
+    if not isinstance(rows, list) or len(rows) > 250:
+        raise ValueError('Invalid TVmaze index response.')
+    # Anime has its own catalog. The index is for discovering cover-bearing TV.
+    items = []
+    for row in rows:
+        item = tvmaze_item(row)
+        if item and item['image'] and _text(row.get('type')).casefold() != 'anime':
+            items.append(item)
+    return {'provider': 'TVmaze', 'items': items}
+
+
 def query_language(query):
     # Script selects a search index, never a country or the work's origin.
     for pattern, language in [

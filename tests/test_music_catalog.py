@@ -43,7 +43,7 @@ class MusicCatalogTests(unittest.TestCase):
         self.assertEqual(item['image'], 'https://coverartarchive.org/release-group/' + MBID + '/front-500')
         self.assertEqual({urlparse(url).hostname for url, _ in calls}, {'itunes.apple.com', 'musicbrainz.org'})
         self.assertEqual(result['providerStatus'], {'apple': 'ok', 'musicbrainz': 'ok'})
-        self.assertEqual(result['catalogVersion'], 3)
+        self.assertEqual(result['catalogVersion'], 4)
 
     def test_user_field_boolean_and_wildcard_syntax_remains_literal(self):
         query = 'Björk OR primarytype:single "live" a\\b *'

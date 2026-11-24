@@ -204,6 +204,13 @@ export function createLibrarySync({request,onChange=()=>{},onStatus=()=>{},stora
   }catch(error){if(active(context))status(context,'error',error);throw error;}
   return snapshot();
  }
+ async function forgetAccount(userId){
+  if(typeof userId!=='string'||!userId)throw new Error('Choose an account to remove from this device.');
+  if(current?.userId===userId)await setSession({user:null});
+  // Serialize after any prior local transaction. In-flight network responses
+  // cannot repopulate this account after its active context was invalidated.
+  await stored(()=>storage.put(userId,empty()));
+ }
  async function replaceEntries(entries){
   const context=current;
   if(!context?.ready||destroyed)throw new Error('Sign in and load your library before editing it.');
@@ -252,5 +259,5 @@ export function createLibrarySync({request,onChange=()=>{},onStatus=()=>{},stora
  }
  const online=()=>void syncNow();
  globalThis.addEventListener?.('online',online);
- return {setSession,replaceEntries,syncNow,resolveConflict,getState:()=>snapshot(),destroy(){destroyed=true;++epoch;current=null;globalThis.removeEventListener?.('online',online);}};
+ return {setSession,forgetAccount,replaceEntries,syncNow,resolveConflict,getState:()=>snapshot(),destroy(){destroyed=true;++epoch;current=null;globalThis.removeEventListener?.('online',online);}};
 }

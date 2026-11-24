@@ -50,6 +50,18 @@ def rating_count(value):
         return None
 
 
+def valid_score_identity(kind, external_id):
+    if not isinstance(external_id, str):
+        return False
+    if kind in ('movie', 'tv', 'anime'):
+        return bool(re.fullmatch(r'tt\d{5,12}', external_id))
+    if kind == 'book':
+        return bool(re.fullmatch(r'/works/OL\d+W|isbn:97[89]\d{10}', external_id))
+    if kind == 'album':
+        return bool(re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|apple:[1-9]\d{0,19}', external_id))
+    return False
+
+
 def source_url(source, imdb_id, title, supplied=''):
     if source == 'IMDb':
         return f'https://www.imdb.com/title/{imdb_id}/ratings/'
@@ -81,7 +93,8 @@ def mdblist_scores(imdb_id, title, kind, fetch):
             continue
         source = SOURCE_NAMES.get(row['source'].strip().lower())
         value = row.get('value')
-        if source not in FILM_SOURCES or isinstance(value, bool) or value is None:
+        allowed = FILM_SOURCES if kind == 'movie' else FILM_SOURCES[:3]
+        if source not in allowed or isinstance(value, bool) or value is None:
             continue
         try:
             number = float(value)
@@ -151,8 +164,7 @@ class RatingsStore:
     @staticmethod
     def _provider_key(provider, kind, imdb_id):
         if (not isinstance(provider, str) or not re.fullmatch(r'[a-z][a-z0-9_-]{0,31}', provider)
-                or kind not in ('movie', 'tv', 'anime')
-                or not isinstance(imdb_id, str) or not re.fullmatch(r'tt\d{5,12}', imdb_id)):
+                or not valid_score_identity(kind, imdb_id)):
             raise ValueError('Invalid provider cache key.')
 
     def read_provider_cache(self, provider, kind, imdb_id, now=None):

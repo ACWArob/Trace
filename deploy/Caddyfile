@@ -1,0 +1,28 @@
+# Set TRACE_DOMAIN to the real hostname (without https://) in Caddy's environment.
+# The matching Trace service must set TRACE_PUBLIC_ORIGIN=https://that-hostname.
+{$TRACE_DOMAIN} {
+    request_body {
+        max_size 10000000
+    }
+    header {
+        -Server
+        X-Content-Type-Options nosniff
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000"
+    }
+    reverse_proxy 127.0.0.1:5173 {
+        # This header is trusted only from the loopback proxy by Trace.
+        # Overwrite client input, rather than append to it.
+        header_up X-Trace-Client-IP {remote_host}
+        header_up Host {hostport}
+        header_up -Forwarded
+        header_up -X-Forwarded-For
+        header_up -X-Forwarded-Host
+        header_up -X-Forwarded-Proto
+        transport http {
+            dial_timeout 3s
+            keepalive 20s
+            response_header_timeout 90s
+        }
+    }
+}

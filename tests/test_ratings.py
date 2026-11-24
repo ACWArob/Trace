@@ -166,7 +166,8 @@ class RatingTests(unittest.TestCase):
                                {'source':'letterboxd','value':4,'url':'https://evil.example/film/test/'}]}
         with patch.dict('os.environ',{'MDBLIST_API_KEY':'synthetic-test-only'}):
             scores=mdblist_scores('tt1234567','A Show','tv',fetch)
-        self.assertEqual(len(scores),2);self.assertEqual(scores[0]['value'],81)
-        self.assertIn('/imdb/show/',calls[0]);self.assertIn('/search/films/',scores[1]['url'])
+        self.assertEqual(len(scores),1);self.assertEqual(scores[0]['value'],81)
+        self.assertNotIn('Letterboxd', [row['source'] for row in scores])
+        self.assertIn('/imdb/show/',calls[0])
 
 if __name__=='__main__':unittest.main()

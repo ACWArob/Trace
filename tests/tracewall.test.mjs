@@ -81,3 +81,13 @@ test('Artwork shapes preserve media identity and fit inside their shared tile',(
  assert.equal(tracewallArtifact('anime').label,'TV');
  assert.equal(tracewallArtifact('memory').kind,'memory');
 });
+
+test('Share cards carry additional memories onto later cards in the same pick order',()=>{
+ const rows=[item('a','memory'),item('b','book'),item('c','memory'),item('d','album'),item('e','memory')];
+ for(const format of ['story','portrait','square']){
+  const {pages}=tracewallShareCard(rows,format);
+  const picks=Array.from({length:pages},(_,index)=>tracewallShareCard(rows,format,index).picks);
+  assert.deepEqual(picks.flat(),rows);
+  assert.ok(picks.every(card=>card.filter(x=>x.type==='memory').length<=1));
+ }
+});

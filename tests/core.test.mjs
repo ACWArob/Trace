@@ -161,3 +161,31 @@ test('Movie consensus deduplicates provider aliases and excludes other scores',(
  assert.equal(filmConsensus([{source:'Metacritic',value:100,max:100}]).value,null);
  assert.equal(normalizePublicScores([{source:'__proto__',value:4,max:5}])[0].source,'__proto__');
 });
+
+test('Discogs imports only album releases, with source links and no listening dates',()=>{
+ const csv='Title,Artist,Format,Released,Rating,release_id,Date Added\n'+
+   'Raoui,Souad Massi,"CD, Album",2001,5,12345,2026-11-01\n'+
+   'A single,Souad Massi,"Vinyl, Single",2002,4,22222,2026-11-01\n';
+ const {entries,source,skipped}=normalizeImport(csv,'collection.csv');
+ assert.equal(source,'discogs');
+ assert.equal(skipped,1);
+ assert.deepEqual(entries.map(x=>[x.type,x.title,x.creator,x.rating,x.status,x.date,x.externalId,x.sourceUrl]),
+   [['album','Raoui','Souad Massi',5,'want','','12345','https://www.discogs.com/release/12345']]);
+});
+
+test('Stable provider and ISBN identifiers distinguish same-name items and merge exact matches',()=>{
+ const item={id:'saved',type:'book',title:'Fantastic Mr. Fox',creator:'Roald Dahl',year:'1988',rating:5,notes:'My note',date:'2026-10-01',isbn:'9780140328721',source:'Goodreads',externalId:'10'};
+ const exact={...item,id:'incoming',title:'Fantastic Mr. Fox (paperback)',isbn:'0-14-032872-6',source:'Open Library',externalId:'/books/OL1M',rating:2,date:'',notes:''};
+ const separate={...item,id:'second',source:'goodreads',externalId:'11',isbn:''};
+ const result=mergeEntries([item],[exact,separate]);
+ assert.equal(result.entries.length,2);
+ assert.equal(result.entries[0].rating,5);
+ assert.equal(result.entries[0].notes,'My note');
+ assert.equal(result.entries[0].date,'2026-10-01');
+ assert.equal(result.entries[0].externalId,'10');
+ assert.equal(result.entries[1].externalId,'11');
+ assert.equal(mergeEntries([item],[{...item,title:'Fantastic Mr. Fox (renamed)',source:'goodreads'}]).entries.length,1);
+ const movies=mergeEntries([{id:'a',type:'movie',title:'Same title',imdbId:'tt1234567'}],
+   [{id:'b',type:'movie',title:'Same title',imdbId:'tt2345678'}]);
+ assert.equal(movies.entries.length,2);
+});

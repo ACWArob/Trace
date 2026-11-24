@@ -40,6 +40,21 @@ async function client(connection,storage=memory(),user='user'){
  const sync=createLibrarySync({request:connection.request,storage,onChange:value=>changes.push(value),onStatus:value=>statuses.push(value)});
  await sync.setSession({user:{id:user}});await sync.syncNow();return {sync,storage,changes,statuses};
 }
+
+test('account deletion clears local queues and an old network response cannot restore them',async()=>{
+ const backend=server(),connection=backend.connect('user'),store=memory(),a=await client(connection,store);
+ connection.offline=true;
+ await a.sync.replaceEntries([entry('private-photo')]);
+ await a.sync.syncNow();
+ const gate={kind:'get',started:deferred(),release:deferred()};connection.gate=gate;connection.offline=false;
+ const sync=a.sync.syncNow();await gate.started.promise;
+ await a.sync.forgetAccount('user');
+ gate.release.resolve();await sync;
+ assert.equal(a.sync.getState().userId,null);
+ assert.deepEqual(store.values.get('user').entries,{});
+ assert.deepEqual(store.values.get('user').pending,{});
+ assert.deepEqual(store.values.get('user').conflicts,{});
+});
 function gate(connection,kind){const value={kind,started:deferred(),release:deferred()};connection.gate=value;return value;}
 
 test('two clients merge distinct entries and preserve every entry field',async()=>{

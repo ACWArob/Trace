@@ -17,6 +17,7 @@ MAX_ENTRIES = 30000
 MAX_ENTRY_BYTES = 1500000
 MAX_CHANGES = 100
 MAX_REVISION = 9007199254740991
+MAX_PULL_BYTES = 6 * 1024 * 1024
 ID_PATTERN = re.compile(r'[a-zA-Z0-9_-]{1,100}')
 
 
@@ -181,7 +182,10 @@ def _entry(value, entry_id):
 
 
 class LibraryStore:
-    def __init__(self, path=None):
+    def __init__(self, path=None, *, byte_limit=None):
+        if byte_limit is not None and (type(byte_limit) is not int or byte_limit < 1):
+            raise ValueError('The account byte limit must be a positive integer.')
+        self.byte_limit = byte_limit
         self.path = Path(path) if path else database_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.db() as db:
@@ -232,9 +236,15 @@ class LibraryStore:
             cursor = state['cursor'] if state else 0
             if after > cursor:
                 _invalid('The library cursor is ahead of this account.')
-            rows = db.execute('SELECT id,entry,revision FROM private_library_entries WHERE user_id=? AND revision>? ORDER BY revision LIMIT ?', (user_id, after, limit + 1)).fetchall()
-            has_more = len(rows) > limit
-            changes = [self._record(row) for row in rows[:limit]]
+            rows, size, has_more = [], 0, False
+            for row in db.execute('SELECT id,entry,revision FROM private_library_entries WHERE user_id=? AND revision>? ORDER BY revision LIMIT ?', (user_id, after, limit + 1)):
+                row_size = len(row['entry'].encode('utf-8')) if row['entry'] else 0
+                if len(rows) == limit or (rows and size + row_size > MAX_PULL_BYTES):
+                    has_more = True
+                    break
+                rows.append(row)
+                size += row_size
+            changes = [self._record(row) for row in rows]
             total = db.execute('SELECT count(*) FROM private_library_entries WHERE user_id=? AND entry IS NOT NULL', (user_id,)).fetchone()[0]
             return {'changes': changes, 'cursor': changes[-1]['revision'] if has_more else cursor,
                     'hasMore': has_more, 'total': total}
@@ -262,15 +272,21 @@ class LibraryStore:
             cursor = state['cursor'] if state else 0
             writes = []
             total = db.execute('SELECT count(*) FROM private_library_entries WHERE user_id=? AND entry IS NOT NULL', (user_id,)).fetchone()[0]
+            previous_bytes = db.execute('SELECT coalesce(sum(length(cast(entry AS BLOB))),0) FROM private_library_entries WHERE user_id=?', (user_id,)).fetchone()[0] if self.byte_limit else 0
+            total_bytes = previous_bytes
             for entry_id, encoded, base in validated:
                 row = db.execute('SELECT id,entry,revision FROM private_library_entries WHERE user_id=? AND id=?', (user_id, entry_id)).fetchone()
                 if base != (row['revision'] if row else 0):
                     conflicts.append(self._record(row, entry_id))
                     continue
                 total += int(encoded is not None) - int(row is not None and row['entry'] is not None)
+                if self.byte_limit:
+                    total_bytes += (len(encoded.encode('utf-8')) if encoded else 0) - (len(row['entry'].encode('utf-8')) if row and row['entry'] else 0)
                 writes.append((entry_id, encoded))
             if total > MAX_ENTRIES:
                 _invalid('Your account library exceeds the 30,000-item limit.')
+            if self.byte_limit and total_bytes > self.byte_limit and total_bytes > previous_bytes:
+                _invalid('Your account storage is full. Export a backup, then remove items or reduce photo sizes. Your device changes are still saved.')
             if cursor + len(writes) > MAX_REVISION:
                 _invalid('The account library revision limit has been reached.')
             for entry_id, encoded in writes:

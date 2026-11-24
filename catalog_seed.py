@@ -8,7 +8,9 @@ import argparse
 import json
 import os
 from pathlib import Path
-from catalog_store import VISIBLE_CATALOG
+from urllib.error import URLError
+from catalog_store import VISIBLE_CATALOG, catalog_search_text
+from screen_catalog import tvmaze_index
 
 
 STARTER_QUERIES = {
@@ -43,12 +45,75 @@ INTERNATIONAL_QUERIES = {
               'Oumou Sangaré', 'Arooj Aftab', 'Nusrat Fateh Ali Khan',
               'Ryuichi Sakamoto'),
 }
-COLLECTIONS = {'international': INTERNATIONAL_QUERIES, 'classic': STARTER_QUERIES}
+EXPANDED_BOOK_AUTHORS = {
+    'The Yacoubian Building': 'Aswany',
+    'Dreams of Trespass': 'Mernissi',
+    'The Queue': 'Basma Abdel Aziz',
+    'The Memory Police': 'Ogawa',
+    'The Mountains Sing': 'Nguyen',
+    'The Shadow of the Wind': 'Zafon',
+    'The Book of Disquiet': 'Pessoa',
+    'The Map of Salt and Stars': 'Joukhadar',
+}
+EXPANDED_MOVIE_YEARS = {
+    'Atlantics': '2019', 'Theeb': '2014', 'Wadjda': '2012',
+    'Timbuktu': '2014', 'The Lunchbox': '2013', 'Flee': '2021',
+}
+EXPANDED_QUERIES = {
+    'movie': tuple(EXPANDED_MOVIE_YEARS),
+    'tv': ('Pachinko', 'AlRawabi School for Girls', 'Midnight Diner'),
+    'anime': ('Ping Pong the Animation', 'A Place Further Than the Universe'),
+    'book': tuple(EXPANDED_BOOK_AUTHORS),
+    'album': ('Tinariwen', 'Cesária Évora', 'Youssou N’Dour', 'A-WA',
+              'Lhasa de Sela', 'Fela Kuti', 'Natacha Atlas', 'Amália Rodrigues'),
+}
+TV_BOOK_QUERIES = {
+    'tv': ('أولاد الحلال', 'عاشور العاشر', 'بنت البلاد', 'نسيبتي العزيزة',
+           'نوبة', 'موضوع عائلي', 'Finding Ola', 'Paranormal', 'The Exchange',
+           'Jinn', 'Delhi Crime', 'Made in Heaven', 'Extraordinary Attorney Woo',
+           'Move to Heaven', 'The Makanai: Cooking for the Maiko House',
+           'The Victims’ Game', 'El marginal', 'Invisible City', 'Blood & Water',
+           'Queen Sono'),
+    'book': ('Assia Djebar', 'Kateb Yacine', 'Mohammed Dib', 'Mouloud Feraoun',
+             'Tahar Djaout', 'Ahlam Mosteghanemi', 'Leïla Slimani', 'Naguib Mahfouz',
+             'al-Ṭayyib Ṣāliḥ', 'Nawal El Saadawi', 'Chimamanda Ngozi Adichie',
+             'Abdulrazak Gurnah', 'Yaa Gyasi', 'Isabel Allende', 'Samanta Schweblin',
+             'Jorge Luis Borges', 'Yoko Ogawa', '吉本 ばなな',
+             'Pramoedya Ananta Toer', 'Viet Thanh Nguyen'),
+}
+COLLECTIONS = {'international': INTERNATIONAL_QUERIES, 'classic': STARTER_QUERIES,
+               'expanded': EXPANDED_QUERIES, 'tv-books': TV_BOOK_QUERIES}
+
+
+def expanded_match(kind, query, row):
+    if not isinstance(row, dict) or row.get('type') != kind:
+        return False
+    target = catalog_search_text(query)
+    title = catalog_search_text(str(row.get('title') or ''))
+    creator = catalog_search_text(str(row.get('creator') or ''))
+    if kind == 'album':
+        return creator.replace(' ', '') == target.replace(' ', '')
+    if kind == 'book':
+        author = catalog_search_text(EXPANDED_BOOK_AUTHORS[query]).replace(' ', '')
+        return (title == target or title.startswith(target + ' ')) and author in creator.replace(' ', '')
+    if kind == 'movie':
+        return title == target and str(row.get('year')) == EXPANDED_MOVIE_YEARS[query]
+    return title == target or (kind == 'tv' and query == 'Midnight Diner' and title == 'midnight diner tokyo stories')
+
+
+def tv_book_match(kind, query, row):
+    if not isinstance(row, dict) or row.get('type') != kind:
+        return False
+    target = catalog_search_text(query)
+    if kind == 'tv':
+        return catalog_search_text(str(row.get('title') or '')) == target
+    authors = str(row.get('creator') or '').split(',')
+    return bool(row.get('image')) and any(catalog_search_text(author) == target for author in authors)
 
 
 def seed_plan(kind=None, limit_queries=40, collection='international'):
     if collection not in COLLECTIONS:
-        raise ValueError('Choose the international or classic starter collection.')
+        raise ValueError('Choose the international, classic, expanded, or tv-books collection.')
     selected = COLLECTIONS[collection]
     if kind is not None and kind not in selected:
         raise ValueError('Choose a supported catalog category.')
@@ -101,10 +166,23 @@ def run_seed(search, catalog, *, kind=None, limit_queries=40, workers=3,
         try:
             # The real search function handles cache freshness/versioning. Do
             # not bypass it by trusting an older cached provider payload here.
-            result = search(media_kind, text)
+            key = text
+            if collection == 'tv-books':
+                key = f'trace-seed:tv-books:{text}'
+                saved = catalog.cached(media_kind, key)
+                if saved:
+                    event.update(status='cached', items=len(saved['items']),
+                                 warningCount=len(saved.get('warnings') or []))
+                    return event
+            query_text = f'author:"{text}"' if collection == 'tv-books' and media_kind == 'book' else text
+            result = search(media_kind, query_text)
             if not isinstance(result, dict) or not isinstance(result.get('items'), list):
                 raise ValueError('Invalid public catalog result.')
-            saved = catalog.save(media_kind, text, result)
+            if collection == 'expanded':
+                result = {**result, 'items': [row for row in result['items'] if expanded_match(media_kind, text, row)]}
+            if collection == 'tv-books':
+                result = {**result, 'items': [row for row in result['items'] if tv_book_match(media_kind, text, row)]}
+            saved = catalog.save(media_kind, key, result)
             event.update(status='cached' if result.get('cached') else 'saved',
                          items=len(saved['items']),
                          warningCount=len(result.get('warnings') or []))
@@ -130,6 +208,16 @@ def run_seed(search, catalog, *, kind=None, limit_queries=40, workers=3,
             'before': before, 'after': after,
             'addedTitles': after['total'] - before['total'],
             'queries': sorted(events, key=lambda event: event['number'])}
+
+
+def run_tv_page(page, fetch, catalog):
+    before = catalog_coverage(catalog)
+    result = tvmaze_index(page, fetch)
+    saved = catalog.save('tv', None, result)
+    after = catalog_coverage(catalog)
+    return {'dryRun': False, 'provider': 'TVmaze', 'tvPage': page,
+            'items': len(saved['items']), 'before': before, 'after': after,
+            'addedTitles': after['total'] - before['total']}
 
 
 def load_seed_server():
@@ -166,17 +254,33 @@ def main(argv=None):
     parser.add_argument('--kind', choices=tuple(STARTER_QUERIES))
     parser.add_argument('--collection', choices=tuple(COLLECTIONS), default='international',
                         help='Choose a fixed discovery plan; international is the default.')
+    parser.add_argument('--tv-page', type=int, help='Use one page of the official TVmaze show index.')
     parser.add_argument('--limit-queries', type=int, default=40)
     parser.add_argument('--workers', type=int, default=3)
     parser.add_argument('--report', help='Write a new public aggregate .json report.')
     args = parser.parse_args(argv)
     try:
-        plan = seed_plan(args.kind, args.limit_queries, args.collection)
+        if args.tv_page is not None:
+            if not 0 <= args.tv_page <= 10000:
+                raise ValueError('Choose a TVmaze index page from 0 to 10000.')
+            if args.kind or args.collection != 'international' or args.limit_queries != 40:
+                raise ValueError('--tv-page is a separate operation from the curated collections.')
+        else:
+            plan = seed_plan(args.kind, args.limit_queries, args.collection)
         if not 1 <= args.workers <= 3:
             raise ValueError('Use between one and three seed workers.')
         if args.report:
             report_target(args.report)
-        if not args.apply:
+        if args.tv_page is not None:
+            if args.apply:
+                backend = load_seed_server()
+                try:
+                    report = run_tv_page(args.tv_page, backend.fetch, backend.get_catalog())
+                except (URLError, TimeoutError) as error:
+                    raise ValueError('TVmaze did not return that page. Check the page number or try again later.') from error
+            else:
+                report = {'dryRun': True, 'provider': 'TVmaze', 'tvPage': args.tv_page}
+        elif not args.apply:
             report = {'dryRun': True, 'collection': args.collection, 'plannedQueries': len(plan),
                       'queries': [{'number': number, 'kind': kind, 'query': query}
                                   for number, (kind, query) in enumerate(plan, 1)]}
@@ -184,7 +288,8 @@ def main(argv=None):
             backend = load_seed_server()
             def progress(event):
                 print(json.dumps({'progress': event}, ensure_ascii=False), flush=True)
-            report = run_seed(backend.search, backend.get_catalog(), kind=args.kind,
+            report = run_seed(lambda kind, text: backend.search(kind, text, persist=False),
+                              backend.get_catalog(), kind=args.kind,
                               limit_queries=args.limit_queries, workers=args.workers,
                               progress=progress, collection=args.collection)
         if args.report:

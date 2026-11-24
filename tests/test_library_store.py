@@ -156,6 +156,31 @@ class LibraryStoreTests(unittest.TestCase):
         self.assertEqual(sum(len(result['conflicts']) for result in results), 1)
         self.assertEqual(self.store.pull('alice')['cursor'], 1)
 
+    def test_account_byte_quota_is_utf8_atomic_and_allows_space_recovery(self):
+        store = LibraryStore(self.path, byte_limit=200)
+        store.sync('alice', [change(value=entry(notes='💛' * 12))])
+        before = store.pull('alice')
+        self.assert_bad(lambda: store.sync('alice', [change('two', entry('two', notes='💛' * 40)), change('one', entry(notes='Changed'), 1)]))
+        self.assertEqual(store.pull('alice'), before)
+        store.sync('bob', [change(value=entry())])
+        # A reduced quota must not prevent the owner shrinking or deleting old data.
+        store = LibraryStore(self.path, byte_limit=20)
+        store.sync('alice', [change(value=entry(), revision=1)])
+        store.sync('alice', [change(value=None, revision=2)])
+        self.assertEqual(store.pull('alice')['total'], 0)
+        self.assertEqual(store.pull('bob')['total'], 1)
+
+    def test_photo_pages_are_byte_bounded_without_skipping_revisions(self):
+        self.store.sync('alice', [change('one', entry(notes='x' * 70)), change('two', entry('two', notes='x' * 70)), change('three', None)])
+        with patch('library_store.MAX_PULL_BYTES', 150):
+            first = self.store.pull('alice')
+            self.assertEqual([x['id'] for x in first['changes']], ['one'])
+            self.assertTrue(first['hasMore'])
+            second = self.store.pull('alice', after=first['cursor'])
+            self.assertEqual([x['id'] for x in second['changes']], ['two', 'three'])
+            self.assertFalse(second['hasMore'])
+            self.assertEqual(second['cursor'], 3)
+
 
 if __name__ == '__main__':
     unittest.main()

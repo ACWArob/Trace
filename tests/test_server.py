@@ -74,6 +74,23 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(item['year'],'')
         self.assertEqual(item['image'],'')
 
+    @patch('server.fetch')
+    def test_isbn_lookup_keeps_the_exact_edition_and_caches_aliases(self, fetch):
+        fetch.return_value = {'ISBN:9780140328721': {
+            'title': 'Fantastic Mr. Fox', 'authors': [{'name': 'Roald Dahl'}], 'publish_date': '1990',
+            'identifiers': {'openlibrary': ['OL123M'], 'isbn_13': ['9780140328721']},
+            'cover': {'large': 'http://covers.openlibrary.org/b/id/123-L.jpg'},
+        }}
+        result = server.search('book', 'ISBN 0-14-032872-6')
+        item = result['items'][0]
+        self.assertIn('bibkeys=ISBN%3A9780140328721', fetch.call_args.args[0])
+        self.assertEqual(item['isbn'], '9780140328721')
+        self.assertEqual(item['externalId'], '/books/OL123M')
+        self.assertEqual(item['image'], 'https://covers.openlibrary.org/b/id/123-L.jpg?default=false')
+        self.assertEqual(server.search('book', '9780140328721')['items'][0]['title'], 'Fantastic Mr. Fox')
+        self.assertEqual(server.get_catalog().browse('book', '0-14-032872-6')['total'], 1)
+        fetch.assert_called_once()
+
     def test_personal_memories_and_legacy_places_are_not_catalogs(self):
         self.assertNotIn('memory',server.PROVIDERS)
         self.assertNotIn('place',server.PROVIDERS)

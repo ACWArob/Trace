@@ -58,11 +58,23 @@ test('package copies only allowlisted public files and generated configuration',
   const root = await fixture();
   const result = await buildNative({rootDir: root, env: {TRACE_NATIVE_API_ORIGIN: 'https://trace.example', UNRELATED_SECRET: 'hidden'}, bundle: fakeBundle});
   const names = await readdir(result.directory);
-  assert.deepEqual(names.sort(), ['assets', 'index.html', 'manifest.webmanifest', 'native-config.json', 'styles.css', 'trace-native.js']);
+  assert.deepEqual(names.sort(), ['assets', 'index.html', 'manifest.webmanifest', 'native-config.json', 'privacy.html', 'styles.css', 'support.html', 'trace-native.js']);
   assert.deepEqual(JSON.parse(await readFile(join(result.directory, 'native-config.json'), 'utf8')), {apiOrigin: 'https://trace.example', development: false});
   assert.equal((await readdir(join(result.directory, 'assets'))).length, PUBLIC_NATIVE_FILES.filter(file => file.startsWith('assets/')).length);
   assert.ok(PUBLIC_NATIVE_FILES.every(file => !/screenshots|logo-options|\.trace|\.env|sqlite|README|tests|node_modules/.test(file)));
-  await buildNative({rootDir: root, env: {}, bundle: fakeBundle});
+  await assert.rejects(buildNative({rootDir: root, env: {}, bundle: fakeBundle}), /connected to a server/);
+  await buildNative({rootDir: root, env: {TRACE_NATIVE_ALLOW_OFFLINE: '1'}, bundle: fakeBundle});
+});
+
+test('accidental offline sync cannot overwrite a connected bundle, and release rejects the escape hatch', async () => {
+  const root = await fixture();
+  await buildNative({rootDir: root, env: {TRACE_NATIVE_API_ORIGIN: 'https://trace.example'}, bundle: fakeBundle});
+  const before = await readFile(join(root, 'native/web/native-config.json'), 'utf8');
+  let bundled = false;
+  await assert.rejects(buildNative({rootDir: root, env: {}, bundle: async () => {bundled = true;}}), /connected to a server/);
+  assert.equal(bundled, false);
+  assert.equal(await readFile(join(root, 'native/web/native-config.json'), 'utf8'), before);
+  assert.throws(() => validateNativeConfig({TRACE_NATIVE_API_ORIGIN: 'https://trace.example', TRACE_NATIVE_ALLOW_OFFLINE: '1'}, {release: true}), /offline downgrade/);
 });
 
 test('unexpected output files stop packaging without deleting the file', async () => {
