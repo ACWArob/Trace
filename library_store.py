@@ -15,6 +15,7 @@ MAX_CHANGES = 100
 MAX_REVISION = 9007199254740991
 MAX_PULL_BYTES = 6 * 1024 * 1024
 ID_PATTERN = re.compile(r'[a-zA-Z0-9_-]{1,100}')
+STORAGE_FULL = 'Your account storage is full. Export a backup, then remove items or reduce photo sizes. Your device changes are still saved.'
 
 
 def _invalid(message='The library entry is invalid.'):
@@ -59,6 +60,9 @@ def _url(value, image=False):
             _invalid('The library image is invalid.')
         return
     if image and re.fullmatch(r'/assets/[\w.-]+', value):
+        return
+    # A synced private photo (photo_store.py), served only to its owner by /api/photos/<id>.
+    if image and re.fullmatch(r'trace-photo:[0-9a-f]{64}', value):
         return
     try:
         parsed = urlparse(value)
@@ -186,7 +190,7 @@ class LibraryStore:
 
     @staticmethod
     def _user(db, user_id):
-        if not isinstance(user_id, str) or not user_id or not db.execute('SELECT 1 FROM users WHERE id=?', (user_id,)).fetchone():
+        if not isinstance(user_id, str) or not user_id or not db.execute('SELECT 1 FROM users WHERE id=? FOR SHARE', (user_id,)).fetchone():
             raise SocialError('Sign in to use your account library.', 401)
 
     @staticmethod
@@ -256,7 +260,7 @@ class LibraryStore:
             if total > MAX_ENTRIES:
                 _invalid('Your account library exceeds the 30,000-item limit.')
             if self.byte_limit and total_bytes > self.byte_limit and total_bytes > previous_bytes:
-                _invalid('Your account storage is full. Export a backup, then remove items or reduce photo sizes. Your device changes are still saved.')
+                _invalid(STORAGE_FULL)
             if cursor + len(writes) > MAX_REVISION:
                 _invalid('The account library revision limit has been reached.')
             for entry_id, encoded in writes:

@@ -28,7 +28,8 @@ def client_ip(peer, headers):
     """
     trust = os.environ.get('TRACE_TRUST_PROXY') if production_mode() else None
     address = None
-    if trust == 'vercel':
+    # Off Vercel the header is client-controlled, so only trust it on Vercel.
+    if trust == 'vercel' and os.environ.get('VERCEL') == '1':
         forwarded = headers.get('X-Vercel-Forwarded-For', '') or ''
         try:
             address = ipaddress.ip_address(forwarded.split(',', 1)[0].strip())

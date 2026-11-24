@@ -17,7 +17,7 @@ from server import Handler, ROOT, public_origin
 from ratings import load_local_rating_key
 from release_policy import signup_mode, library_byte_limit
 
-MAX_BODY_BYTES = 4_000_000  # Vercel caps request bodies at 4.5 MB.
+MAX_BODY_BYTES = 4_100_000  # Vercel caps request bodies at 4.5 MB; fits a 3 MB photo as base64 JSON.
 HOP_HEADERS = frozenset(('connection', 'keep-alive', 'proxy-authenticate',
                          'proxy-authorization', 'te', 'trailer',
                          'transfer-encoding', 'upgrade'))

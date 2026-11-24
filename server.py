@@ -14,8 +14,10 @@ import threading
 import ssl
 import hmac
 from http.cookies import SimpleCookie
+import base64
 import database
 import maintenance
+import photo_store
 from durable_budget import DurableBudget
 from catalog_store import CatalogStore, query_cache_ttl, catalog_search_text
 from book_catalog import search_books, normalize_isbn, openlibrary_scores, google_books_scores, CATALOG_VERSION as BOOK_CATALOG_VERSION
@@ -486,6 +488,76 @@ class Handler(SimpleHTTPRequestHandler):
         except database.Error:
             return self.send_json({'error': 'The library database is busy. Your device changes are still saved.'}, 503)
 
+    def photo_library(self):
+        # On Vercel the function's OIDC token arrives per request; env vars cover cron and local dev.
+        store = photo_store.store_from_env(self.headers.get('x-vercel-oidc-token') or None)
+        if store is None:
+            raise photo_store.PhotoStoreError('Photo storage is not configured.')
+        return photo_store.PhotoLibrary(get_database(), store)
+
+    def photo_post(self):
+        try:
+            if self.headers.get('Origin') != self.request_origin():
+                raise SocialError('This action must come from Trace.', 403)
+            session = get_social().session(self.session_token())
+            if not session['user']:
+                raise SocialError('Sign in to sync your photos.', 401)
+            csrf = self.headers.get('X-Trace-CSRF', '')
+            if not csrf or not hmac.compare_digest(csrf, session['csrf']):
+                raise SocialError('Refresh Trace and try again.', 403)
+            content_type = self.headers.get('Content-Type', '').split(';')[0].strip().lower()
+            native = content_type == 'application/json'
+            if not native and content_type not in photo_store.PHOTO_TYPES:
+                raise photo_store.PhotoError('Choose a JPEG, PNG, or WebP photo.', 415)
+            max_bytes = photo_store.photo_byte_limit()
+            # Native bodies carry base64 (4 characters per 3 bytes) inside a small JSON object.
+            limit = -(-max_bytes // 3) * 4 + 256 if native else max_bytes
+            try:
+                length = int(self.headers.get('Content-Length', ''))
+            except ValueError:
+                length = 0
+            if length > limit:
+                raise photo_store.PhotoError('The photo is too large.', 413)
+            if length <= 0:
+                raise photo_store.PhotoError('Send a photo.')
+            body = self.rfile.read(length)
+            if native:
+                try:
+                    payload = json.loads(body)
+                except (ValueError, UnicodeError) as exc:
+                    raise photo_store.PhotoError('The request is not valid JSON.') from exc
+                if not isinstance(payload, dict):
+                    raise photo_store.PhotoError('Send a JSON object.')
+                content_type, body = photo_store.decode_native(payload)
+            photo_id = self.headers.get('X-Trace-Photo-Id', '')
+            return self.send_json(self.photo_library().upload(session['user']['id'], photo_id, content_type, body))
+        except (SocialError, photo_store.PhotoError) as exc:
+            return self.send_json({'error': str(exc)}, exc.status)
+        except (photo_store.PhotoStoreError, database.Error):
+            return self.send_json({'error': 'Photo sync is temporarily unavailable. Your device changes are still saved.'}, 503)
+
+    def photo_get(self, parsed):
+        try:
+            session = get_social().session(self.session_token())
+            if not session['user']:
+                raise SocialError('Sign in to open your photos.', 401)
+            photo_id = parsed.path[len('/api/photos/'):]
+            content_type, data = self.photo_library().read(session['user']['id'], photo_id)
+        except SocialError as exc:
+            return self.send_json({'error': str(exc)}, exc.status)
+        except photo_store.PhotoMissing:
+            return self.send_json({'error': 'Photo not found.'}, 404)
+        except (photo_store.PhotoStoreError, database.Error):
+            return self.send_json({'error': 'Photos are temporarily unavailable.'}, 503)
+        if parse_qs(parsed.query).get('encoding') == ['base64']:
+            return self.send_json({'contentType': content_type, 'data': base64.b64encode(data).decode()})
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Cache-Control', 'private, max-age=86400')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def session_token(self):
         cookie = SimpleCookie()
         try:
@@ -601,6 +673,8 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == '/api/library/sync':
             return self.library_post()
+        if path == '/api/photos':
+            return self.photo_post()
         if path.startswith(('/api/social/', '/api/auth/')):
             return self.social_post(path)
         if path != '/api/profile-connect':
@@ -637,7 +711,8 @@ class Handler(SimpleHTTPRequestHandler):
         if not secret or not hmac.compare_digest(supplied.encode(), ('Bearer ' + secret).encode()):
             return self.send_json({'error': 'Unauthorized.'}, 401)
         try:
-            return self.send_json(maintenance.run(get_database(), service=score_service(), loader_for=score_loader))
+            store = photo_store.store_from_env(self.headers.get('x-vercel-oidc-token') or None)
+            return self.send_json(maintenance.run(get_database(), service=score_service(), loader_for=score_loader, photo_store=store))
         except database.Error:
             return self.send_json({'error': 'Maintenance could not reach the database.'}, 503)
 
@@ -667,6 +742,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == '/api/library':
             return self.library_get(parsed)
+        if parsed.path.startswith('/api/photos/'):
+            return self.photo_get(parsed)
         if parsed.path.startswith(('/api/social/', '/api/auth/')):
             return self.social_get(parsed)
         if parsed.path == '/api/ratings':

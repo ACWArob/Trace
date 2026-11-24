@@ -3,6 +3,9 @@
   "framework": null,
   "buildCommand": "python3 scripts/build_public.py",
   "outputDirectory": "public",
+  "regions": [
+    "iad1"
+  ],
   "rewrites": [
     {
       "source": "/api/(.*)",

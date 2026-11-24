@@ -105,7 +105,7 @@ def read_profile_feed(service, identifier, context):
         profile_url = 'https://www.goodreads.com/user/show/' + identifier
         feed_url = 'https://www.goodreads.com/review/list_rss/' + identifier + '?' + urlencode({'shelf': '#ALL#', 'per_page': 200})
     request = Request(feed_url, headers={'User-Agent': 'TraceLocal/0.1 (personal collection)', 'Accept': 'application/rss+xml, application/xml, text/xml'})
-    with urlopen(request, timeout=20, context=context) as response:
+    with urlopen(request, timeout=9, context=context) as response:
         payload = response.read(2 * 1024 * 1024 + 1)
     return {'items': parse_feed(service, payload), 'identifier': identifier, 'profileUrl': profile_url,
             'service': service, 'mode': 'public-feed', 'limited': True}

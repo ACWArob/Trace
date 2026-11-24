@@ -83,9 +83,9 @@ class ProductionAdapterTests(PostgresTestCase):
 
     def test_limits_and_unsupported_methods_are_rejected_before_dispatch(self):
         self.assertEqual(request('/', 'PUT')['status'], 405)
-        self.assertEqual(production.MAX_BODY_BYTES, 4_000_000)
-        self.assertEqual(request('/', headers={'CONTENT_LENGTH': '4000001'})['status'], 413)
-        self.assertEqual(request('/', headers={'CONTENT_LENGTH': '4000000'}, validate=False)['status'], 200)
+        self.assertEqual(production.MAX_BODY_BYTES, 4_100_000)
+        self.assertEqual(request('/', headers={'CONTENT_LENGTH': '4100001'})['status'], 413)
+        self.assertEqual(request('/', headers={'CONTENT_LENGTH': '4100000'}, validate=False)['status'], 200)
         self.assertEqual(request('/', headers={'CONTENT_LENGTH': '-1'}, validate=False)['status'], 400)
         self.assertEqual(request('/', headers={'SCRIPT_NAME': '/trace'})['status'], 400)
 

@@ -1,5 +1,6 @@
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -89,7 +90,7 @@ class ReleasePolicyTests(PostgresTestCase):
         self.assertEqual(keys, [budget.digest('auth:203.0.113.7')])
 
     def test_vercel_mode_keys_on_the_vercel_forwarded_address(self):
-        with patch.dict('os.environ', {'TRACE_TRUST_PROXY':'vercel'}):
+        with patch.dict('os.environ', {'TRACE_TRUST_PROXY':'vercel', 'VERCEL':'1'}):
             self.assertEqual(client_ip('', {'X-Vercel-Forwarded-For':'203.0.113.9', 'X-Real-IP':'198.51.100.1'}), '203.0.113.9')
             self.assertEqual(client_ip('10.0.0.1', {'X-Vercel-Forwarded-For':'203.0.113.9, 10.1.1.1'}), '203.0.113.9')
             self.assertEqual(client_ip('10.0.0.1', {'X-Real-IP':'198.51.100.1'}), '10.0.0.1')
@@ -99,12 +100,16 @@ class ReleasePolicyTests(PostgresTestCase):
             self.assertEqual(client_ip('127.0.0.1', {'X-Trace-Client-IP':'203.0.113.4'}), '127.0.0.1')
         with patch.dict('os.environ', {'TRACE_TRUST_PROXY':'vercel', 'TRACE_ENV':'development'}):
             self.assertEqual(client_ip('127.0.0.1', {'X-Vercel-Forwarded-For':'203.0.113.9'}), '127.0.0.1')
+        # Off Vercel the header is client-controlled and must be ignored.
+        with patch.dict('os.environ', {'TRACE_TRUST_PROXY':'vercel'}):
+            os.environ.pop('VERCEL', None)
+            self.assertEqual(client_ip('10.0.0.1', {'X-Vercel-Forwarded-For':'203.0.113.9'}), '10.0.0.1')
 
     def test_vercel_auth_budget_ignores_a_spoofed_real_ip(self):
         def login(real_ip):
             return request('/api/auth/login', 'POST', {}, {'HTTP_HOST':'trace.example', 'HTTP_ORIGIN':'https://trace.example',
                            'HTTP_X_VERCEL_FORWARDED_FOR':'203.0.113.20', 'HTTP_X_REAL_IP':real_ip})
-        with patch.dict('os.environ', {'TRACE_TRUST_PROXY':'vercel'}):
+        with patch.dict('os.environ', {'TRACE_TRUST_PROXY':'vercel', 'VERCEL':'1'}):
             for index in range(15):
                 login(f'198.51.100.{index}')
             self.assertEqual(login('198.51.100.99')['status'], 429)
