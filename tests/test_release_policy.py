@@ -71,7 +71,9 @@ class ReleasePolicyTests(PostgresTestCase):
         self.assertEqual(client_ip('127.0.0.1',{'X-Trace-Client-IP':'a,b'}),'127.0.0.1')
         with patch.dict('os.environ',{'TRACE_TRUST_PROXY':'0'}):self.assertEqual(client_ip('127.0.0.1',headers),'127.0.0.1')
         for _ in range(15):self.call('/api/auth/login',{},address='203.0.113.8')
-        self.assertEqual(self.call('/api/auth/login',{},address='203.0.113.8')['status'],429)
+        limited=self.call('/api/auth/login',{},address='203.0.113.8')
+        self.assertEqual(limited['status'],429)
+        self.assertEqual(dict(limited['headers']).get('Retry-After'),'60')
         self.assertEqual(self.call('/api/auth/login',{},address='203.0.113.9')['status'],401)
 
     def test_shallow_health_never_opens_the_database(self):

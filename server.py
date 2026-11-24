@@ -635,7 +635,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(store.set_hidden(user_id, str(payload.get('id', '')), payload.get('hidden') is True))
             raise SocialError('Unknown social action.', 404)
         except SocialError as exc:
-            return self.send_json({'error': str(exc)}, exc.status)
+            return self.send_json({'error': str(exc)}, exc.status, {'Retry-After': '60'} if exc.status == 429 else None)
         except database.Error:
             return self.send_json({'error': 'The social database is busy. Please try again.'}, 503)
 
