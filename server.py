@@ -17,6 +17,7 @@ import hashlib
 from http.cookies import SimpleCookie
 import base64
 import database
+import cover_maintenance
 import maintenance
 import photo_store
 from durable_budget import DurableBudget
@@ -456,6 +457,14 @@ def cover(kind, title, year='', creator='', isbn=''):
     return result['image']
 
 
+class _CoverLookups:
+    letterboxd = staticmethod(lambda url: letterboxd_poster(url))
+    cover = staticmethod(lambda kind, title, year, creator, isbn: cover(kind, title, year, creator, isbn))
+
+
+COVER_LOOKUPS = _CoverLookups()
+
+
 def book_description(book_id):
     if not re.fullmatch(r'/works/OL\d+W', book_id):
         raise ValueError('Invalid book ID')
@@ -765,13 +774,28 @@ class Handler(SimpleHTTPRequestHandler):
         except (FeedUnavailable, HTTPError, URLError, TimeoutError, OSError):
             return self.send_json({'error': 'This public profile feed is unavailable. Check that the profile is public, try again later, or import its CSV export.'}, 502)
 
-    def cron_maintenance(self):
+    def cron_authorized(self):
         # Authenticated by the shared secret, not cookies, so it skips the Host
         # check: Vercel's scheduler may call a deployment URL, not the domain.
         secret = os.environ.get('CRON_SECRET', '')
         supplied = self.headers.get('Authorization', '') or ''
         if not secret or not hmac.compare_digest(supplied.encode(), ('Bearer ' + secret).encode()):
-            return self.send_json({'error': 'Unauthorized.'}, 401)
+            self.send_json({'error': 'Unauthorized.'}, 401)
+            return False
+        return True
+
+    def cron_covers(self):
+        if not self.cron_authorized():
+            return
+        try:
+            # The same cached, throttled lookups as /api/letterboxd-poster and /api/cover.
+            return self.send_json(cover_maintenance.run_cover_pass(get_database(), lookups=COVER_LOOKUPS, library=get_library()))
+        except database.Error:
+            return self.send_json({'error': 'The cover pass could not reach the database.'}, 503)
+
+    def cron_maintenance(self):
+        if not self.cron_authorized():
+            return
         try:
             store = photo_store.store_from_env(self.headers.get('x-vercel-oidc-token') or None)
             return self.send_json(maintenance.run(get_database(), service=score_service(), loader_for=score_loader, photo_store=store))
@@ -782,6 +806,8 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == '/api/cron/maintenance':
             return self.cron_maintenance()
+        if parsed.path == '/api/cron/covers':
+            return self.cron_covers()
         if not self.valid_host():
             return self.send_json({'error': 'Unknown host.'}, 403)
         if parsed.path == '/api/health':

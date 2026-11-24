@@ -212,7 +212,7 @@ class MigrationTest(unittest.TestCase):
 
     def test_migrate_applies_all_files_once(self):
         applied = database.migrate(self.database)
-        self.assertEqual(applied, ['001_catalog', '002_social', '003_library', '004_ratings', '005_runtime', '006_photos'])
+        self.assertEqual(applied, ['001_catalog', '002_social', '003_library', '004_ratings', '005_runtime', '006_photos', '007_cover_checks'])
         self.assertEqual(database.migrate(self.database), [])
         self.assertEqual(self.versions(), applied)
 
@@ -231,20 +231,20 @@ class MigrationTest(unittest.TestCase):
         for thread in threads:
             thread.join()
         self.assertEqual(errors, [])
-        self.assertEqual(sorted(len(r) for r in results), [0, 0, 6])
-        self.assertEqual(len(self.versions()), 6)
+        self.assertEqual(sorted(len(r) for r in results), [0, 0, 7])
+        self.assertEqual(len(self.versions()), 7)
 
     def test_cli_migrates_named_schema_twice_without_printing_the_url(self):
         script = [sys.executable, str(ROOT / 'scripts' / 'migrate_db.py'), '--schema', self.schema]
         env = {'TRACE_DATABASE_URL': TEST_DATABASE_URL, 'PATH': '/usr/bin:/bin'}
         first = subprocess.run(script, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertIn('006_photos', first.stdout)
+        self.assertIn('007_cover_checks', first.stdout)
         second = subprocess.run(script, env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertIn('up to date', second.stdout)
         self.assertNotIn('trace@', first.stdout + first.stderr + second.stdout + second.stderr)
-        self.assertEqual(len(self.versions()), 6)
+        self.assertEqual(len(self.versions()), 7)
 
     def test_cli_requires_a_database_url(self):
         script = [sys.executable, str(ROOT / 'scripts' / 'migrate_db.py')]

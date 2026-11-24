@@ -76,13 +76,19 @@ class VercelConfigTests(unittest.TestCase):
         self.assertNotIn('Content-Type', headers_for('/app.js'))
 
     def test_maintenance_cron_runs_daily(self):
-        self.assertEqual(len(CONFIG['crons']), 1)
-        cron = CONFIG['crons'][0]
-        self.assertEqual(cron['path'], '/api/cron/maintenance')
+        self.assertEqual(sorted(cron['path'] for cron in CONFIG['crons']), ['/api/cron/covers', '/api/cron/maintenance'])
+        cron = next(cron for cron in CONFIG['crons'] if cron['path'] == '/api/cron/maintenance')
         minute, hour, day, month, weekday = cron['schedule'].split()
         self.assertTrue(minute.isdigit() and hour.isdigit(), cron['schedule'])
         self.assertEqual((day, month, weekday), ('*', '*', '*'))
         self.assertNotIn('/api/cron/maintenance', server.PUBLIC_FILES)
+
+    def test_cover_cron_runs_hourly(self):
+        cron = next(cron for cron in CONFIG['crons'] if cron['path'] == '/api/cron/covers')
+        minute, hour, day, month, weekday = cron['schedule'].split()
+        self.assertTrue(minute.isdigit() and int(minute) < 60, cron['schedule'])
+        self.assertEqual((hour, day, month, weekday), ('*', '*', '*', '*'))
+        self.assertNotIn('/api/cron/covers', server.PUBLIC_FILES)
 
     def test_build_stages_only_the_allowlisted_shell(self):
         with tempfile.TemporaryDirectory() as folder:
