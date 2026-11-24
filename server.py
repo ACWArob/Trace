@@ -13,6 +13,7 @@ import time
 import threading
 import ssl
 import hmac
+import hashlib
 from http.cookies import SimpleCookie
 import base64
 import database
@@ -29,6 +30,7 @@ from library_store import LibraryStore
 from score_service import ScoreService
 from ratings import RatingsStore, omdb_scores, mdblist_scores, merge_scores, load_local_rating_key
 from profile_feeds import read_profile_feed, FeedUnavailable, letterboxd_film_url, fetch_letterboxd_poster
+from cover_sources import cover_params, find_cover, openlibrary_isbn_cover, COVER_READ_LIMIT
 from release_policy import production_mode, signup_mode, client_ip, RequestBudget, library_byte_limit
 
 ROOT = Path(__file__).resolve().parent
@@ -51,6 +53,7 @@ def create_tls_context():
 
 
 TLS_CONTEXT = create_tls_context()
+COVER_PROVIDERS = {'tv': 'TVmaze', 'anime': 'Kitsu', 'book': 'Open Library'}
 PROVIDERS = {'movie': 'Wikidata / Wikipedia', 'tv': 'TVmaze / Wikidata', 'anime': 'Kitsu',
              'book': 'Open Library', 'album': 'Apple / MusicBrainz'}
 
@@ -274,16 +277,25 @@ def media_scores(item, isbn=''):
             'genres': genres}
 
 
-def fetch(url, provider):
-    # Coalesce public-provider requests and respect a modest per-provider request rate.
+def wait_turn(provider):
+    # Respect a modest per-provider request rate.
     with LOCK:
         wait = max(0, LAST.get(provider, 0) + 1.1 - time.monotonic())
         if wait:
             time.sleep(wait)
         LAST[provider] = time.monotonic()
+
+
+def fetch(url, provider, limit=None):
+    wait_turn(provider)
     req = Request(url, headers={'User-Agent': 'Trace/0.1 (https://github.com/ACWArob/Trace)', 'Accept': 'application/vnd.api+json' if provider == 'kitsu' else 'application/json'})
     with urlopen(req, timeout=9, context=TLS_CONTEXT) as response:
-        return json.load(response)
+        if limit is None:
+            return json.load(response)
+        body = response.read(limit + 1)
+        if len(body) > limit:
+            raise ValueError('The provider response is too large.')
+        return json.loads(body)
 
 
 def cache_lifetime(key, result):
@@ -413,6 +425,32 @@ def letterboxd_poster(url):
             LAST['letterboxd'] = time.monotonic()
         saved = get_catalog().save('movie', cache_query, {'items': [], 'provider': 'Letterboxd',
                                                          'image': fetch_letterboxd_poster(url, TLS_CONTEXT)})
+    result = {'image': saved.get('image') if isinstance(saved.get('image'), str) else ''}
+    cache_put(key, result)
+    return result['image']
+
+
+def isbn_cover(isbn):
+    wait_turn('openlibrary-covers')
+    return openlibrary_isbn_cover(isbn, TLS_CONTEXT)
+
+
+def cover(kind, title, year='', creator='', isbn=''):
+    """The primary-source cover for validated parameters ('' when there is none), cached by request."""
+    kind, title, year, creator, isbn = cover_params(kind, title, year, creator, isbn)
+    digest = hashlib.sha256(json.dumps([1, kind, title.casefold(), year, creator.casefold(), isbn]).encode()).hexdigest()
+    key = ('cover', digest)
+    with CACHE_LOCK:
+        cached = CACHE.get(key)
+    if cached is not None and time.time() - cached[0] < cache_lifetime(key, cached[1]):
+        return cached[1]['image']
+    cache_query = 'trace-cover:' + digest
+    saved = get_catalog().cached(kind, cache_query)
+    if saved is None:
+        image = find_cover(kind, title, year, creator, isbn,
+                           lambda url, provider: fetch(url, provider, limit=COVER_READ_LIMIT),
+                           isbn_cover)
+        saved = get_catalog().save(kind, cache_query, {'items': [], 'provider': COVER_PROVIDERS[kind], 'image': image})
     result = {'image': saved.get('image') if isinstance(saved.get('image'), str) else ''}
     cache_put(key, result)
     return result['image']
@@ -762,7 +800,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if parsed.path == '/api/auth/config':
             return self.send_json({'signupMode': signup_mode(), 'recovery': 'codes'})
-        if parsed.path in ('/api/search', '/api/ratings', '/api/book-description', '/api/letterboxd-poster') and not self.hosted_catalog_access():
+        if parsed.path in ('/api/search', '/api/ratings', '/api/book-description', '/api/letterboxd-poster', '/api/cover') and not self.hosted_catalog_access():
             return
         if parsed.path == '/api/library':
             return self.library_get(parsed)
@@ -807,6 +845,23 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({'error': 'The catalog database is busy. Try again shortly.'}, 503)
             if not image:
                 return self.send_json({'error': 'No Letterboxd poster found.'}, 404)
+            return self.send_json({'image': image})
+        if parsed.path == '/api/cover':
+            params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+            try:
+                cover_params(params.get('type', ''), params.get('title', ''), params.get('year', ''),
+                             params.get('creator', ''), params.get('isbn', ''))
+            except ValueError:
+                return self.send_json({'error': 'Choose TV, anime, or a book and a title of up to 300 characters.'}, 400)
+            try:
+                image = cover(params.get('type', ''), params.get('title', ''), params.get('year', ''),
+                              params.get('creator', ''), params.get('isbn', ''))
+            except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+                return self.send_json({'error': 'The cover catalog is unavailable right now.'}, 502)
+            except database.Error:
+                return self.send_json({'error': 'The catalog database is busy. Try again shortly.'}, 503)
+            if not image:
+                return self.send_json({'error': 'No cover found.'}, 404)
             return self.send_json({'image': image})
         if parsed.path == '/api/search':
             params = parse_qs(parsed.query)

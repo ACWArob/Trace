@@ -175,7 +175,7 @@ async function collapseDuplicates(){
  if(!await persist({...collection,entries:next})||epoch!==sessionEpoch)return;
  if(!activeSession.user)redrawLibrary();notify(`Merged ${merged} ${merged===1?'duplicate':'duplicates'}.`);
 }
-// Imported entries without artwork get public covers in the background; only image and a missing imdbId change.
+// Entries without artwork, or with an auto-picked Wikimedia image, get covers from each type's primary source in the background; only image and a missing imdbId change.
 let coverRunning=false,coverAgain=false,coverTimer=0,coverProgress='';const coverAttemptsByAccount=new Map(),coverPaused=new Set();
 const coverAccount=()=>activeSession.user?.id||'guest';
 function coverAttempts(account){
@@ -188,6 +188,14 @@ async function coverSearch(entry){
  const response=await apiFetch(`/api/search?type=${encodeURIComponent(entry.type)}&q=${encodeURIComponent(query)}`);
  let items=[];if(response.ok){try{const data=await response.json();items=Array.isArray(data.items)?data.items:[];}catch{}}
  return {status:response.status,items,retryAfter:Number(response.headers?.get?.('Retry-After'))||0};
+}
+async function coverLookup(entry){
+ const params=new URLSearchParams({type:entry.type,title:entry.title.trim().slice(0,300)});
+ const year=String(entry.year||'').slice(0,4);if(/^[12]\d{3}$/.test(year))params.set('year',year);
+ if(entry.type==='book'){const creator=String(entry.creator||'').trim().slice(0,300),isbn=normalizeISBN(entry.isbn);if(creator)params.set('creator',creator);if(isbn)params.set('isbn',isbn);}
+ const response=await apiFetch(`/api/cover?${params}`);
+ let image='';if(response.ok){try{const data=await response.json();image=typeof data.image==='string'?data.image:'';}catch{}}
+ return {status:response.status,image,retryAfter:Number(response.headers?.get?.('Retry-After'))||0};
 }
 async function letterboxdPoster(entry){
  const response=await apiFetch(`/api/letterboxd-poster?url=${encodeURIComponent(letterboxdFilmUrl(entry.sourceUrl))}`);
@@ -203,7 +211,7 @@ async function startCoverBackfill(){
  const attempts=coverAttempts(account),cancelled=()=>epoch!==sessionEpoch||coverAccount()!==account;
  coverRunning=true;coverAgain=false;let shownAt=0;
  try{
-  const result=await runCoverBackfill({entries:collection.entries,attempts,search:coverSearch,poster:letterboxdPoster,isCancelled:cancelled,
+  const result=await runCoverBackfill({entries:collection.entries,attempts,search:coverSearch,poster:letterboxdPoster,cover:coverLookup,isCancelled:cancelled,
    save:async matches=>{
     if(cancelled()||!libraryReady)return false;
     const ok=await persist({...collection,entries:applyCovers(collection.entries,matches)});saveCoverAttempts(account,attempts);
@@ -229,7 +237,8 @@ function validateEntries(rows){
   if(row.type==='book'&&row.isbn)out.isbn=normalizeISBN(row.isbn);
   out.publicScores=normalizePublicScores(row.publicScores);out.genres=normalizeGenres(row.genres||DEMO.find(x=>sameItem(x,row))?.genres);out.image=storedImage(row.image);out.sourceUrl=safeUrl(row.sourceUrl||'');out.metadataSourceUrl=safeUrl(row.metadataSourceUrl||'');out.metadataSource=String(row.metadataSource||'').slice(0,100);out.attachments=attachmentsWithPhotos(original.attachments);
   if(['restaurant','place'].includes(row.legacyType)){out.legacyType=row.legacyType;out.legacyRating=Number(row.legacyRating)||0;}
-  return {...row,...out};
+  const {coverChosen,...rest}=row;
+  return {...rest,...out,...(coverChosen===true?{coverChosen:true}:{})};
  });
 }
 function stars(r){return r?`${'★'.repeat(Math.floor(r))}${r%1?'½':''}`:'';}
@@ -667,6 +676,7 @@ async function saveEntry(form,edit){const submit=form.querySelector('[type="subm
  const uploaded=photo?.size?await photoData(photo):'';
  if(!form.isConnected||!form.closest('dialog')?.open||owner!==activeSession.user?.id)return;
  const item={...original,id:edit?editingId:uid(),title:String(data.get('title')).trim(),creator:String(data.get(memory?'memoryContext':'creator')||'').trim(),type,year:memory?'':data.get('year'),status:memory?'done':data.get('status'),date:dateOnly(data.get('date')),rating:memory?0:Number(data.get('rating')),genres:normalizeGenres(String(data.get('genres')||'')),notes:String(data.get('notes')).trim(),favorite:data.get('favorite')==='on',image:uploaded||safeUrl(String(data.get('image')||''))||original?.image||'',attachments:memory?attachmentsWithPhotos(form.traceLinks):[],addedAt:original?.addedAt||new Date().toISOString()};
+ if(item.image&&item.image!==original?.image)item.coverChosen=true;
  if(!item.title)throw Error('Give this memory a title.');if(item.date>today())throw Error('Choose today or an earlier date.');item.history=[...new Set([...(original?.history||[]),...(item.status==='done'&&item.date?[item.date]:[])])];const current=collection.started?collection.entries:[];
  const result=edit?current.map(x=>x.id===editingId?item:x):memory?[...current,item]:mergeEntries(current,[item]).entries;
  if(!await persist({started:true,entries:result}))return;await closeModal(edit?'#detail-dialog':'#log-dialog');render();notify(edit?'Changes saved.':memory?'Memory saved.':'Added to your shelf.');
@@ -709,7 +719,7 @@ detailDialog.addEventListener('click',ev=>{
 });
 let metadataMatches=[];
 async function findMetadata(id,button){const item=entries().find(x=>x.id===id);if(!item)return;button.disabled=true;const host=$('#metadata-results');host.innerHTML='<p class="source-hint">Searching the catalog…</p>';try{const response=await apiFetch('/api/search?type='+encodeURIComponent(item.type)+'&q='+encodeURIComponent(item.title));const data=await response.json();if(!response.ok)throw Error(data.error||'Catalog unavailable.');if(editingId!==id||!host.isConnected)return;metadataMatches=data.items;host.innerHTML=metadataMatches.length?`<p class="source-hint">Choose the matching release. Your rating and notes are kept.</p>${metadataMatches.slice(0,8).map((x,i)=>`<button class="metadata-match" data-use-metadata="${i}" data-entry="${e(id)}">${x.image?`<img src="${e(imageUrl(x.image))}" alt="">`:''}<span><strong dir="auto">${e(x.title)}</strong><small>${e(x.year)} · ${e(x.creator||x.source)}</small><small>${e((x.genres||[]).join(' · '))}</small></span><b>Use cover & genres +</b></button>`).join('')}`:'<p class="source-hint">No matches. You can add genres in Edit entry.</p>';}catch(err){if(host.isConnected)host.innerHTML=`<p class="error-message" role="alert">${e(err.message)}</p>`;}finally{button.disabled=false;}}
-async function useMetadata(id,index){const candidate=metadataMatches[index],item=collection.entries.find(x=>x.id===id);if(!candidate||!item)return;const updated={...item,genres:normalizeGenres([...(item.genres||[]),...(candidate.genres||[])]),metadataSource:candidate.source,metadataSourceUrl:safeUrl(candidate.sourceUrl)};updated.publicScores=normalizePublicScores([...normalizePublicScores(candidate.publicScores),...normalizePublicScores(item.publicScores)]);if(candidate.image)updated.image=imageUrl(candidate.image);for(const key of ['description','creator','year','imdbId'])if(!updated[key]&&candidate[key])updated[key]=candidate[key];if(!await persist({...collection,entries:collection.entries.map(x=>x.id===id?updated:x)}))return;render();openDetail(id);notify('Cover and genres updated.');}
+async function useMetadata(id,index){const candidate=metadataMatches[index],item=collection.entries.find(x=>x.id===id);if(!candidate||!item)return;const updated={...item,genres:normalizeGenres([...(item.genres||[]),...(candidate.genres||[])]),metadataSource:candidate.source,metadataSourceUrl:safeUrl(candidate.sourceUrl)};updated.publicScores=normalizePublicScores([...normalizePublicScores(candidate.publicScores),...normalizePublicScores(item.publicScores)]);if(candidate.image){updated.image=imageUrl(candidate.image);updated.coverChosen=true;}for(const key of ['description','creator','year','imdbId'])if(!updated[key]&&candidate[key])updated[key]=candidate[key];if(!await persist({...collection,entries:collection.entries.map(x=>x.id===id?updated:x)}))return;render();openDetail(id);notify('Cover and genres updated.');}
 detailDialog.addEventListener('click',ev=>{const find=ev.target.closest('[data-find-metadata]');if(find)findMetadata(find.dataset.findMetadata,find);const use=ev.target.closest('[data-use-metadata]');if(use)useMetadata(use.dataset.entry,Number(use.dataset.useMetadata));});
 async function saveToList(id,list){const source=entries().find(x=>x.id===id);if(!source)return;const existing=collection.entries.find(x=>sameItem(x,source));const item=existing?{...existing}:{...source,id:uid(),notes:'',rating:0,date:'',status:'want',history:[],attachments:[],favorite:false,forLater:false,addedAt:new Date().toISOString()};if(list==='later')item.forLater=true;else item.favorite=true;
  const next=existing?collection.entries.map(x=>x.id===item.id?item:x):[...collection.entries,item];if(!await persist({started:true,entries:next}))return;state.previewId=null;render();openDetail(item.id);notify(list==='later'?'Saved to For later. Find it in the shelf filter.':'Added to Favorites.');}

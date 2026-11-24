@@ -117,7 +117,7 @@ def _entry(value, entry_id):
         _string(value['metadataSource'], 100)
     if 'status' in value and (not isinstance(value['status'], str) or value['status'] not in ('done', 'want', 'progress')):
         _invalid()
-    for key in ('favorite', 'forLater'):
+    for key in ('favorite', 'forLater', 'coverChosen'):
         if key in value and type(value[key]) is not bool:
             _invalid()
     for key in ('rating', 'legacyRating'):

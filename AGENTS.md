@@ -107,3 +107,4 @@ Prefer the affected test file over the whole suite.
 - 2026-11-24 — Open Library returns original publication years while imports carry edition years, and multiple matches appended duplicates — match books on title plus author surname regardless of year, and merge into the best existing copy instead of appending.
 - 2026-11-24 — a deploy changed shell files without bumping the service worker cache, so installed apps kept old code — the Vercel build stamps CACHE_NAME with a hash of the staged shell.
 - 2026-11-24 — about 10% of Letterboxd titles had no confident catalog cover — fall back to the film page poster through its saved boxd.it link, with strict host checks and a cached, bounded fetch.
+- 2026-11-24 — Wikipedia thumbnails were often stills rather than posters — take covers from each type's dedicated source first (Letterboxd, TVmaze, Kitsu, Open Library), upgrade only auto-picked Wikimedia images, and never replace a photo or a coverChosen cover.

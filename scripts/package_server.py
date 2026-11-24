@@ -13,7 +13,7 @@ import tarfile
 BACKEND_FILES = (
     'production.py', 'server.py', 'release_policy.py', 'catalog_store.py',
     'social.py', 'library_store.py', 'ratings.py', 'score_service.py',
-    'profile_feeds.py', 'book_catalog.py', 'music_catalog.py',
+    'profile_feeds.py', 'cover_sources.py', 'book_catalog.py', 'music_catalog.py',
     'movie_catalog.py', 'screen_catalog.py', 'catalog_seed.py',
     'requirements-runtime.txt',
 )

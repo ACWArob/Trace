@@ -73,7 +73,7 @@ class LibraryStoreTests(PostgresTestCase):
     def test_all_private_fields_are_preserved_without_normalization(self):
         photo = 'data:image/png;base64,aGVsbG8='
         private = entry(type='memory', title=' An unchanged memory ', creator='At home', year='',
-                        status='done', favorite=True, forLater=False, rating=0, date='',
+                        status='done', favorite=True, forLater=False, coverChosen=True, rating=0, date='',
                         history=['2024-02-29', '2025-03-05'], notes='A private note\nwith details 💛',
                         description='Private description', source='Manual entry', externalId='old-id',
                         addedAt='2025-03-05T12:13:14.000Z', imdbId='', publicScores=[{
@@ -124,7 +124,7 @@ class LibraryStoreTests(PostgresTestCase):
         for value in (None, {}, [None], [change()] * 2, [change(str(i)) for i in range(101)]):
             self.assert_bad(lambda: self.store.sync('alice', value))
         for patch_value in ({'id': 'different'}, {'title': ''}, {'type': []}, {'rating': True},
-                            {'rating': float('nan')}, {'rating': 6}, {'favorite': 'yes'}, {'notes': 1},
+                            {'rating': float('nan')}, {'rating': 6}, {'favorite': 'yes'}, {'coverChosen': 'yes'}, {'notes': 1},
                             {'history': ['2025-02-30']}, {'date': None}, {'genres': ['x'] * 9},
                             {'attachments': [{'title': 'Bad', 'type': 'memory'}]},
                             {'publicScores': [{'source': 'IMDb', 'value': 11, 'max': 10}]},

@@ -1,9 +1,13 @@
 import {coverMatch,coverImageUrl} from './core.mjs';
 
-// Background cover backfill for imported entries. Network, clock and saving are injected
-// so the queue can be tested; it only ever adds `image` and a missing `imdbId`.
+// Background cover backfill. Network, clock and saving are injected so the queue can be tested.
+// Each type asks its dedicated source first (Letterboxd for linked films, TVmaze for TV, Kitsu for
+// anime, Open Library for books) and falls back to the catalog. It only ever sets `image` and a
+// missing `imdbId`, and replaces an existing image only when it was auto-picked from Wikimedia.
 export const COVER_RETRY_MS=7*24*60*60*1000;
 const SCREEN_TYPES=['movie','tv','anime'];
+const PRIMARY_HOSTS={tv:['static.tvmaze.com'],anime:['media.kitsu.io','media.kitsu.app'],book:['covers.openlibrary.org']};
+const WIKIMEDIA_HOSTS=new Set(['upload.wikimedia.org','commons.wikimedia.org','thumb.wikimedia.org']);
 
 // Letterboxd film links accepted by /api/letterboxd-poster (mirrors profile_feeds.letterboxd_film_url).
 export function letterboxdFilmUrl(value){
@@ -25,8 +29,25 @@ export function letterboxdPosterUrl(value){
 
 const wantsLetterboxdPoster=row=>SCREEN_TYPES.includes(row?.type)&&!!letterboxdFilmUrl(row.sourceUrl);
 
+// Wikimedia images come from automatic catalog picks (often stills, not posters).
+export function autoWikimediaImage(value){
+ if(typeof value!=='string')return false;
+ try{const url=new URL(value);return url.protocol==='https:'&&WIKIMEDIA_HOSTS.has(url.hostname);}catch{return false;}
+}
+
+// An image from the type's dedicated cover host, or ''.
+export function primaryCoverUrl(type,value){
+ const image=coverImageUrl(value);
+ if(!image||!PRIMARY_HOSTS[type])return '';
+ return PRIMARY_HOSTS[type].includes(new URL(image).hostname)?image:'';
+}
+
+const hasPrimarySource=row=>wantsLetterboxdPoster(row)||Object.hasOwn(PRIMARY_HOSTS,row.type);
+// User photos, explicit cover choices, and non-Wikimedia images are never replaced.
+const upgradeable=row=>!!row.image&&row.coverChosen!==true&&autoWikimediaImage(row.image)&&hasPrimarySource(row);
+
 export function coverCandidates(entries,attempts={},now=Date.now()){
- return (Array.isArray(entries)?entries:[]).filter(row=>row&&row.type!=='memory'&&!row.image&&typeof row.id==='string'&&typeof row.title==='string'&&row.title.trim()
+ return (Array.isArray(entries)?entries:[]).filter(row=>row&&row.type!=='memory'&&(!row.image||upgradeable(row))&&typeof row.id==='string'&&typeof row.title==='string'&&row.title.trim()
   &&!(Number.isFinite(attempts[row.id])&&now-attempts[row.id]<COVER_RETRY_MS));
 }
 
@@ -41,14 +62,15 @@ export function applyCovers(entries,matches){
  return entries.map(row=>{
   const match=byId.get(row?.id);
   const image=coverImageUrl(match?.image)||(wantsLetterboxdPoster(row)?letterboxdPosterUrl(match?.image):'');
-  if(!match||!image||row.type==='memory'||row.image)return row;
+  if(!match||!image||row.type==='memory')return row;
+  if(row.image&&!(upgradeable(row)&&!autoWikimediaImage(image)))return row;
   const next={...row,image};
   if(SCREEN_TYPES.includes(row.type)&&!row.imdbId&&/^tt\d{5,12}$/.test(match.imdbId||''))next.imdbId=match.imdbId;
   return next;
  });
 }
 
-export async function runCoverBackfill({entries,attempts={},search,poster=null,save,now=()=>Date.now(),sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),
+export async function runCoverBackfill({entries,attempts={},search,poster=null,cover=null,save,now=()=>Date.now(),sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms)),
  onProgress=()=>{},isCancelled=()=>false,batchSize=25,intervalMs=1000,backoffMs=2000,maxBackoffMs=5*60*1000,maxRetries=5}){
  const queue=coverCandidates(entries,attempts,now());
  const total=queue.length;let processed=0,matched=0,pending=[],lastStart=-Infinity;
@@ -82,14 +104,26 @@ export async function runCoverBackfill({entries,attempts={},search,poster=null,s
   }
  };
  for(const entry of queue){
-  const found=await request(search,entry);
-  if(found.stop)return finish(found.stop);
-  let match=found.status>=200&&found.status<300?coverMatch(entry,found.response.items):null;
-  if(!match&&poster&&wantsLetterboxdPoster(entry)){
-   const fallback=await request(poster,entry);
-   if(fallback.stop)return finish(fallback.stop);
-   const image=fallback.status>=200&&fallback.status<300?letterboxdPosterUrl(fallback.response.image):'';
+  const ok=reply=>reply.status>=200&&reply.status<300;
+  let match=null;
+  if(poster&&wantsLetterboxdPoster(entry)){
+   const found=await request(poster,entry);
+   if(found.stop)return finish(found.stop);
+   const image=ok(found)?letterboxdPosterUrl(found.response.image):'';
    if(image)match={image};
+  }
+  if(!match&&cover&&PRIMARY_HOSTS[entry.type]){
+   const found=await request(cover,entry);
+   if(found.stop)return finish(found.stop);
+   const image=ok(found)?primaryCoverUrl(entry.type,found.response.image):'';
+   if(image)match={image};
+  }
+  if(!match){
+   const found=await request(search,entry);
+   if(found.stop)return finish(found.stop);
+   const fallback=ok(found)?coverMatch(entry,found.response.items):null;
+   // Upgrades exist to leave Wikimedia behind, so another Wikimedia image is no match.
+   if(fallback&&!(entry.image&&autoWikimediaImage(fallback.image)))match=fallback;
   }
   attempts[entry.id]=now();
   if(match){matched++;pending.push({id:entry.id,...match});}
