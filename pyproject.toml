@@ -1,0 +1,5 @@
+[project]
+name = "trace"
+version = "0.0.0"
+description = "Local-first shelf and diary for films, TV, books, albums, and memories."
+requires-python = ">=3.11"
