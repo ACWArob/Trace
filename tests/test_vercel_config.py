@@ -93,6 +93,15 @@ class VercelConfigTests(unittest.TestCase):
         self.assertLessEqual(set(sw_shell_files()), staged)
         self.assertFalse({path for path in staged if path.endswith(('.py', '.md', '.sql', '.sqlite3'))})
 
+    def test_build_stamps_the_offline_cache_with_the_shell_contents(self):
+        with tempfile.TemporaryDirectory() as folder:
+            target = Path(folder) / 'public'
+            stage(target)
+            first = (target / 'sw.js').read_text(encoding='utf-8')
+            self.assertRegex(first, r'const CACHE_NAME = `\$\{CACHE_PREFIX\}v\d+-[0-9a-f]{12}`;')
+            stage(target)
+            self.assertEqual((target / 'sw.js').read_text(encoding='utf-8'), first)  # Stable for the same shell.
+
     def test_build_replaces_a_stale_output_directory(self):
         with tempfile.TemporaryDirectory() as folder:
             target = Path(folder) / 'public'

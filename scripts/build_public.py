@@ -9,6 +9,7 @@ repository root is published.  The output directory is recreated each run.
 """
 import argparse
 import ast
+import hashlib
 from pathlib import Path
 import re
 import shutil
@@ -47,7 +48,23 @@ def build(out):
         target = out / path
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, target)
+    stamp_service_worker(out)
     return out
+
+
+def stamp_service_worker(out):
+    """Tie the offline cache name to the staged shell, so every deploy that
+    changes a public file makes installed apps pick up the new code."""
+    digest = hashlib.sha256()
+    for path in sorted(p for p in out.rglob('*') if p.is_file() and p.name != 'sw.js'):
+        digest.update(path.relative_to(out).as_posix().encode() + b'\0' + path.read_bytes())
+    worker = out / 'sw.js'
+    source = worker.read_text(encoding='utf-8')
+    stamped, count = re.subn(r'(const CACHE_NAME = `\$\{CACHE_PREFIX\}v\d+)`;',
+                             lambda m: f'{m.group(1)}-{digest.hexdigest()[:12]}`;', source, count=1)
+    if count != 1:
+        raise SystemExit('sw.js has no CACHE_NAME line to stamp.')
+    worker.write_text(stamped, encoding='utf-8')
 
 
 if __name__ == '__main__':
