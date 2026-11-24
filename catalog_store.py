@@ -1,16 +1,28 @@
 """Persistent, attributed catalog results; private collection data never enters this store."""
-from pathlib import Path
-from contextlib import contextmanager
 import json
-import os
-import sqlite3
+import re
 import time
 import unicodedata
 from book_catalog import normalize_isbn, book_genres
+from database import Database, lock
 from music_catalog import ALBUM_GENRES, clean_album_genres
 
 KINDS = {'movie', 'tv', 'anime', 'book', 'album'}
-VISIBLE_CATALOG = "coalesce(json_extract(catalog.payload,'$.catalogExcludedReason'),'')=''"
+VISIBLE_CATALOG = "coalesce(catalog.payload->>'catalogExcludedReason','')=''"
+# Postgres text and jsonb reject NUL, and jsonb rejects lone surrogate escapes.
+_UNSAFE_TEXT = re.compile('[\x00\ud800-\udfff]')
+
+
+def strip_unsafe_text(value):
+    """Return a copy of a JSON-like value without characters Postgres cannot store."""
+    if isinstance(value, str):
+        return _UNSAFE_TEXT.sub('', value)
+    if isinstance(value, list):
+        return [strip_unsafe_text(entry) for entry in value]
+    if isinstance(value, dict):
+        return {strip_unsafe_text(key) if isinstance(key, str) else key: strip_unsafe_text(entry)
+                for key, entry in value.items()}
+    return value
 
 
 def catalog_genres(kind, values, *, facets=False):
@@ -51,40 +63,30 @@ def query_cache_ttl(result):
     return 60 if result.get('warnings') or unavailable else 86400
 
 
-def database_path() -> Path:
-    directory = Path(os.environ.get('TRACE_DATA_DIR', Path(__file__).resolve().parent / '.trace'))
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / 'trace.sqlite3'
+def rank_sql(search):
+    """SQL twin of catalog_search_rank over the stored title_norm/creator_norm columns.
+
+    Returns (expression, params); the expression is NULL when a row does not match.
+    catalog_search_rank remains the oracle that tests compare this against.
+    """
+    words = search.split()
+    combined = "(title_norm || ' ' || creator_norm)"
+    every_word = ' AND '.join(f'position(? in {combined}) > 0' for _ in words)
+    expression = ("CASE WHEN title_norm = ? THEN 0"
+                  " WHEN ? IN (title_norm || ' ' || creator_norm, creator_norm || ' ' || title_norm) THEN 1"
+                  " WHEN creator_norm = ? THEN 2"
+                  f" WHEN {every_word} THEN (CASE WHEN starts_with(title_norm, ?) THEN 3 ELSE 4 END) END")
+    return expression, [search, search, search, *words, search]
 
 
 class CatalogStore:
-    def __init__(self, path=None):
-        self.path = Path(path) if path else database_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.connect() as db:
-            db.executescript('''
-                CREATE TABLE IF NOT EXISTS catalog (
-                    item_key TEXT PRIMARY KEY, kind TEXT NOT NULL, title TEXT NOT NULL,
-                    creator TEXT NOT NULL, genres TEXT NOT NULL, payload TEXT NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS catalog_kind_title ON catalog(kind,title COLLATE NOCASE);
-                CREATE TABLE IF NOT EXISTS catalog_queries (
-                    kind TEXT NOT NULL, query TEXT NOT NULL, payload TEXT NOT NULL,
-                    updated_at REAL NOT NULL, PRIMARY KEY(kind,query)
-                );
-            ''')
+    """Public catalog on Postgres; the schema comes from migrations/001_catalog.sql."""
 
-    @contextmanager
+    def __init__(self, database=None):
+        self.database = database if database is not None else Database.from_env()
+
     def connect(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        db.execute('PRAGMA journal_mode=WAL')
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+        return self.database.connect()
 
     def cached(self, kind, query, stale=False):
         with self.connect() as db:
@@ -106,6 +108,7 @@ class CatalogStore:
         if kind not in KINDS:
             raise ValueError('Unknown catalog')
         now = time.time()
+        result, query = strip_unsafe_text(result), strip_unsafe_text(query)
         # Only provider results, never a user's rating, diary date, notes, or attachments.
         fields = ('type', 'title', 'creator', 'year', 'image', 'genres', 'description', 'source', 'sourceUrl', 'externalId', 'imdbId', 'isbn', 'publicScores')
         items = [{key: row.get(key, [] if key in ('genres', 'publicScores') else '') for key in fields}
@@ -121,7 +124,7 @@ class CatalogStore:
         payload = {**result, 'items': items}
         retained_fields = ('image', 'description', 'creator', 'year', 'imdbId', 'isbn', 'genres', 'publicScores', 'catalogSources')
         with self.connect() as db:
-            db.execute('BEGIN IMMEDIATE')
+            lock(db, 'catalog-write')
             for item in items:
                 if item['type'] not in KINDS or not item['externalId'] or not item['title']:
                     continue
@@ -161,10 +164,14 @@ class CatalogStore:
                         if (isinstance(source, dict) and all(isinstance(source.get(name), str) for name in source_fields)
                                 and source not in item['catalogSources'] and len(item['catalogSources']) < 8):
                             item['catalogSources'].append({name: source[name] for name in source_fields})
-                db.execute('''INSERT INTO catalog VALUES(?,?,?,?,?,?,?)
+                stored_genres = item['genres'] if isinstance(item['genres'], list) else []
+                db.execute('''INSERT INTO catalog(item_key,kind,title,creator,genres,payload,updated_at,title_norm,creator_norm)
+                    VALUES(?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(item_key) DO UPDATE SET title=excluded.title,creator=excluded.creator,
-                    genres=excluded.genres,payload=excluded.payload,updated_at=excluded.updated_at''',
-                           (key, item['type'], item['title'], item['creator'], json.dumps(item['genres']), json.dumps(item), now))
+                    genres=excluded.genres,payload=excluded.payload,updated_at=excluded.updated_at,
+                    title_norm=excluded.title_norm,creator_norm=excluded.creator_norm''',
+                           (key, item['type'], item['title'], item['creator'], json.dumps(stored_genres), json.dumps(item), now,
+                            catalog_search_text(item['title']), catalog_search_text(item['creator'] or '')))
             if query is not None:
                 db.execute('''INSERT INTO catalog_queries VALUES(?,?,?,?) ON CONFLICT(kind,query)
                     DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at''',
@@ -179,34 +186,33 @@ class CatalogStore:
             clauses.append('kind=?'); args.append(kind)
         isbn = normalize_isbn(query) if kind in ('book', 'all') else ''
         search = '' if isbn else catalog_search_text(query)
-        order = 'title COLLATE NOCASE,item_key'
+        order = 'lower(title),item_key'
         order_args = []
         if isbn:
-            clauses.append("json_extract(payload,'$.isbn')=?")
+            clauses.append("payload->>'isbn'=?")
             args.append(isbn)
         elif search:
-            clauses.append('catalog_rank(title,creator,?) IS NOT NULL')
-            args.append(search)
-            order = 'catalog_rank(title,creator,?),'+order
-            order_args.append(search)
+            rank, rank_args = rank_sql(search)
+            clauses.append(f'({rank}) IS NOT NULL')
+            args.extend(rank_args)
+            order = f'({rank}),' + order
+            order_args.extend(rank_args)
         elif query:
             # Preserve literal searches for titles containing only punctuation.
             term = '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
-            clauses.append("(title LIKE ? ESCAPE '\\' OR creator LIKE ? ESCAPE '\\')"); args.extend([term, term])
+            clauses.append("(title ILIKE ? ESCAPE '\\' OR creator ILIKE ? ESCAPE '\\')"); args.extend([term, term])
         # Keep alternatives visible while a genre is selected, within this catalog/search.
         facet_where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
         facet_args = list(args)
         if genre:
-            clauses.append('EXISTS (SELECT 1 FROM json_each(catalog.genres) WHERE lower(value)=lower(?))'); args.append(genre)
+            clauses.append('EXISTS (SELECT 1 FROM jsonb_array_elements_text(catalog.genres) AS g(value) WHERE lower(g.value)=lower(?))'); args.append(genre)
         where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
         page = max(0, min(10000, int(page)))
         with self.connect() as db:
-            if search:
-                db.create_function('catalog_rank', 3, catalog_search_rank, deterministic=True)
             count = db.execute('SELECT count(*) FROM catalog' + where, args).fetchone()[0]
             rows = db.execute('SELECT payload FROM catalog' + where + ' ORDER BY ' + order + ' LIMIT 40 OFFSET ?',
                               args + order_args + [page * 40]).fetchall()
-            genres = [r[0] for r in db.execute('SELECT DISTINCT value FROM catalog,json_each(catalog.genres)' + facet_where + ' ORDER BY value COLLATE NOCASE LIMIT 200', facet_args)]
+            genres = [r[0] for r in db.execute('SELECT value FROM (SELECT DISTINCT g.value AS value FROM catalog, jsonb_array_elements_text(catalog.genres) AS g(value)' + facet_where + ') AS facets ORDER BY lower(value),value LIMIT 200', facet_args)]
             totals = {r[0]: r[1] for r in db.execute('SELECT kind,count(*) FROM catalog WHERE ' + VISIBLE_CATALOG + ' GROUP BY kind')}
         items = [json.loads(row[0]) for row in rows]
         for item in items:
@@ -227,7 +233,7 @@ class CatalogStore:
 
     def matching(self, kind, title, year='', creator=''):
         with self.connect() as db:
-            rows = db.execute('SELECT payload FROM catalog WHERE kind=? AND title=? COLLATE NOCASE AND ' + VISIBLE_CATALOG + ' LIMIT 50', (kind, title)).fetchall()
+            rows = db.execute('SELECT payload FROM catalog WHERE kind=? AND lower(title)=lower(?) AND ' + VISIBLE_CATALOG + ' LIMIT 50', (kind, title)).fetchall()
         matches = [json.loads(row[0]) for row in rows]
         if creator and kind in ('book', 'album'):
             matches = [row for row in matches if catalog_search_text(row.get('creator') or '') == catalog_search_text(creator)]

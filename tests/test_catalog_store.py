@@ -1,21 +1,22 @@
 from pathlib import Path
 from copy import deepcopy
-import tempfile
+import json
 import unittest
 from unittest.mock import patch
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from catalog_store import CatalogStore
+from catalog_store import CatalogStore, catalog_search_rank, catalog_search_text
+from tests.pg_support import PostgresTestCase
 
-class CatalogTests(unittest.TestCase):
+class CatalogTests(PostgresTestCase):
     def setUp(self):
-        self.directory=tempfile.TemporaryDirectory();self.addCleanup(self.directory.cleanup)
-        self.path=Path(self.directory.name)/'test.sqlite3';self.store=CatalogStore(self.path)
+        super().setUp()
+        self.store=CatalogStore(self.database)
         self.item={'type':'movie','title':'Arrival','creator':'Denis Villeneuve','year':'2016','genres':['Drama','Science Fiction'],'source':'Wikidata','externalId':'Q1','notes':'PRIVATE','rating':5,'date':'2026-11-03','publicScores':[]}
 
     def test_cache_is_persistent_attributed_and_excludes_personal_fields(self):
         self.store.save('movie','Arrival',{'items':[self.item],'provider':'Wikidata'})
-        saved=CatalogStore(self.path).cached('movie','ARRIVAL')['items'][0]
+        saved=CatalogStore(self.database).cached('movie','ARRIVAL')['items'][0]
         for field in ['notes','rating','date']:self.assertNotIn(field,saved)
         self.assertEqual(saved['source'],'Wikidata')
         self.assertEqual(self.store.browse('movie',genre='Science Fiction')['total'],1)
@@ -115,7 +116,6 @@ class CatalogTests(unittest.TestCase):
         item={**self.item,'image':'https://example.org/verified.jpg'}
         self.store.save('movie','first',{'items':[item]})
         with self.store.connect() as db:
-            import json
             row=json.loads(db.execute('SELECT payload FROM catalog').fetchone()[0])
             row['verifiedImage']=row['image']
             row['unavailableImages']=['https://example.org/missing.jpg']
@@ -143,5 +143,97 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual(second['genres'],['Drama','Science Fiction'])
         self.assertEqual(second['counts'],{'movie':42,'album':1})
         self.assertTrue({row['externalId'] for row in first['items']}.isdisjoint(row['externalId'] for row in second['items']))
+
+    def test_nul_characters_and_lone_surrogates_are_stripped_before_saving(self):
+        item={**self.item,'title':'Ar\x00rival','creator':'De\x00nis','description':'A\x00 note \ud800','genres':['Dra\x00ma'],
+              'publicScores':[{'source':'IMDb\x00','value':7,'max':10}]}
+        saved=self.store.save('movie','nul\x00query',{'items':[item]})['items'][0]
+        self.assertEqual((saved['title'],saved['creator'],saved['genres']),('Arrival','Denis',['Drama']))
+        self.assertEqual(self.store.browse('movie',query='Arrival')['items'][0]['description'],'A note ')
+        self.assertEqual(self.store.cached('movie','nulquery')['items'][0]['title'],'Arrival')
+        self.assertEqual(item['title'],'Ar\x00rival')
+
+    def test_scalar_genres_are_stored_as_an_empty_list(self):
+        self.store.save('movie','scalar',{'items':[{**self.item,'genres':'Drama'}]})
+        self.assertEqual(self.store.browse('movie')['genres'],[])
+
+    def test_literal_punctuation_search_is_case_insensitive_and_escaped(self):
+        self.store.save('movie','punct',{'items':[{**self.item,'title':'!!!','externalId':'P1'},
+                                                  {**self.item,'title':'100%','externalId':'P2'},
+                                                  {**self.item,'title':'1000','externalId':'P3'}]})
+        self.assertEqual([r['title'] for r in self.store.browse('movie',query='!!')['items']],['!!!'])
+        self.assertEqual([r['title'] for r in self.store.browse('movie',query='%')['items']],['100%'])
+
+    def test_title_matching_is_case_insensitive(self):
+        self.store.save('movie','x',{'items':[self.item]})
+        self.assertEqual(self.store.matching('movie','ARRIVAL','2016')['externalId'],'Q1')
+
+    def test_excluded_rows_are_hidden_from_every_read(self):
+        self.store.save('movie','visible',{'items':[self.item,{**self.item,'title':'Hidden','externalId':'Q2'}]})
+        with self.store.connect() as db:
+            db.execute("UPDATE catalog SET payload=jsonb_set(payload,'{catalogExcludedReason}','\"reason\"') WHERE item_key LIKE '%:Q2'")
+        self.assertEqual(self.store.browse('all')['total'],1)
+        self.assertEqual(self.store.browse('all')['counts'],{'movie':1})
+        self.assertIsNone(self.store.identified('movie','Wikidata','Q2'))
+        self.assertIsNotNone(self.store.identified('movie','Wikidata','Q1'))
+        self.assertIsNone(self.store.matching('movie','Hidden','2016'))
+
+    def test_isbn_query_matches_the_stored_isbn_exactly(self):
+        book={**self.item,'type':'book','title':'The Hobbit','externalId':'OL1W','isbn':'9780261102217','genres':['Fantasy']}
+        self.store.save('book','isbn',{'items':[book,{**book,'externalId':'OL2W','isbn':'9780261102218'}]})
+        self.assertEqual([r['externalId'] for r in self.store.browse('book',query='978-0-261-10221-7')['items']],['OL1W'])
+
+    def test_concurrent_saves_serialize_without_losing_rows(self):
+        import threading
+        errors=[]
+        def work(number):
+            try:
+                rows=[{**self.item,'title':f'Film {number}-{index}','externalId':f'T{number}-{index}'} for index in range(5)]
+                self.store.save('movie',f'thread-{number}',{'items':rows})
+            except Exception as error:
+                errors.append(error)
+        threads=[threading.Thread(target=work,args=(number,)) for number in range(4)]
+        for thread in threads:thread.start()
+        for thread in threads:thread.join()
+        self.assertEqual(errors,[])
+        self.assertEqual(self.store.browse('movie')['total'],20)
+
+
+class CatalogRankParityTests(PostgresTestCase):
+    """SQL ranking (title_norm/creator_norm CASE) must agree with the catalog_search_rank oracle."""
+    FIXTURE=[('Amélie','Jean-Pierre Jeunet'),('Amelie Poulain','Someone Else'),('Blue','Joni Mitchell'),
+             ('Blue Velvet','David Lynch'),('Velvet','Blue Oyster'),('Mitchell','Blue'),('Joni Mitchell','Blue'),
+             ('Crème brûlée','Zoë Saldaña'),('Zoe','Saldana Creme Brulee'),('Brûlée','Creme'),('Æon Flux','Peter Chung'),
+             ('The Blue Room','Georges Simenon'),('Room','The Blue'),('!!!','Chk Chk Chk'),('Hôtel du Nord','Marcel Carné'),
+             ('Hotel','Nord'),('Ñandú','Pájaro'),('Nandu Pajaro','Ñandú'),('東京物語','小津安二郎'),('Tokyo Story','Yasujirō Ozu'),
+             ('Ozu','Tokyo'),('It','Stephen King'),('Italy','Stephen King Italy'),('A','B'),('B','A')]
+    QUERIES=['amelie','Amélie','blue','blue velvet','velvet blue','joni mitchell','mitchell joni','mitchell','creme brulee',
+             'zoe saldana','nandu pajaro','pajaro','ozu','tokyo story','小津安二郎','東京物語','hotel nord','nord hotel','it','a','b',
+             'stephen king','king stephen','oyster','aeon','room blue','the blue','e','é','zzz']
+
+    def setUp(self):
+        super().setUp()
+        self.store=CatalogStore(self.database)
+        rows=[{'type':'movie','title':title,'creator':creator,'year':'2000','genres':[],'source':'Wikidata','externalId':f'R{index}'}
+              for index,(title,creator) in enumerate(self.FIXTURE)]
+        self.store.save('movie',None,{'items':rows})
+
+    def test_sql_ranking_matches_the_python_rank_oracle(self):
+        for query in self.QUERIES:
+            with self.subTest(query=query):
+                search=catalog_search_text(query)
+                oracle={f'R{index}':catalog_search_rank(title,creator,search) for index,(title,creator) in enumerate(self.FIXTURE)}
+                expected={key:rank for key,rank in oracle.items() if rank is not None}
+                got=[]
+                for page in range(3):
+                    result=self.store.browse('movie',query=query,page=page)
+                    got.extend((row['externalId'],oracle[row['externalId']]) for row in result['items'])
+                    if not result['hasMore']:break
+                self.assertEqual(set(key for key,_ in got),set(expected))
+                self.assertEqual(self.store.browse('movie',query=query)['total'],len(expected))
+                self.assertEqual([rank for _,rank in got],sorted(expected.values()))
+
+    def test_punctuation_only_query_falls_back_to_literal_search(self):
+        self.assertEqual([row['title'] for row in self.store.browse('movie',query='!')['items']],['!!!'])
 
 if __name__=='__main__':unittest.main()

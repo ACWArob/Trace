@@ -1,16 +1,12 @@
 """Private, revisioned account libraries. Nothing here publishes social content."""
-from contextlib import contextmanager
 from datetime import date
-from pathlib import Path
 from urllib.parse import urlparse
 import base64
 import binascii
 import json
 import math
 import re
-import sqlite3
 
-from catalog_store import database_path
 from social import SocialError, TYPES
 
 MAX_ENTRIES = 30000
@@ -182,38 +178,11 @@ def _entry(value, entry_id):
 
 
 class LibraryStore:
-    def __init__(self, path=None, *, byte_limit=None):
+    def __init__(self, database, *, byte_limit=None):
         if byte_limit is not None and (type(byte_limit) is not int or byte_limit < 1):
             raise ValueError('The account byte limit must be a positive integer.')
         self.byte_limit = byte_limit
-        self.path = Path(path) if path else database_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.db() as db:
-            db.executescript('''
-                CREATE TABLE IF NOT EXISTS private_library_state (
-                    user_id TEXT PRIMARY KEY REFERENCES users(id),
-                    cursor INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE TABLE IF NOT EXISTS private_library_entries (
-                    user_id TEXT NOT NULL REFERENCES users(id),
-                    id TEXT NOT NULL, entry TEXT, revision INTEGER NOT NULL,
-                    PRIMARY KEY (user_id, id)
-                );
-                CREATE INDEX IF NOT EXISTS private_library_revision
-                    ON private_library_entries(user_id, revision);
-            ''')
-
-    @contextmanager
-    def db(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        db.execute('PRAGMA foreign_keys=ON')
-        db.execute('PRAGMA journal_mode=WAL')
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+        self.database = database
 
     @staticmethod
     def _user(db, user_id):
@@ -229,21 +198,20 @@ class LibraryStore:
     def pull(self, user_id, after=0, limit=200):
         if not _integer(after) or not _integer(limit, 1, 200):
             _invalid('Use a valid library cursor and a limit from 1 to 200.')
-        with self.db() as db:
-            db.execute('BEGIN')
+        # Repeatable read: the cursor, the rows and the total come from one snapshot.
+        with self.database.connect(isolation='repeatable read') as db:
             self._user(db, user_id)
             state = db.execute('SELECT cursor FROM private_library_state WHERE user_id=?', (user_id,)).fetchone()
             cursor = state['cursor'] if state else 0
             if after > cursor:
                 _invalid('The library cursor is ahead of this account.')
             rows, size, has_more = [], 0, False
-            for row in db.execute('SELECT id,entry,revision FROM private_library_entries WHERE user_id=? AND revision>? ORDER BY revision LIMIT ?', (user_id, after, limit + 1)):
-                row_size = len(row['entry'].encode('utf-8')) if row['entry'] else 0
-                if len(rows) == limit or (rows and size + row_size > MAX_PULL_BYTES):
+            for row in db.execute('SELECT id,entry,revision,coalesce(octet_length(entry),0) AS size FROM private_library_entries WHERE user_id=? AND revision>? ORDER BY revision LIMIT ?', (user_id, after, limit + 1)):
+                if len(rows) == limit or (rows and size + row['size'] > MAX_PULL_BYTES):
                     has_more = True
                     break
                 rows.append(row)
-                size += row_size
+                size += row['size']
             changes = [self._record(row) for row in rows]
             total = db.execute('SELECT count(*) FROM private_library_entries WHERE user_id=? AND entry IS NOT NULL', (user_id,)).fetchone()[0]
             return {'changes': changes, 'cursor': changes[-1]['revision'] if has_more else cursor,
@@ -265,23 +233,25 @@ class LibraryStore:
             encoded = None if change['entry'] is None else _entry(change['entry'], entry_id)
             validated.append((entry_id, encoded, change['baseRevision']))
         accepted, conflicts = [], []
-        with self.db() as db:
-            db.execute('BEGIN IMMEDIATE')
+        with self.database.connect() as db:
             self._user(db, user_id)
-            state = db.execute('SELECT cursor FROM private_library_state WHERE user_id=?', (user_id,)).fetchone()
-            cursor = state['cursor'] if state else 0
+            # Serialize writers per account (not globally): make sure the cursor
+            # row exists, then hold it FOR UPDATE until this transaction ends.
+            db.execute('INSERT INTO private_library_state(user_id,cursor) VALUES(?,0) ON CONFLICT DO NOTHING', (user_id,))
+            cursor = db.execute('SELECT cursor FROM private_library_state WHERE user_id=? FOR UPDATE', (user_id,)).fetchone()['cursor']
             writes = []
             total = db.execute('SELECT count(*) FROM private_library_entries WHERE user_id=? AND entry IS NOT NULL', (user_id,)).fetchone()[0]
-            previous_bytes = db.execute('SELECT coalesce(sum(length(cast(entry AS BLOB))),0) FROM private_library_entries WHERE user_id=?', (user_id,)).fetchone()[0] if self.byte_limit else 0
+            previous_bytes = db.execute('SELECT coalesce(sum(octet_length(entry)),0)::bigint FROM private_library_entries WHERE user_id=?', (user_id,)).fetchone()[0] if self.byte_limit else 0
             total_bytes = previous_bytes
             for entry_id, encoded, base in validated:
-                row = db.execute('SELECT id,entry,revision FROM private_library_entries WHERE user_id=? AND id=?', (user_id, entry_id)).fetchone()
+                row = db.execute('SELECT revision,entry IS NOT NULL AS live,coalesce(octet_length(entry),0) AS size FROM private_library_entries WHERE user_id=? AND id=?', (user_id, entry_id)).fetchone()
                 if base != (row['revision'] if row else 0):
-                    conflicts.append(self._record(row, entry_id))
+                    full = db.execute('SELECT id,entry,revision FROM private_library_entries WHERE user_id=? AND id=?', (user_id, entry_id)).fetchone()
+                    conflicts.append(self._record(full, entry_id))
                     continue
-                total += int(encoded is not None) - int(row is not None and row['entry'] is not None)
+                total += int(encoded is not None) - int(row is not None and row['live'])
                 if self.byte_limit:
-                    total_bytes += (len(encoded.encode('utf-8')) if encoded else 0) - (len(row['entry'].encode('utf-8')) if row and row['entry'] else 0)
+                    total_bytes += (len(encoded.encode('utf-8')) if encoded else 0) - (row['size'] if row else 0)
                 writes.append((entry_id, encoded))
             if total > MAX_ENTRIES:
                 _invalid('Your account library exceeds the 30,000-item limit.')
@@ -294,5 +264,5 @@ class LibraryStore:
                 db.execute('INSERT INTO private_library_entries(user_id,id,entry,revision) VALUES(?,?,?,?) ON CONFLICT(user_id,id) DO UPDATE SET entry=excluded.entry,revision=excluded.revision', (user_id, entry_id, encoded, cursor))
                 accepted.append({'id': entry_id, 'entry': json.loads(encoded) if encoded is not None else None, 'revision': cursor})
             if writes:
-                db.execute('INSERT INTO private_library_state(user_id,cursor) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET cursor=excluded.cursor', (user_id, cursor))
+                db.execute('UPDATE private_library_state SET cursor=? WHERE user_id=?', (cursor, user_id))
         return {'accepted': accepted, 'conflicts': conflicts}

@@ -14,6 +14,7 @@ import tempfile
 from urllib.parse import parse_qsl, urlparse
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import database
 from catalog_store import CatalogStore
 
 MAX_ITEMS = 10000
@@ -208,7 +209,13 @@ def export_catalog(source, output):
     return {'exported':len(items),'skipped':skipped,'path':str(output)}
 
 
-def import_catalog(source,destination):
+def import_catalog(source,destination=None):
+    """Validate a public transfer file, then write it to Postgres.
+
+    destination is a CatalogStore or database.Database; None uses the
+    TRACE_DATABASE_URL / DATABASE_URL environment. Nothing is written unless
+    every record validates.
+    """
     source = _source(source)
     if source.stat().st_size>MAX_BYTES:
         raise TransferError('Catalog import exceeds 20 MiB.')
@@ -228,22 +235,28 @@ def import_catalog(source,destination):
     identities=[(item['type'],item['source'],item['externalId']) for item in items]
     if len(set(identities))!=len(identities):
         raise TransferError('Catalog transfer contains conflicting duplicate identities.')
-    destination = Path(destination).absolute()
-    if destination.is_symlink() or destination==source:
-        raise TransferError('Use a regular destination database separate from the input.')
-    store = CatalogStore(destination)
+    if destination is None:
+        try:
+            destination = database.Database.from_env()
+        except ValueError as exc:
+            raise TransferError('Set TRACE_DATABASE_URL (or DATABASE_URL) to the destination Postgres database.') from exc
+    store = destination if isinstance(destination,CatalogStore) else CatalogStore(destination)
     for kind in ('movie','tv','anime','book','album'):
         group = [item for item in items if item['type']==kind]
         for offset in range(0,len(group),250):
             store.save(kind,None,{'items':group[offset:offset+250]})
     # Preserve exact-record owner audit fields which normal provider ingestion cannot set.
     with store.connect() as db:
+        database.lock(db,'catalog-write')
         for item in items:
             audits = {name:item[name] for name in ('verifiedYear','verifiedImage','unavailableImages') if name in item}
             if not audits:
                 continue
             key = f"{item['type']}:{item['source']}:{item['externalId']}"
-            stored = json.loads(db.execute('SELECT payload FROM catalog WHERE item_key=?',(key,)).fetchone()[0])
+            row = db.execute('SELECT payload FROM catalog WHERE item_key=?',(key,)).fetchone()
+            if row is None:
+                continue
+            stored = json.loads(row[0])
             if stored.get('year')==item.get('year') and 'verifiedYear' in audits:
                 stored['verifiedYear']=audits['verifiedYear']
             if stored.get('image')==item.get('image'):
@@ -251,18 +264,18 @@ def import_catalog(source,destination):
                     if name in audits:
                         stored[name]=audits[name]
             db.execute('UPDATE catalog SET payload=? WHERE item_key=?',(json.dumps(stored),key))
-    return {'imported':len(items),'path':str(destination)}
+    return {'imported':len(items)}
 
 
 def main(argv=None):
     parser=argparse.ArgumentParser(description=__doc__)
     sub=parser.add_subparsers(dest='command',required=True)
     export=sub.add_parser('export');export.add_argument('--source',type=Path,required=True);export.add_argument('--output',type=Path,required=True)
-    load=sub.add_parser('import');load.add_argument('--source',type=Path,required=True);load.add_argument('--destination',type=Path,required=True)
+    load=sub.add_parser('import',help='Import into the database named by TRACE_DATABASE_URL or DATABASE_URL.');load.add_argument('--source',type=Path,required=True)
     args=parser.parse_args(argv)
     try:
-        result=export_catalog(args.source,args.output) if args.command=='export' else import_catalog(args.source,args.destination)
-    except (TransferError,OSError,sqlite3.Error) as exc:
+        result=export_catalog(args.source,args.output) if args.command=='export' else import_catalog(args.source)
+    except (TransferError,OSError,sqlite3.Error,database.Error) as exc:
         parser.exit(1,(str(exc) if isinstance(exc,TransferError) else 'Catalog transfer failed; check file access and database status.')+'\n')
     print(json.dumps(result))
 

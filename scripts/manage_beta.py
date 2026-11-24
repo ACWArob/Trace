@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from database import Database
 from social import SocialStore
 
 
@@ -26,7 +27,7 @@ def main():
     parser.add_argument('--hours', type=int, default=168)
     args = parser.parse_args()
     try:
-        write_invite(SocialStore(), args.output, hours=args.hours)
+        write_invite(SocialStore(Database.from_env()), args.output, hours=args.hours)
     except (ValueError, OSError) as error:
         parser.exit(1, 'Invite creation failed. Use a new writable private output path and valid duration.\n')
     print('Invite saved to the requested private file. It expires and can be used once.')

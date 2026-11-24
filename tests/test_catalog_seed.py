@@ -11,14 +11,14 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from catalog_seed import catalog_coverage, load_seed_server, main, run_seed, run_tv_page, seed_plan, write_report
 from catalog_store import CatalogStore
+from tests.pg_support import PostgresTestCase
 
 
-class CatalogSeedTests(unittest.TestCase):
+class CatalogSeedTests(PostgresTestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.directory = Path(directory.name)
-        self.catalog = CatalogStore(self.directory / 'public.sqlite3')
+        super().setUp()
+        self.directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.catalog = CatalogStore(self.database)
 
     def result(self, kind, query):
         return {'provider': 'Synthetic public provider', 'items': [{
@@ -139,7 +139,7 @@ class CatalogSeedTests(unittest.TestCase):
         self.assertEqual(second['addedTitles'], 0)
         self.assertEqual(second['cachedQueries'], 5)
         self.assertEqual(second['after']['total'], 5)
-        reopened = CatalogStore(self.catalog.path)
+        reopened = CatalogStore(self.database)
         self.assertEqual(catalog_coverage(reopened)['total'], 5)
 
     def test_partial_failures_continue_and_never_print_raw_exception(self):

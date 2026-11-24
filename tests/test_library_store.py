@@ -1,14 +1,12 @@
 """Private library checks use disposable databases only."""
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-import json
-import sqlite3
-import tempfile
 import unittest
 from unittest.mock import patch
 
-from library_store import LibraryStore, MAX_ENTRY_BYTES
-from social import SocialError, SocialStore
+import database
+from library_store import LibraryStore, MAX_ENTRY_BYTES, MAX_REVISION
+from social import SocialError
+from tests.pg_support import PostgresTestCase
 
 
 def entry(entry_id='one', **extra):
@@ -19,16 +17,17 @@ def change(entry_id='one', value=None, revision=0):
     return {'id': entry_id, 'entry': value, 'baseRevision': revision}
 
 
-class LibraryStoreTests(unittest.TestCase):
+class LibraryStoreTests(PostgresTestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.path = Path(self.directory.name) / 'library.sqlite3'
-        self.social = SocialStore(self.path)
-        with self.social.db() as db:
+        super().setUp()
+        with self.database.connect() as db:
             for user_id in ('alice', 'bob'):
                 db.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?)', (user_id, user_id, user_id, '', b'salt', b'hash', 0))
-        self.store = LibraryStore(self.path)
+        self.store = LibraryStore(self.database)
+
+    def drop_fail_trigger(self):
+        with self.database.connect() as db:
+            db.execute('DROP TRIGGER IF EXISTS fail_second ON private_library_entries')
 
     def assert_bad(self, operation, status=400):
         with self.assertRaises(SocialError) as error:
@@ -42,7 +41,7 @@ class LibraryStoreTests(unittest.TestCase):
         self.assertEqual(b['accepted'][0]['revision'], 1)
         self.assertEqual(self.store.pull('alice')['changes'][0]['entry']['notes'], 'Only Alice')
         self.assertEqual(self.store.pull('bob')['changes'][0]['entry']['notes'], 'Only Bob')
-        with self.social.db() as db:
+        with self.database.connect() as db:
             self.assertEqual(db.execute('SELECT count(*) FROM reviews').fetchone()[0], 0)
         for unknown in (None, '', 'missing', True, ['alice']):
             self.assert_bad(lambda: self.store.pull(unknown), 401)
@@ -90,28 +89,29 @@ class LibraryStoreTests(unittest.TestCase):
         self.assertEqual(result['accepted'][0]['entry'], private)
         self.assertEqual(self.store.pull('alice')['changes'][0]['entry'], private)
 
-    def test_additive_schema_restart_preserves_social_data(self):
-        with self.social.db() as db:
-            db.execute('INSERT INTO reviews VALUES(?,?,?,?,?,?,?,?,?)', ('review', 'alice', '{}', 'Public review', 4, 0, 1, 1, None))
-            tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    def test_new_store_instance_keeps_cursor_and_social_data(self):
+        with self.database.connect() as db:
+            db.execute('INSERT INTO reviews VALUES(?,?,?,?,?,?,?,?,?)', ('review', 'alice', '{}', 'Public review', 4, False, 1, 1, None))
         self.store.sync('alice', [change(value=entry())])
-        restarted = LibraryStore(self.path)
+        restarted = LibraryStore(self.database)
         self.assertEqual(restarted.pull('alice')['cursor'], 1)
         self.assertEqual(restarted.sync('alice', [change('two', entry('two'))])['accepted'][0]['revision'], 2)
-        with self.social.db() as db:
-            self.assertTrue(tables <= {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")})
+        with self.database.connect() as db:
             self.assertEqual(db.execute('SELECT body FROM reviews WHERE id=?', ('review',)).fetchone()[0], 'Public review')
             self.assertEqual(len(db.execute('SELECT * FROM users').fetchall()), 2)
-            with self.assertRaises(sqlite3.IntegrityError):
+        with self.assertRaises(database.IntegrityError):
+            with self.database.connect() as db:
                 db.execute('INSERT INTO private_library_entries VALUES(?,?,?,?)', ('missing', 'bad', '{}', 1))
 
     def test_invalid_batch_rolls_back_all_changes(self):
         bad = entry('bad', notes='x' * 20001)
         self.assert_bad(lambda: self.store.sync('alice', [change(value=entry()), change('bad', bad)]))
         self.assertEqual(self.store.pull('alice'), {'changes': [], 'cursor': 0, 'hasMore': False, 'total': 0})
-        with self.store.db() as db:
-            db.execute("CREATE TRIGGER fail_second BEFORE INSERT ON private_library_entries WHEN NEW.id='two' BEGIN SELECT RAISE(ABORT, 'test failure'); END")
-        with self.assertRaises(sqlite3.IntegrityError):
+        with self.database.connect() as db:
+            db.execute("CREATE FUNCTION fail_second() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id='two' THEN RAISE EXCEPTION 'test failure' USING ERRCODE='23514'; END IF; RETURN NEW; END $$")
+            db.execute('CREATE TRIGGER fail_second BEFORE INSERT ON private_library_entries FOR EACH ROW EXECUTE FUNCTION fail_second()')
+        self.addCleanup(self.drop_fail_trigger)
+        with self.assertRaises(database.IntegrityError):
             self.store.sync('alice', [change(value=entry()), change('two', entry('two'))])
         self.assertEqual(self.store.pull('alice')['changes'], [])
         self.assertEqual(self.store.pull('alice')['cursor'], 0)
@@ -149,7 +149,7 @@ class LibraryStoreTests(unittest.TestCase):
 
     def test_concurrent_create_accepts_exactly_one_writer(self):
         def write(note):
-            return LibraryStore(self.path).sync('alice', [change(value=entry(notes=note))])
+            return LibraryStore(self.database).sync('alice', [change(value=entry(notes=note))])
         with ThreadPoolExecutor(max_workers=2) as executor:
             results = list(executor.map(write, ['First', 'Second']))
         self.assertEqual(sum(len(result['accepted']) for result in results), 1)
@@ -157,14 +157,14 @@ class LibraryStoreTests(unittest.TestCase):
         self.assertEqual(self.store.pull('alice')['cursor'], 1)
 
     def test_account_byte_quota_is_utf8_atomic_and_allows_space_recovery(self):
-        store = LibraryStore(self.path, byte_limit=200)
+        store = LibraryStore(self.database, byte_limit=200)
         store.sync('alice', [change(value=entry(notes='💛' * 12))])
         before = store.pull('alice')
         self.assert_bad(lambda: store.sync('alice', [change('two', entry('two', notes='💛' * 40)), change('one', entry(notes='Changed'), 1)]))
         self.assertEqual(store.pull('alice'), before)
         store.sync('bob', [change(value=entry())])
         # A reduced quota must not prevent the owner shrinking or deleting old data.
-        store = LibraryStore(self.path, byte_limit=20)
+        store = LibraryStore(self.database, byte_limit=20)
         store.sync('alice', [change(value=entry(), revision=1)])
         store.sync('alice', [change(value=None, revision=2)])
         self.assertEqual(store.pull('alice')['total'], 0)
@@ -180,6 +180,82 @@ class LibraryStoreTests(unittest.TestCase):
             self.assertEqual([x['id'] for x in second['changes']], ['two', 'three'])
             self.assertFalse(second['hasMore'])
             self.assertEqual(second['cursor'], 3)
+
+    def test_concurrent_syncs_never_reuse_a_revision_and_leave_no_gaps(self):
+        workers, per_worker = 8, 5
+
+        def write(worker):
+            store = LibraryStore(self.database)
+            revisions = []
+            for index in range(per_worker):
+                entry_id = f'w{worker}-{index}'
+                result = store.sync('alice', [change(entry_id, entry(entry_id))])
+                self.assertEqual(result['conflicts'], [])
+                revisions.append(result['accepted'][0]['revision'])
+            return revisions
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = list(executor.map(write, range(workers)))
+        issued = sorted(revision for revisions in results for revision in revisions)
+        self.assertEqual(issued, list(range(1, workers * per_worker + 1)))
+        pulled = self.store.pull('alice', limit=200)
+        self.assertEqual((pulled['cursor'], pulled['total'], pulled['hasMore']), (workers * per_worker, workers * per_worker, False))
+        self.assertEqual([c['revision'] for c in pulled['changes']], issued)
+        with self.database.connect() as db:
+            self.assertEqual(db.execute('SELECT cursor FROM private_library_state WHERE user_id=?', ('alice',)).fetchone()[0], workers * per_worker)
+
+    def test_concurrent_multi_change_batches_keep_revisions_contiguous(self):
+        def write(worker):
+            return LibraryStore(self.database).sync('alice', [change(f'b{worker}-{i}', entry(f'b{worker}-{i}')) for i in range(3)])
+        with ThreadPoolExecutor(max_workers=6) as executor:
+            results = list(executor.map(write, range(6)))
+        for result in results:
+            revisions = [x['revision'] for x in result['accepted']]
+            self.assertEqual(revisions, list(range(revisions[0], revisions[0] + 3)))
+        self.assertEqual(sorted(x['revision'] for r in results for x in r['accepted']), list(range(1, 19)))
+        self.assertEqual(self.store.pull('alice', limit=200)['cursor'], 18)
+
+    def test_revision_limit_is_accepted_at_the_edge_and_rejected_beyond(self):
+        self.store.sync('alice', [change(value=entry())])
+        with self.database.connect() as db:
+            db.execute('UPDATE private_library_state SET cursor=? WHERE user_id=?', (MAX_REVISION - 1, 'alice'))
+            db.execute('UPDATE private_library_entries SET revision=? WHERE user_id=?', (MAX_REVISION - 1, 'alice'))
+        top = self.store.sync('alice', [change(value=entry(notes='Edge'), revision=MAX_REVISION - 1)])
+        self.assertEqual(top['accepted'][0]['revision'], MAX_REVISION)
+        pulled = self.store.pull('alice', after=MAX_REVISION - 1)
+        self.assertEqual((pulled['cursor'], pulled['changes'][0]['revision']), (MAX_REVISION, MAX_REVISION))
+        self.assertEqual(self.store.pull('alice', after=MAX_REVISION)['changes'], [])
+        self.assert_bad(lambda: self.store.sync('alice', [change(value=entry(notes='Over'), revision=MAX_REVISION)]))
+        self.assertEqual(self.store.sync('alice', [change('two', entry('two'), MAX_REVISION)])['conflicts'],
+                         [{'id': 'two', 'entry': None, 'revision': 0}])
+        self.assert_bad(lambda: self.store.sync('alice', [change(value=entry(), revision=MAX_REVISION + 1)]))
+        self.assertEqual(self.store.pull('alice')['cursor'], MAX_REVISION)
+
+    def test_a_user_cannot_pull_or_conflict_into_another_users_rows(self):
+        self.store.sync('alice', [change('secret', entry('secret', notes='Alice only'))])
+        self.assertEqual(self.store.pull('bob'), {'changes': [], 'cursor': 0, 'hasMore': False, 'total': 0})
+        self.assert_bad(lambda: self.store.pull('bob', after=1))
+        result = self.store.sync('bob', [change('secret', entry('secret', notes='Bob copy'), 1)])
+        self.assertEqual(result, {'accepted': [], 'conflicts': [{'id': 'secret', 'entry': None, 'revision': 0}]})
+        self.assertEqual(self.store.pull('alice')['changes'][0]['entry']['notes'], 'Alice only')
+
+    def test_pull_reads_one_repeatable_snapshot(self):
+        self.store.sync('alice', [change('one', entry('one'))])
+        with self.database.connect(isolation='repeatable read') as db:
+            self.assertEqual(db.execute('SELECT cursor FROM private_library_state WHERE user_id=?', ('alice',)).fetchone()[0], 1)
+            self.store.sync('alice', [change('two', entry('two'))])
+            self.assertEqual(db.execute('SELECT count(*) FROM private_library_entries WHERE user_id=?', ('alice',)).fetchone()[0], 1)
+        seen = []
+        original = LibraryStore._record
+
+        def record(row, entry_id=None):
+            if not seen:
+                seen.append(1)
+                LibraryStore(self.database).sync('alice', [change('three', entry('three'))])
+            return original(row, entry_id)
+        with patch.object(LibraryStore, '_record', staticmethod(record)):
+            page = self.store.pull('alice')
+        self.assertEqual((page['cursor'], page['total'], [c['id'] for c in page['changes']]), (2, 2, ['one', 'two']))
+        self.assertEqual(self.store.pull('alice')['cursor'], 3)
 
 
 if __name__ == '__main__':

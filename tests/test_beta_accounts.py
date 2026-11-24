@@ -1,25 +1,23 @@
 """Friends-beta account tests use isolated synthetic databases only."""
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import sqlite3
-import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from social import SocialStore, SocialError
 from library_store import LibraryStore
+from tests.pg_support import PostgresTestCase
 
 PASSWORD = 'synthetic-test-passphrase'
 NEW_PASSWORD = 'synthetic-replacement-passphrase'
 
 
-class BetaAccountTests(unittest.TestCase):
+class BetaAccountTests(PostgresTestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.path = Path(directory.name) / 'beta.sqlite3'
-        self.store = SocialStore(self.path)
+        super().setUp()
+        self.store = SocialStore(self.database)
 
     def register(self, name='alice', **kwargs):
         return self.store.register({'username': name, 'password': PASSWORD, **kwargs})
@@ -56,14 +54,37 @@ class BetaAccountTests(unittest.TestCase):
 
     def test_concurrent_invite_registration_has_one_winner(self):
         invite = self.store.create_invite()
+        barrier = threading.Barrier(2)
         def attempt(name):
+            barrier.wait(timeout=10)
             try:
                 self.store.register({'username': name, 'password': PASSWORD, 'inviteCode': invite}, invite_required=True)
                 return True
-            except SocialError:
+            except SocialError as exc:
+                self.assertEqual(exc.status, 403)
                 return False
         with ThreadPoolExecutor(max_workers=2) as pool:
             self.assertEqual(sum(pool.map(attempt, ['alice', 'bob'])), 1)
+        with self.store.db() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM users').fetchone()[0], 1)
+            claimed = db.execute('SELECT claimed_by FROM beta_invites').fetchone()[0]
+            self.assertEqual(claimed, db.execute('SELECT id FROM users').fetchone()[0])
+
+    def test_username_is_case_insensitive_for_signup_and_recovery(self):
+        with self.assertRaises(SocialError) as caught:
+            self.register('ALICE')
+            self.register('alice')
+        self.assertEqual(caught.exception.status, 409)
+        # A legacy mixed-case row (inserted directly) still conflicts and still recovers.
+        account, _ = self.register('carol')
+        with self.store.db() as db:
+            db.execute('UPDATE users SET username=? WHERE id=?', ('Carol_Mixed', account['user']['id']))
+        with self.assertRaises(SocialError) as caught:
+            self.register('carol_mixed')
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(self.store.profile('CAROL_MIXED')['id'], account['user']['id'])
+        result, _ = self.store.recover({'username': 'CAROL_MIXED', 'recoveryCode': account['recoveryCodes'][0], 'newPassword': NEW_PASSWORD})
+        self.assertEqual(result['user']['id'], account['user']['id'])
 
     def test_recovery_rotates_codes_and_revokes_every_old_session(self):
         account, token = self.register()
@@ -111,7 +132,7 @@ class BetaAccountTests(unittest.TestCase):
         alice, old_token = self.register()
         bob, bob_token = self.register('bob')
         a, b = alice['user']['id'], bob['user']['id']
-        library = LibraryStore(self.path)
+        library = LibraryStore(self.database)
         entry = {'id': 'one', 'type': 'book', 'title': 'Synthetic title', 'status': 'want', 'rating': 0, 'date': ''}
         library.sync(a, [{'id': 'one', 'entry': entry, 'baseRevision': 0}])
         library.sync(b, [{'id': 'one', 'entry': entry, 'baseRevision': 0}])
@@ -125,6 +146,9 @@ class BetaAccountTests(unittest.TestCase):
         self.store.comment(b, other_review, 'Retained comment')
         self.store.like(a, other_review, True)
         self.store.like(b, own_review, True)
+        with self.store.db() as db:
+            for owner, photo in [(a, 'a' * 64), (b, 'b' * 64)]:
+                db.execute('INSERT INTO photos VALUES(?,?,?,?,?,?,NULL)', (owner, photo, f'photos/{owner}/{photo}', 'image/jpeg', 10, 1.0))
         with self.assertRaises(SocialError):
             self.store.delete_account(a, PASSWORD, 'wrong')
         with self.assertRaises(SocialError):
@@ -139,7 +163,10 @@ class BetaAccountTests(unittest.TestCase):
             for table in ['users', 'sessions', 'account_recovery_codes', 'private_library_entries', 'private_library_state', 'reviews', 'likes', 'comments']:
                 column = 'id' if table == 'users' else 'user_id'
                 self.assertEqual(db.execute(f'SELECT count(*) FROM {table} WHERE {column}=?', (a,)).fetchone()[0], 0)
-            self.assertEqual(db.execute('PRAGMA foreign_key_check').fetchall(), [])
+            photos = {row[0]: row[1] for row in db.execute('SELECT user_id,deleted_at FROM photos')}
+            self.assertIsNotNone(photos[a])
+            self.assertIsNone(photos[b])
+            self.assertEqual(db.execute('SELECT count(*) FROM private_library_entries WHERE user_id=?', (b,)).fetchone()[0], 1)
 
     def test_account_deletion_before_library_initialization_and_used_invite_remains_used(self):
         invite = self.store.create_invite()

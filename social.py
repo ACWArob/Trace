@@ -1,16 +1,13 @@
 """Small server-backed social domain with explicit publishing and private authentication."""
-from contextlib import contextmanager
 from hashlib import scrypt, sha256
-from pathlib import Path
 from urllib.parse import urlparse
 import hmac
 import json
 import math
 import re
 import secrets
-import sqlite3
 import time
-from catalog_store import database_path
+from database import Database, IntegrityError
 
 TYPES = {'movie', 'tv', 'anime', 'book', 'album', 'memory'}
 
@@ -50,63 +47,13 @@ def genres(value):
 
 
 class SocialStore:
-    def __init__(self, path=None):
-        self.path = Path(path) if path else database_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.db() as db:
-            db.executescript('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE,
-                    display_name TEXT NOT NULL, bio TEXT NOT NULL DEFAULT '',
-                    salt BLOB NOT NULL, password_hash BLOB NOT NULL, created_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS sessions (
-                    token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
-                    csrf TEXT NOT NULL, expires_at REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS follows (
-                    follower TEXT NOT NULL REFERENCES users(id), target TEXT NOT NULL REFERENCES users(id),
-                    PRIMARY KEY(follower,target), CHECK(follower<>target)
-                );
-                CREATE TABLE IF NOT EXISTS reviews (
-                    id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id),
-                    item TEXT NOT NULL, body TEXT NOT NULL, rating REAL NOT NULL,
-                    spoiler INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL, deleted_at REAL
-                );
-                CREATE INDEX IF NOT EXISTS reviews_created ON reviews(created_at DESC,id DESC);
-                CREATE INDEX IF NOT EXISTS reviews_user ON reviews(user_id,created_at DESC);
-                CREATE TABLE IF NOT EXISTS likes (
-                    review_id TEXT NOT NULL REFERENCES reviews(id), user_id TEXT NOT NULL REFERENCES users(id),
-                    PRIMARY KEY(review_id,user_id)
-                );
-                CREATE TABLE IF NOT EXISTS comments (
-                    id TEXT PRIMARY KEY, review_id TEXT NOT NULL REFERENCES reviews(id),
-                    user_id TEXT NOT NULL REFERENCES users(id), body TEXT NOT NULL,
-                    created_at REAL NOT NULL, deleted_at REAL
-                );
-                CREATE INDEX IF NOT EXISTS comments_review ON comments(review_id,created_at);
-                CREATE TABLE IF NOT EXISTS beta_invites (
-                    invite_hash TEXT PRIMARY KEY, expires_at REAL NOT NULL,
-                    claimed_at REAL, claimed_by TEXT
-                );
-                CREATE TABLE IF NOT EXISTS account_recovery_codes (
-                    user_id TEXT NOT NULL REFERENCES users(id), code_hash TEXT NOT NULL,
-                    created_at REAL NOT NULL, PRIMARY KEY(user_id,code_hash)
-                );
-            ''')
+    """Accounts and Circle features over Postgres (schema: migrations/002_social.sql)."""
 
-    @contextmanager
+    def __init__(self, database=None):
+        self.database = database or Database.from_env()
+
     def db(self):
-        db = sqlite3.connect(self.path, timeout=10)
-        db.row_factory = sqlite3.Row
-        db.execute('PRAGMA foreign_keys=ON')
-        db.execute('PRAGMA journal_mode=WAL')
-        try:
-            with db:
-                yield db
-        finally:
-            db.close()
+        return self.database.connect()
 
     def _profile(self, db, row, viewer=None):
         if not row:
@@ -178,26 +125,26 @@ class SocialStore:
         uid = secrets.token_hex(16)
         try:
             with self.db() as db:
-                db.execute('BEGIN IMMEDIATE')
                 if invite_required:
+                    # One atomic claim: a concurrent registration blocks on the row, then finds it claimed.
+                    now = time.time()
                     invite_hash = sha256(invite.encode()).hexdigest()
-                    invitation = db.execute('SELECT * FROM beta_invites WHERE invite_hash=?', (invite_hash,)).fetchone()
-                    if not invitation or invitation['claimed_at'] is not None or invitation['expires_at'] <= time.time():
+                    if not db.execute('UPDATE beta_invites SET claimed_at=? WHERE invite_hash=? AND claimed_at IS NULL AND expires_at>? RETURNING 1',
+                                      (now, invite_hash, now)).fetchone():
                         raise SocialError('This invitation is invalid, expired, or already used.', 403)
                 db.execute('INSERT INTO users VALUES(?,?,?,?,?,?,?)', (uid, username, text(payload.get('displayName'), 60) or username, '', salt, digest, time.time()))
                 if invite_required:
-                    db.execute('UPDATE beta_invites SET claimed_at=?,claimed_by=? WHERE invite_hash=?', (time.time(), uid, invite_hash))
+                    db.execute('UPDATE beta_invites SET claimed_by=? WHERE invite_hash=?', (uid, invite_hash))
                 recovery_codes = self._new_recovery_codes(db, uid)
                 token, csrf = self._new_session(db, uid)
                 user = self._profile(db, db.execute('SELECT * FROM users WHERE id=?', (uid,)).fetchone())
-        except sqlite3.IntegrityError as exc:
+        except IntegrityError as exc:
             raise SocialError('That username is already in use.', 409) from exc
         return {'user': user, 'csrf': csrf, 'recoveryCodes': recovery_codes}, token
 
     def issue_recovery_codes(self, user_id, password):
         with self.db() as db:
-            db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+            row = db.execute('SELECT * FROM users WHERE id=? FOR UPDATE', (user_id,)).fetchone()
             self._check_password(row, password)
             return {'recoveryCodes': self._new_recovery_codes(db, user_id)}
 
@@ -213,8 +160,7 @@ class SocialStore:
         if not re.fullmatch(r'[A-F0-9]{24}', code):
             raise SocialError('Username or recovery code is incorrect.', 401)
         with self.db() as db:
-            db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT * FROM users WHERE username=?', (username,)).fetchone()
+            row = db.execute('SELECT * FROM users WHERE username=? FOR UPDATE', (username,)).fetchone()
             user_id = row['id'] if row else 'unavailable-account'
             candidate = sha256((user_id + ':' + code).encode()).hexdigest()
             hashes = [x['code_hash'] for x in db.execute('SELECT code_hash FROM account_recovery_codes WHERE user_id=? LIMIT 8', (user_id,))]
@@ -232,8 +178,7 @@ class SocialStore:
 
     def delete_account(self, user_id, password, confirmation=None):
         with self.db() as db:
-            db.execute('BEGIN IMMEDIATE')
-            row = db.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+            row = db.execute('SELECT * FROM users WHERE id=? FOR UPDATE', (user_id,)).fetchone()
             self._check_password(row, password)
             if confirmation is not None and (not isinstance(confirmation, str) or len(confirmation) > 24 or not confirmation.isascii() or not hmac.compare_digest(confirmation.encode(), row['username'].encode())):
                 raise SocialError('Type your username to confirm account deletion.')
@@ -243,9 +188,10 @@ class SocialStore:
             db.execute('DELETE FROM reviews WHERE user_id=?', (user_id,))
             db.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
             db.execute('DELETE FROM account_recovery_codes WHERE user_id=?', (user_id,))
-            for table in ('private_library_entries', 'private_library_state'):
-                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
-                    db.execute(f'DELETE FROM {table} WHERE user_id=?', (user_id,))
+            db.execute('DELETE FROM private_library_entries WHERE user_id=?', (user_id,))
+            db.execute('DELETE FROM private_library_state WHERE user_id=?', (user_id,))
+            # Photo rows have no foreign key: mark them so the maintenance cron deletes their blobs.
+            db.execute('UPDATE photos SET deleted_at=? WHERE user_id=? AND deleted_at IS NULL', (time.time(), user_id))
             db.execute('UPDATE beta_invites SET claimed_by=NULL WHERE claimed_by=?', (user_id,))
             db.execute('DELETE FROM users WHERE id=?', (user_id,))
         return {'deleted': True}
@@ -293,7 +239,7 @@ class SocialStore:
     def people(self, query, viewer=None):
         query = text(query, 40).replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
         with self.db() as db:
-            rows = db.execute("SELECT * FROM users WHERE username LIKE ? ESCAPE '\\' OR display_name LIKE ? ESCAPE '\\' ORDER BY username LIMIT 20", ('%' + query + '%', '%' + query + '%')).fetchall()
+            rows = db.execute("SELECT * FROM users WHERE username ILIKE ? ESCAPE '\\' OR display_name ILIKE ? ESCAPE '\\' ORDER BY username LIMIT 20", ('%' + query + '%', '%' + query + '%')).fetchall()
             return [self._profile(db, row, viewer) for row in rows]
 
     def follow(self, user_id, username, active):
@@ -304,7 +250,7 @@ class SocialStore:
             if target['id'] == user_id:
                 raise SocialError('This is your own profile.')
             if active:
-                db.execute('INSERT OR IGNORE INTO follows VALUES(?,?)', (user_id, target['id']))
+                db.execute('INSERT INTO follows VALUES(?,?) ON CONFLICT DO NOTHING', (user_id, target['id']))
             else:
                 db.execute('DELETE FROM follows WHERE follower=? AND target=?', (user_id, target['id']))
             return self._profile(db, target, user_id)
@@ -374,7 +320,7 @@ class SocialStore:
         self.review(review_id, user_id)
         with self.db() as db:
             if active:
-                db.execute('INSERT OR IGNORE INTO likes VALUES(?,?)', (review_id, user_id))
+                db.execute('INSERT INTO likes VALUES(?,?) ON CONFLICT DO NOTHING', (review_id, user_id))
             else:
                 db.execute('DELETE FROM likes WHERE review_id=? AND user_id=?', (review_id, user_id))
         return self.review(review_id, user_id)
@@ -400,14 +346,14 @@ class SocialStore:
 
     def community_rating(self, item):
         creator = text(item.get('creator'), 300)
-        creator_filter = " AND lower(json_extract(item,'$.creator'))=lower(?)" if item.get('type') in ('book', 'album') else ''
+        creator_filter = " AND lower(item->>'creator')=lower(?)" if item.get('type') in ('book', 'album') else ''
         args = [item.get('type'), text(item.get('title'), 300), text(item.get('year'), 4)]
         if creator_filter:
             args.append(creator)
         with self.db() as db:
             rows = db.execute('''SELECT user_id,rating FROM reviews WHERE deleted_at IS NULL
-                AND json_extract(item,'$.type')=? AND lower(json_extract(item,'$.title'))=lower(?)
-                AND json_extract(item,'$.year')=?''' + creator_filter + ' ORDER BY updated_at DESC,id DESC', args).fetchall()
+                AND item->>'type'=? AND lower(item->>'title')=lower(?)
+                AND item->>'year'=?''' + creator_filter + ' ORDER BY updated_at DESC,id DESC', args).fetchall()
         latest = {}
         for row in rows:
             if row['user_id'] not in latest:

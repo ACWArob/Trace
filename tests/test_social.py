@@ -1,7 +1,6 @@
 import http.client
 import json
 from pathlib import Path
-import tempfile
 import threading
 import unittest
 from unittest.mock import patch
@@ -9,6 +8,7 @@ import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import server
 from social import SocialStore
+from tests.pg_support import PostgresTestCase
 
 
 class QuietHandler(server.Handler):
@@ -16,12 +16,11 @@ class QuietHandler(server.Handler):
         pass
 
 
-class SocialHTTPTests(unittest.TestCase):
+class SocialHTTPTests(PostgresTestCase):
     def setUp(self):
-        self.directory=tempfile.TemporaryDirectory();self.addCleanup(self.directory.cleanup)
-        path=Path(self.directory.name)/'test.sqlite3'
+        super().setUp()
         for name,store in [('SOCIAL_STORE',server.SocialStore),('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore)]:
-            patcher=patch.object(server,name,store(path));patcher.start();self.addCleanup(patcher.stop)
+            patcher=patch.object(server,name,store(self.database));patcher.start();self.addCleanup(patcher.stop)
         server.AUTH_ATTEMPTS.clear()
         self.http=server.ThreadingHTTPServer(('127.0.0.1',0),QuietHandler)
         self.thread=threading.Thread(target=self.http.serve_forever,daemon=True);self.thread.start()
@@ -53,6 +52,7 @@ class SocialHTTPTests(unittest.TestCase):
         self.assertEqual(self.request('/api/auth/login',{},headers={'Origin':'https://evil.example'})[0],403)
         self.assertEqual(self.request('/api/auth/session',headers={'Host':'evil.example'})[0],403)
         self.assertEqual(self.request('/api/auth/signup',{'username':'alice','password':'another-test-password'})[0],409)
+        self.assertEqual(self.request('/api/auth/signup',{'username':'ALICE','password':'another-test-password'})[0],409)
         self.assertEqual(self.request('/api/auth/login',{'username':'alice','password':'wrong-password'})[0],401)
         self.assertEqual(self.request('/api/auth/logout',{},alice)[0],200)
         self.assertIsNone(self.request('/api/auth/session',account=alice)[1]['user'])
@@ -90,6 +90,26 @@ class SocialHTTPTests(unittest.TestCase):
         result=self.request('/api/social/profile',{'displayName':'Reader <b>One</b>','bio':'A little biography.'},alice)[1]['user']
         self.assertEqual(result['displayName'],'Reader <b>One</b>')
         self.assertNotIn('password_hash',result);self.assertNotIn('salt',result)
+
+    def test_people_search_is_case_insensitive_and_escapes_wildcards(self):
+        alice,bob=self.signup('alice'),self.signup('bob')
+        self.request('/api/social/profile',{'displayName':'Wonder_Land 100%'},bob)
+        store=server.get_social()
+        self.assertEqual([p['username'] for p in store.people('ALIC')],['alice'])
+        self.assertEqual([p['username'] for p in store.people('wonder_land')],['bob'])
+        self.assertEqual([p['username'] for p in store.people('100%')],['bob'])
+        self.assertEqual([p['username'] for p in store.people('%')],['bob'])
+        self.assertEqual([p['username'] for p in store.people('b_b')],[])
+        self.assertEqual(len(store.people('')),2)
+
+    def test_community_rating_matches_creator_case_insensitively_for_books(self):
+        alice=self.signup('alice')
+        item={'type':'book','title':'A Book','creator':'Some Author','year':'2020'}
+        self.request('/api/social/reviews',{'item':item,'text':'x','rating':4},alice)
+        store=server.get_social()
+        self.assertEqual(store.community_rating({**item,'title':'a BOOK','creator':'SOME author'})['count'],1)
+        self.assertIsNone(store.community_rating({**item,'creator':'Other'}))
+        self.assertIsNone(store.community_rating({**item,'type':'album'}))
 
     def test_invalid_reviews_are_rejected_without_creating_posts(self):
         alice=self.signup('alice')

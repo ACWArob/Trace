@@ -2,71 +2,83 @@ from pathlib import Path
 import gzip
 import io
 import os
-import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from ratings import RatingsStore,omdb_scores,mdblist_scores,load_local_rating_key
+from tests.pg_support import PostgresTestCase
 
-class RatingTests(unittest.TestCase):
+class RatingTests(PostgresTestCase):
     def test_provider_scores_and_missing_results_survive_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/'test.sqlite3';store=RatingsStore(path)
-            sources=[{'source':'IMDb','value':8.4,'max':10,'count':12345,'url':'https://www.imdb.com/title/tt1234567/ratings/'}]
-            store.save_provider_cache('mdblist','movie','tt1234567',sources,now=100)
-            store.save_provider_cache('mdblist','movie','tt7654321',[],now=100)
-            restarted=RatingsStore(path)
-            self.assertEqual(restarted.read_provider_cache('mdblist','movie','tt1234567',now=101),
-                             {'sources':sources,'status':'ok','fetchedAt':100,'stale':False,'refreshAt':604900})
-            self.assertEqual(restarted.read_provider_cache('mdblist','movie','tt7654321',now=3699),
-                             {'sources':[],'status':'missing','fetchedAt':100,'stale':False,'refreshAt':3700})
-            self.assertTrue(restarted.read_provider_cache('mdblist','movie','tt7654321',now=3700)['stale'])
-            self.assertIsNone(restarted.read_provider_cache('mdblist','movie','tt9999999',now=101))
+        store=RatingsStore(self.database)
+        sources=[{'source':'IMDb','value':8.4,'max':10,'count':12345,'url':'https://www.imdb.com/title/tt1234567/ratings/'}]
+        store.save_provider_cache('mdblist','movie','tt1234567',sources,now=100)
+        store.save_provider_cache('mdblist','movie','tt7654321',[],now=100)
+        restarted=RatingsStore(self.database)
+        self.assertEqual(restarted.read_provider_cache('mdblist','movie','tt1234567',now=101),
+                         {'sources':sources,'status':'ok','fetchedAt':100,'stale':False,'refreshAt':604900})
+        self.assertEqual(restarted.read_provider_cache('mdblist','movie','tt7654321',now=3699),
+                         {'sources':[],'status':'missing','fetchedAt':100,'stale':False,'refreshAt':3700})
+        self.assertTrue(restarted.read_provider_cache('mdblist','movie','tt7654321',now=3700)['stale'])
+        self.assertIsNone(restarted.read_provider_cache('mdblist','movie','tt9999999',now=101))
+
+    def test_epoch_timestamps_keep_sub_second_precision(self):
+        store=RatingsStore(self.database)
+        store.save_provider_cache('mdblist','movie','tt1234567',[],now=1790000000.123456)
+        cached=store.read_provider_cache('mdblist','movie','tt1234567',now=1790000001)
+        self.assertEqual(cached['fetchedAt'],1790000000.123456)
+        self.assertEqual(cached['refreshAt'],1790000000.123456+3600)
+
+    def test_provider_cache_upsert_replaces_the_row_and_rejects_bad_input(self):
+        store=RatingsStore(self.database)
+        store.save_provider_cache('mdblist','movie','tt1234567',[{'source':'IMDb','value':7,'max':10}],now=100)
+        store.save_provider_cache('mdblist','movie','tt1234567',[{'source':'IMDb','value':9,'max':10}],now=200)
+        cached=store.read_provider_cache('mdblist','movie','tt1234567',now=201)
+        self.assertEqual((cached['sources'][0]['value'],cached['fetchedAt']),(9,200))
+        with self.database.connect() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM provider_score_cache').fetchone()[0],1)
+        for args in [('BAD','movie','tt1234567'),('mdblist','movie','../x'),('mdblist','movie','tt12')]:
+            with self.assertRaises(ValueError):store.save_provider_cache(*args,[])
+        with self.assertRaises(ValueError):store.save_provider_cache('mdblist','movie','tt1234567',[{'v':'x'*70000}])
+        with self.assertRaises(ValueError):store.save_provider_cache('mdblist','movie','tt1234567',[],now=100,refresh_after=50)
 
     def test_provider_cache_separates_provider_kind_and_title(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store=RatingsStore(Path(directory)/'test.sqlite3')
-            for provider,kind,imdb_id,value in [('mdblist','movie','tt1234567',8),('omdb','movie','tt1234567',7),
-                                                ('mdblist','tv','tt1234567',6),('mdblist','movie','tt7654321',5)]:
-                store.save_provider_cache(provider,kind,imdb_id,[{'source':'IMDb','value':value,'max':10}],now=100)
-            for provider,kind,imdb_id,value in [('mdblist','movie','tt1234567',8),('omdb','movie','tt1234567',7),
-                                                ('mdblist','tv','tt1234567',6),('mdblist','movie','tt7654321',5)]:
-                self.assertEqual(store.read_provider_cache(provider,kind,imdb_id,now=101)['sources'][0]['value'],value)
+        store=RatingsStore(self.database)
+        for provider,kind,imdb_id,value in [('mdblist','movie','tt1234567',8),('omdb','movie','tt1234567',7),
+                                            ('mdblist','tv','tt1234567',6),('mdblist','movie','tt7654321',5)]:
+            store.save_provider_cache(provider,kind,imdb_id,[{'source':'IMDb','value':value,'max':10}],now=100)
+        for provider,kind,imdb_id,value in [('mdblist','movie','tt1234567',8),('omdb','movie','tt1234567',7),
+                                            ('mdblist','tv','tt1234567',6),('mdblist','movie','tt7654321',5)]:
+            self.assertEqual(store.read_provider_cache(provider,kind,imdb_id,now=101)['sources'][0]['value'],value)
 
     def test_persistent_failure_backoff_keeps_stale_successful_scores(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/'test.sqlite3';store=RatingsStore(path)
-            sources=[{'source':'Letterboxd','value':4.2,'max':5}]
-            store.save_provider_cache('mdblist','movie','tt1234567',sources,now=100,refresh_after=200)
-            store.set_provider_backoff('mdblist','rate-limited',retry_after=3600,now=201)
-            restarted=RatingsStore(path)
-            cached=restarted.read_provider_cache('mdblist','movie','tt1234567',now=202)
-            self.assertEqual(cached,{'sources':sources,'status':'ok','fetchedAt':100,'stale':True,'refreshAt':200})
-            self.assertEqual(restarted.get_provider_backoff('mdblist',now=202),{'status':'rate-limited','refreshAt':3801})
-            restarted.set_provider_backoff('mdblist','unavailable',now=203)
-            self.assertEqual(restarted.get_provider_backoff('mdblist',now=204),{'status':'rate-limited','refreshAt':3801})
-            self.assertIsNone(restarted.get_provider_backoff('omdb',now=204))
-            self.assertIsNone(restarted.get_provider_backoff('mdblist',now=3801))
-            restarted.set_provider_backoff('omdb','unavailable',now=4000)
-            self.assertEqual(RatingsStore(path).get_provider_backoff('omdb',now=4001),{'status':'unavailable','refreshAt':4060})
-            self.assertEqual(restarted.read_provider_cache('mdblist','movie','tt1234567',now=4001)['sources'],sources)
+        store=RatingsStore(self.database)
+        sources=[{'source':'Letterboxd','value':4.2,'max':5}]
+        store.save_provider_cache('mdblist','movie','tt1234567',sources,now=100,refresh_after=200)
+        store.set_provider_backoff('mdblist','rate-limited',retry_after=3600,now=201)
+        restarted=RatingsStore(self.database)
+        cached=restarted.read_provider_cache('mdblist','movie','tt1234567',now=202)
+        self.assertEqual(cached,{'sources':sources,'status':'ok','fetchedAt':100,'stale':True,'refreshAt':200})
+        self.assertEqual(restarted.get_provider_backoff('mdblist',now=202),{'status':'rate-limited','refreshAt':3801})
+        restarted.set_provider_backoff('mdblist','unavailable',now=203)
+        self.assertEqual(restarted.get_provider_backoff('mdblist',now=204),{'status':'rate-limited','refreshAt':3801})
+        self.assertIsNone(restarted.get_provider_backoff('omdb',now=204))
+        self.assertIsNone(restarted.get_provider_backoff('mdblist',now=3801))
+        restarted.set_provider_backoff('omdb','unavailable',now=4000)
+        self.assertEqual(RatingsStore(self.database).get_provider_backoff('omdb',now=4001),{'status':'unavailable','refreshAt':4060})
+        self.assertEqual(restarted.read_provider_cache('mdblist','movie','tt1234567',now=4001)['sources'],sources)
 
-    def test_provider_cache_migration_preserves_existing_imdb_dataset(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/'test.sqlite3'
-            with sqlite3.connect(path) as db:
-                db.execute('''CREATE TABLE public_scores (source TEXT NOT NULL,external_id TEXT NOT NULL,
-                    value REAL NOT NULL,maximum REAL NOT NULL,votes INTEGER,url TEXT NOT NULL,
-                    updated_at REAL NOT NULL,PRIMARY KEY(source,external_id))''')
-                db.execute('INSERT INTO public_scores VALUES(?,?,?,?,?,?,?)',('IMDb','tt1234567',8.4,10,12000,'https://www.imdb.com/title/tt1234567/ratings/',100))
-            store=RatingsStore(path)
-            store.save_provider_cache('mdblist','movie','tt1234567',[{'source':'IMDb','value':9,'max':10}],now=100)
-            restarted=RatingsStore(path)
-            self.assertEqual(restarted.lookup('tt1234567')[0]['value'],8.4)
-            self.assertEqual(restarted.lookup('tt1234567')[0]['count'],12000)
-            self.assertEqual(restarted.read_provider_cache('mdblist','movie','tt1234567',now=101)['sources'][0]['value'],9)
+    def test_existing_imdb_dataset_rows_coexist_with_provider_cache(self):
+        with self.database.connect() as db:
+            db.execute('INSERT INTO public_scores VALUES(?,?,?,?,?,?,?)',('IMDb','tt1234567',8.4,10,12000,'https://www.imdb.com/title/tt1234567/ratings/',100))
+        store=RatingsStore(self.database)
+        store.save_provider_cache('mdblist','movie','tt1234567',[{'source':'IMDb','value':9,'max':10}],now=100)
+        restarted=RatingsStore(self.database)
+        self.assertEqual(restarted.lookup('tt1234567')[0]['value'],8.4)
+        self.assertEqual(restarted.lookup('tt1234567')[0]['count'],12000)
+        self.assertEqual(restarted.read_provider_cache('mdblist','movie','tt1234567',now=101)['sources'][0]['value'],9)
 
     def test_private_local_key_loads_at_startup_with_environment_precedence(self):
         with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ',{},clear=True):
@@ -107,13 +119,26 @@ class RatingTests(unittest.TestCase):
             self.assertFalse(load_local_rating_key(directory))
 
     def test_imdb_dataset_is_streamed_and_keeps_rating_counts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store=RatingsStore(Path(directory)/'test.sqlite3')
-            stream=io.BytesIO(gzip.compress(b'tconst\taverageRating\tnumVotes\ntt1234567\t8.4\t12000\nbad\t4.0\t2\n'))
-            with patch('ratings.urlopen',return_value=stream):self.assertEqual(store.import_imdb(),1)
-            self.assertEqual(store.lookup('tt1234567')[0]['count'],12000)
-            self.assertEqual(store.lookup('tt1234567')[0]['value'],8.4)
-            self.assertEqual(store.lookup('../../secret'),[])
+        store=RatingsStore(self.database)
+        data=lambda *rows:io.BytesIO(gzip.compress(('tconst\taverageRating\tnumVotes\n'+''.join(rows)).encode()))
+        with patch('ratings.urlopen',return_value=data('tt1234567\t8.4\t12000\n','bad\t4.0\t2\n')):
+            self.assertEqual(store.import_imdb(enabled=True),1)
+        self.assertEqual(store.lookup('tt1234567')[0]['count'],12000)
+        self.assertEqual(store.lookup('tt1234567')[0]['value'],8.4)
+        self.assertEqual(store.lookup('../../secret'),[])
+        # Re-importing upserts instead of failing on the primary key.
+        with patch('ratings.urlopen',return_value=data('tt1234567\t7.9\t13000\n')):
+            self.assertEqual(store.import_imdb(enabled=True),1)
+        self.assertEqual((store.lookup('tt1234567')[0]['value'],store.lookup('tt1234567')[0]['count']),(7.9,13000))
+        with self.database.connect() as db:
+            self.assertEqual(db.execute('SELECT count(*) FROM public_scores').fetchone()[0],1)
+
+    def test_imdb_import_requires_the_explicit_flag(self):
+        store=RatingsStore(self.database)
+        with patch('ratings.urlopen',side_effect=AssertionError('The dataset must not be fetched')) as opened:
+            for kwargs in ({},{'enabled':False},{'enabled':1}):
+                with self.assertRaises(RuntimeError):store.import_imdb(**kwargs)
+        opened.assert_not_called()
 
     def test_omdb_sources_keep_their_scale_and_do_not_require_a_key(self):
         with patch.dict('os.environ',{},clear=True):self.assertEqual(omdb_scores('tt1234567','Test',None),[])

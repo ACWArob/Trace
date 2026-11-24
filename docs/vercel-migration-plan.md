@@ -131,6 +131,16 @@ Effort: S ≤ 2 h, M ≈ 3–5 h, L ≈ 6–9 h. Commands run with `python3.11` 
 - **Confirm and write back into this plan:** `PATH_INFO` preserved under rewrite; `wsgi.input` readable for POST; `SCRIPT_NAME` empty; `x-vercel-forwarded-for` vs spoofed `x-real-ip`; static content types and HSTS present; cron `Authorization` format; SDK import path/pin; Python 3.12 selected; cold-start time with psycopg.
 - **Test:** `curl -si https://<preview>/api/probe` (with the protection-bypass header for previews). **Parallel:** nothing else should start before the answers on `PATH_INFO` and `wsgi.input`; Step 1 can start immediately.
 
+**Step 0 results (2026-11-24, Vercel CLI 66.6.0, preview probe):**
+- Project `trace` (team scope, Pro) is linked; Neon `trace-data` (Free) and private Blob `trace-photos` are connected to all environments. Neon supplies `DATABASE_URL` / `DATABASE_URL_UNPOOLED`; Blob uses OIDC (`BLOB_STORE_ID`, no static read-write token), so the Blob client must authenticate with `VERCEL_OIDC_TOKEN`.
+- `PATH_INFO` keeps the original path (`/api/library/sync`), `SCRIPT_NAME` is empty, and `wsgi.input` reads POST bodies.
+- **A rewrite with a named parameter appends it to the query string** (`/api/:path*` produced `QUERY_STRING=path=library%2Fsync`). Use a parameter-free rewrite, or strip that key in `api/index.py` before calling the app.
+- `HTTP_X_VERCEL_FORWARDED_FOR` is present; a spoofed `X-Real-IP` was overwritten to match it; `X-Forwarded-For` has a single entry. Key client IP on `x-vercel-forwarded-for`.
+- Host, `X-Forwarded-Host`, and `wsgi.url_scheme=https` match the deployment URL.
+- **`.mjs` files are served as `text/plain`.** Browsers refuse module scripts with that type, so `vercel.json` must set `Content-Type: text/javascript; charset=utf-8` for `/(.*)\.mjs`. `.webmanifest` is served correctly.
+- Vercel already sends `Strict-Transport-Security: max-age=63072000; includeSubDomains; preload`.
+- Previews are protected; automation uses `vercel curl <path> --deployment <url>`.
+
 ### Step 1 — Database foundation and schema — L
 - **Create:** `database.py` (`Database(dsn, search_path=None)`, `connect(isolation=None)` context manager, `lock(db,name)`, `Row`, `Error`, `IntegrityError`, `?` translation, jsonb text loader, `prepare_threshold=None`), `migrations/001_catalog.sql` … `006_photos.sql` (catalog + `title_norm/creator_norm` + indexes; users/sessions/follows/reviews/likes/comments/invites/recovery codes with the type changes in 1.2; library; ratings/provider caches/backoff; `auth_budget`, `score_refresh_queue`; `photos`), `schema_migrations`, `scripts/migrate_db.py` (direct URL, advisory-locked, idempotent), `scripts/dev_postgres.sh`, `requirements.txt`, `pyproject.toml` (requires-python), `tests/pg_support.py`, `tests/test_database.py`.
 - **Test:** `python3.11 -m unittest tests.test_database -v` — covers `?`→`%s` with literal `%`, Row int/name access, commit/rollback, `IntegrityError` mapping, isolation param, double-migration idempotence, citext uniqueness (`Ada` vs `ada`), BIGINT at 2^53−1, DOUBLE epoch round-trip.

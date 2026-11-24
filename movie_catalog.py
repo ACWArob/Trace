@@ -7,6 +7,8 @@ import json
 import re
 import unicodedata
 
+from database import lock
+
 
 # Verified Wikidata classes: Q11424 film; Q24869 feature film; Q24862 short
 # film; Q202866 animated film; Q506240 television film; Q93204 documentary;
@@ -128,9 +130,8 @@ def reconcile_movie_catalog(catalog):
     """
     counts = {'checked': 0, 'excluded': 0, 'restored': 0}
     with catalog.connect() as db:
-        db.execute('BEGIN IMMEDIATE')
-        rows = db.execute("SELECT item_key,payload FROM catalog WHERE kind='movie' "
-                          "AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.source') END=?",
+        lock(db, 'catalog-write')
+        rows = db.execute("SELECT item_key,payload FROM catalog WHERE kind='movie' AND payload->>'source'=?",
                           (WIKIDATA_SOURCE,)).fetchall()
         for row in rows:
             item = json.loads(row['payload'])

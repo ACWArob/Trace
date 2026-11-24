@@ -24,3 +24,5 @@ xcuserdata/
 *.keystore
 *.jks
 .venv/
+.vercel
+.env*

@@ -12,10 +12,11 @@ from catalog_store import CatalogStore
 from music_catalog import search_albums, album_details, match_album, clean_album_genres
 from ratings import RatingsStore
 from score_service import ScoreService
+from tests.pg_support import PostgresTestCase
 
 MBID='2f40e601-5e93-4e3a-90f4-223f661ea4a7'
 
-class MediaScoreTests(unittest.TestCase):
+class MediaScoreTests(PostgresTestCase):
     def test_album_genres_exclude_chart_and_personal_library_tags(self):
         self.assertEqual(clean_album_genres(['electronic','ambient','offizielle charts','1–4 wochen','ph_2_stars','Classical']),
                          ['electronic','ambient','Classical'])
@@ -122,19 +123,13 @@ class MediaScoreTests(unittest.TestCase):
             self.assertIsNone(match_album(item,fetch))
 
     def test_book_and_album_cache_is_durable_and_separate_by_identity(self):
-        with tempfile.TemporaryDirectory() as folder:
-            path=Path(folder)/'db.sqlite3'
-            first=ScoreService(RatingsStore(path))
-            try:
-                for kind,key,source in [('book','/works/OL123W','Google Books'),('album',MBID,'MusicBrainz')]:
-                    result=first.lookup(kind,key,{'public':{'enabled':True,'load':lambda s=source:[{'source':s,'value':4,'max':5}]}})
-                    self.assertEqual(result['sources'][0]['source'],source)
-            finally:first.close()
-            second=ScoreService(RatingsStore(path))
-            try:
-                result=second.lookup('album',MBID,{'public':{'enabled':True,'load':lambda:self.fail('Fetched durable rating again')}})
-                self.assertEqual(result['sources'][0]['value'],4)
-            finally:second.close()
+        first=ScoreService(RatingsStore(self.database))
+        for kind,key,source in [('book','/works/OL123W','Google Books'),('album',MBID,'MusicBrainz')]:
+            result=first.lookup(kind,key,{'public':{'enabled':True,'load':lambda s=source:[{'source':s,'value':4,'max':5}]}})
+            self.assertEqual(result['sources'][0]['source'],source)
+        second=ScoreService(RatingsStore(self.database))
+        result=second.lookup('album',MBID,{'public':{'enabled':True,'load':lambda:self.fail('Fetched durable rating again')}})
+        self.assertEqual(result['sources'][0]['value'],4)
 
     def test_metadata_patch_keeps_newer_artwork_and_adds_verified_source_identity(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -168,25 +163,24 @@ class MediaScoreTests(unittest.TestCase):
             self.assertEqual(len(store.browse('book')['genres']),12)
 
     def test_server_persists_album_genres_without_replacing_matched_cover_or_identity(self):
-        with tempfile.TemporaryDirectory() as folder:
-            path=Path(folder)/'db.sqlite3';catalog=CatalogStore(path);ratings=RatingsStore(path)
-            item={'type':'album','title':'An Album','creator':'An Artist','source':'Apple Music','externalId':'123',
-                  'image':'https://example.org/exact-cover.jpg','year':'2000','genres':['World']}
-            catalog.save('album',None,{'items':[item]})
-            details={'type':'album','source':'MusicBrainz','externalId':MBID,'title':'An Album','creator':'An Artist',
-                     'sourceUrl':'https://musicbrainz.org/release-group/'+MBID,
-                     'image':'https://example.org/canonical.jpg','genres':['rai'],'publicScores':[{'source':'MusicBrainz','value':4.2,'max':5}]}
-            with patch.object(server,'CATALOG_STORE',catalog),patch.object(server,'RATINGS_STORE',ratings),patch.object(server,'SCORE_SERVICE',None), \
-                 patch('server.album_details',return_value=details) as load,patch('server.match_album',return_value={'externalId':MBID}) as match,patch('server.get_social') as social:
-                social.return_value.community_rating.return_value=None
-                try:
-                    result=server.title_scores('album','An Album','2000',creator='An Artist',source='Apple Music',external_id='123')
-                    again=server.title_scores('album','An Album','2000',creator='An Artist',source='Apple Music',external_id='123')
-                    self.assertEqual(result['sources'][0]['value'],4.2)
-                    self.assertEqual(again['genres'],['World','rai'])
-                    load.assert_called_once()
-                    match.assert_called_once()
-                    saved=catalog.identified('album','Apple Music','123')
-                    self.assertEqual(saved['image'],item['image'])
-                    self.assertEqual(catalog.browse('album')['total'],2)
-                finally:server.SCORE_SERVICE.close()
+        catalog=CatalogStore(self.database);ratings=RatingsStore(self.database)
+        item={'type':'album','title':'An Album','creator':'An Artist','source':'Apple Music','externalId':'123',
+              'image':'https://example.org/exact-cover.jpg','year':'2000','genres':['World']}
+        catalog.save('album',None,{'items':[item]})
+        details={'type':'album','source':'MusicBrainz','externalId':MBID,'title':'An Album','creator':'An Artist',
+                 'sourceUrl':'https://musicbrainz.org/release-group/'+MBID,
+                 'image':'https://example.org/canonical.jpg','genres':['rai'],'publicScores':[{'source':'MusicBrainz','value':4.2,'max':5}]}
+        with patch.object(server,'CATALOG_STORE',catalog),patch.object(server,'RATINGS_STORE',ratings),patch.object(server,'SCORE_SERVICE',None), \
+             patch('server.album_details',return_value=details) as load,patch('server.match_album',return_value={'externalId':MBID}) as match,patch('server.get_social') as social:
+            social.return_value.community_rating.return_value=None
+            try:
+                result=server.title_scores('album','An Album','2000',creator='An Artist',source='Apple Music',external_id='123')
+                again=server.title_scores('album','An Album','2000',creator='An Artist',source='Apple Music',external_id='123')
+                self.assertEqual(result['sources'][0]['value'],4.2)
+                self.assertEqual(again['genres'],['World','rai'])
+                load.assert_called_once()
+                match.assert_called_once()
+                saved=catalog.identified('album','Apple Music','123')
+                self.assertEqual(saved['image'],item['image'])
+                self.assertEqual(catalog.browse('album')['total'],2)
+            finally:server.SCORE_SERVICE.close()

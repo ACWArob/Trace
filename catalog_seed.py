@@ -132,9 +132,9 @@ def catalog_coverage(catalog):
     """Read aggregate metadata coverage from the public catalog table only."""
     with catalog.connect() as db:
         rows = db.execute('''SELECT kind,count(*) AS total,
-            sum(CASE WHEN trim(coalesce(json_extract(payload,'$.image'),'')) != '' THEN 1 ELSE 0 END) AS covers,
-            sum(CASE WHEN json_array_length(genres) > 0 THEN 1 ELSE 0 END) AS genres,
-            sum(CASE WHEN trim(coalesce(json_extract(payload,'$.description'),'')) != '' THEN 1 ELSE 0 END) AS descriptions
+            sum(CASE WHEN trim(coalesce(payload->>'image','')) != '' THEN 1 ELSE 0 END)::bigint AS covers,
+            sum(CASE WHEN jsonb_array_length(genres) > 0 THEN 1 ELSE 0 END)::bigint AS genres,
+            sum(CASE WHEN trim(coalesce(payload->>'description','')) != '' THEN 1 ELSE 0 END)::bigint AS descriptions
             FROM catalog WHERE ''' + VISIBLE_CATALOG + ' GROUP BY kind').fetchall()
     coverage = {kind: {'total': 0, 'withCover': 0, 'withGenres': 0,
                        'withDescription': 0, 'missingCover': 0,
