@@ -125,12 +125,18 @@ class CatalogStore:
         retained_fields = ('image', 'description', 'creator', 'year', 'imdbId', 'isbn', 'genres', 'publicScores', 'catalogSources')
         with self.connect() as db:
             lock(db, 'catalog-write')
-            for item in items:
-                if item['type'] not in KINDS or not item['externalId'] or not item['title']:
-                    continue
-                key = f"{item['type']}:{item['source']}:{item['externalId']}"
-                stored = db.execute('SELECT payload FROM catalog WHERE item_key=?', (key,)).fetchone()
-                previous = json.loads(stored['payload']) if stored else {}
+            items = [item for item in items if item['type'] in KINDS and item['externalId'] and item['title']]
+            keys = [f"{item['type']}:{item['source']}:{item['externalId']}" for item in items]
+            # One read and one batched write per save, not two round trips per item.
+            stored_payloads = {}
+            for start in range(0, len(keys), 100):
+                chunk = keys[start:start + 100]
+                stored_payloads.update(db.execute(
+                    f"SELECT item_key,payload FROM catalog WHERE item_key IN ({','.join('?' * len(chunk))})", chunk).fetchall())
+            writes = []
+            for key, item in zip(keys, items):
+                stored = stored_payloads.get(key)
+                previous = json.loads(stored) if stored else {}
                 if previous:
                     previous['genres'] = catalog_genres(item['type'], previous.get('genres'))
                 if metadata_only and previous:
@@ -165,13 +171,15 @@ class CatalogStore:
                                 and source not in item['catalogSources'] and len(item['catalogSources']) < 8):
                             item['catalogSources'].append({name: source[name] for name in source_fields})
                 stored_genres = item['genres'] if isinstance(item['genres'], list) else []
-                db.execute('''INSERT INTO catalog(item_key,kind,title,creator,genres,payload,updated_at,title_norm,creator_norm)
+                writes.append((key, item['type'], item['title'], item['creator'], json.dumps(stored_genres), json.dumps(item), now,
+                               catalog_search_text(item['title']), catalog_search_text(item['creator'] or '')))
+                stored_payloads[key] = writes[-1][5]  # A repeat later in this batch merges onto this write.
+            if writes:
+                db.executemany('''INSERT INTO catalog(item_key,kind,title,creator,genres,payload,updated_at,title_norm,creator_norm)
                     VALUES(?,?,?,?,?,?,?,?,?)
                     ON CONFLICT(item_key) DO UPDATE SET title=excluded.title,creator=excluded.creator,
                     genres=excluded.genres,payload=excluded.payload,updated_at=excluded.updated_at,
-                    title_norm=excluded.title_norm,creator_norm=excluded.creator_norm''',
-                           (key, item['type'], item['title'], item['creator'], json.dumps(stored_genres), json.dumps(item), now,
-                            catalog_search_text(item['title']), catalog_search_text(item['creator'] or '')))
+                    title_norm=excluded.title_norm,creator_norm=excluded.creator_norm''', writes)
             if query is not None:
                 db.execute('''INSERT INTO catalog_queries VALUES(?,?,?,?) ON CONFLICT(kind,query)
                     DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at''',
