@@ -125,32 +125,34 @@ def search_books(query, fetch):
     }), 'openlibrary')
     if not isinstance(data, dict) or not isinstance(data.get('docs'), list):
         raise ValueError('Invalid Open Library search response.')
-    items = []
-    for row in data.get('docs', [])[:16]:
-        if not isinstance(row, dict) or not isinstance(row.get('title'), str) or not row['title'].strip():
-            continue
-        key = str(row.get('key') or '')
-        if re.fullmatch(r'OL[0-9]+W', key):
-            key = '/works/' + key
-        if not re.fullmatch(r'/works/OL[0-9]+W', key):
-            continue
-        url = 'https://openlibrary.org' + key
-        authors = row.get('author_name')
-        authors = authors if isinstance(authors, list) else []
-        subjects = row.get('subject')
-        subjects = subjects if isinstance(subjects, list) else []
-        rating = row.get('ratings_average')
-        count = row.get('ratings_count')
-        rated = type(rating) in (int, float) and math.isfinite(rating) and 0 < rating <= 5 and type(count) is int and count > 0
-        scores = [{'source': SOURCE, 'value': rating, 'max': 5, 'count': count, 'url': url}] if rated else []
-        cover = row.get('cover_i')
-        items.append({
-            'title': row['title'], 'creator': ', '.join(a for a in authors[:2] if isinstance(a, str)),
-            'year': str(row.get('first_publish_year') or ''), 'type': 'book',
-            'image': f'https://covers.openlibrary.org/b/id/{cover}-L.jpg' if type(cover) is int and cover > 0 else '',
-            'source': SOURCE, 'sourceUrl': url, 'externalId': key, 'genres': book_genres(subjects), 'publicScores': scores,
-        })
-    return items
+    return [item for item in map(work_item, data.get('docs', [])[:16]) if item]
+
+
+def work_item(row):
+    """One Open Library search.json work row as a catalog item, or None."""
+    if not isinstance(row, dict) or not isinstance(row.get('title'), str) or not row['title'].strip():
+        return None
+    key = str(row.get('key') or '')
+    if re.fullmatch(r'OL[0-9]+W', key):
+        key = '/works/' + key
+    if not re.fullmatch(r'/works/OL[0-9]+W', key):
+        return None
+    url = 'https://openlibrary.org' + key
+    authors = row.get('author_name')
+    authors = authors if isinstance(authors, list) else []
+    subjects = row.get('subject')
+    subjects = subjects if isinstance(subjects, list) else []
+    rating = row.get('ratings_average')
+    count = row.get('ratings_count')
+    rated = type(rating) in (int, float) and math.isfinite(rating) and 0 < rating <= 5 and type(count) is int and count > 0
+    scores = [{'source': SOURCE, 'value': rating, 'max': 5, 'count': count, 'url': url}] if rated else []
+    cover = row.get('cover_i')
+    return {
+        'title': row['title'], 'creator': ', '.join(a for a in authors[:2] if isinstance(a, str)),
+        'year': str(row.get('first_publish_year') or ''), 'type': 'book',
+        'image': f'https://covers.openlibrary.org/b/id/{cover}-L.jpg' if type(cover) is int and cover > 0 else '',
+        'source': SOURCE, 'sourceUrl': url, 'externalId': key, 'genres': book_genres(subjects), 'publicScores': scores,
+    }
 
 
 def search_edition(isbn, fetch):
