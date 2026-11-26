@@ -23,3 +23,7 @@ native/android/app/src/main/assets/capacitor.plugins.json
 xcuserdata/
 *.keystore
 *.jks
+.venv/
+.vercel
+.env*
+public/

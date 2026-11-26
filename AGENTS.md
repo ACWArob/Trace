@@ -89,3 +89,23 @@ Prefer the affected test file over the whole suite.
 - 2026-11-08 — the full recap was too tall for social posts — compose fixed-size cards with room at the story edges and export the preview canvas directly.
 - 2026-11-09 — a flat list of text buttons made recap picks hard to scan — group cover tiles by category and show the pick order in a separate tray.
 - 2026-11-09 — the 3 MB upload limit rejected ordinary phone photos — bound the input and resize locally before saving.
+- 2026-11-09 — broad starter searches saved unrelated books and albums — filter curated results by title and author or artist before writing the public catalog.
+- 2026-11-10 — one request per TV title made catalog growth slow — use bounded TVmaze index pages for bulk TV and keep curated book results out of the live search cache.
+- 2026-11-10 — familiar English spellings missed some international authors — use Open Library’s indexed author names for curated batch searches.
+- 2026-11-10 — public catalog growth left the personal TV shelf at six — verify the visible room and add requested starters through the private library save path with blank dates and ratings.
+- 2026-11-10 — a category switch briefly exposed the previous genre list — reset choices immediately and bind every asynchronous menu update to the current search.
+- 2026-11-10 — provider years mixed editions with original publication and included an impossible date — verify starter years, retain corrections by source ID, and omit explicit zero-vote scores.
+
+- 2026-11-13 — Discover hid bundled titles behind loading and API failures — render matching attributed starters immediately, keep them usable on failure, and never substitute unrelated offline results.
+- 2026-11-13 — a reverse proxy makes every peer look local and photo pages can exhaust small servers — trust only the configured loopback proxy header, cap hosted requests and storage, and page libraries by bytes as well as records.
+- 2026-11-13 — catalog-transfer rules dropped Kitsu anime films — validate provider identity independently of film-versus-series category and retain legitimate movie records.
+- 2026-11-13 — clearing whole dialogs on account changes removed their reusable content containers — clear private content inside the containers and invalidate pending lookups, then reopen a detail in the browser.
+- 2026-11-13 — a restrictive administrator umask can make deployed code unreadable by the service — set public code and private storage permissions explicitly and test installation under umask 077.
+- 2026-11-24 — a web file input can open the native iPhone camera — include a camera purpose string and verify it in the built app’s Info.plist.
+- 2026-11-24 — the Sensitive CRON_SECRET pulls as a bracketed placeholder, so a pulled-env cron call returned 401 — verify the authorized path with `vercel crons run /api/cron/maintenance` and the function logs; auth 429s also carry Retry-After.
+- 2026-11-24 — Letterboxd ZIP and CSV imports carry no artwork, so a fresh hosted shelf showed no covers — backfill missing covers from catalog search with strict ID or title/year matching, adding only the image.
+- 2026-11-24 — Open Library returns original publication years while imports carry edition years, and multiple matches appended duplicates — match books on title plus author surname regardless of year, and merge into the best existing copy instead of appending.
+- 2026-11-24 — a deploy changed shell files without bumping the service worker cache, so installed apps kept old code — the Vercel build stamps CACHE_NAME with a hash of the staged shell.
+- 2026-11-24 — about 10% of Letterboxd titles had no confident catalog cover — fall back to the film page poster through its saved boxd.it link, with strict host checks and a cached, bounded fetch.
+- 2026-11-24 — Wikipedia thumbnails were often stills rather than posters — take covers from each type's dedicated source first (Letterboxd, TVmaze, Kitsu, Open Library), upgrade only auto-picked Wikimedia images, and never replace a photo or a coverChosen cover.
+- 2026-11-25 — the hosted book catalog held only books someone had searched, so browsing felt empty — seed it with widely read Open Library works by subject and language (scripts/seed_books.py), saved through CatalogStore in batched writes.

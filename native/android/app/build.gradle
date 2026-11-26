@@ -1,5 +1,18 @@
 apply plugin: 'com.android.application'
 
+// Signing credentials belong in the process environment, never in source or bundled web assets.
+def traceSigning = [
+    store: System.getenv('TRACE_ANDROID_KEYSTORE'),
+    storePassword: System.getenv('TRACE_ANDROID_STORE_PASSWORD'),
+    alias: System.getenv('TRACE_ANDROID_KEY_ALIAS'),
+    keyPassword: System.getenv('TRACE_ANDROID_KEY_PASSWORD')
+]
+def traceSigningReady = traceSigning.values().every { it != null && !it.isEmpty() }
+def traceVersionCode = System.getenv('TRACE_ANDROID_VERSION_CODE') ?: '1'
+if (!(traceVersionCode ==~ /[1-9][0-9]{0,9}/) || traceVersionCode.toLong() > 2100000000L) {
+    throw new GradleException('TRACE_ANDROID_VERSION_CODE must be a positive Android version code.')
+}
+
 android {
     namespace = "com.acwarob.trace"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -7,7 +20,7 @@ android {
         applicationId "com.acwarob.trace"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
+        versionCode traceVersionCode.toInteger()
         versionName "1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
@@ -16,11 +29,29 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        if (traceSigningReady) {
+            traceRelease {
+                storeFile file(traceSigning.store)
+                storePassword traceSigning.storePassword
+                keyAlias traceSigning.alias
+                keyPassword traceSigning.keyPassword
+            }
+        }
+    }
     buildTypes {
         release {
+            if (traceSigningReady) signingConfig signingConfigs.traceRelease
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
+    }
+}
+
+gradle.taskGraph.whenReady { graph ->
+    def signingRelease = graph.allTasks.any { it.project == project && it.name in ['assembleRelease', 'bundleRelease', 'packageRelease', 'validateSigningRelease'] }
+    if (signingRelease && (!traceSigningReady || !file(traceSigning.store).isFile())) {
+        throw new GradleException('Release signing is not configured. Set all four TRACE_ANDROID signing variables using your private release keystore.')
     }
 }
 

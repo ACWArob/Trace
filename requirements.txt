@@ -1,0 +1,2 @@
+# Runtime dependencies installed by Vercel (and locally into .venv).
+psycopg[binary]==3.3.9

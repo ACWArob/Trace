@@ -1,0 +1,2 @@
+# https://pypi.org/project/waitress/ — production only; local web stays buildless.
+waitress==3.0.2

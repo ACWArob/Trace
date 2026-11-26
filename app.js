@@ -1,10 +1,102 @@
-import {artworkCandidates,artworkFit} from './artwork.mjs';
+import {artworkCandidates as providerArtwork,artworkFit} from './artwork.mjs';
 import {apiFetch} from './api_client.mjs';
-import {TYPES,singular,uid,today,escapeHTML as e,safeUrl,dateOnly,normalizeImport,mergeEntries,recapEntries,selectTracewall,tracewallLayout,tracewallArtifact,TRACEWALL_THEMES,TRACEWALL_FORMATS,tracewallShareCard,migrateEntry,normalizeAttachments,safeImageUrl as imageUrl,sameItem,normalizeGenres,reviewLinks,normalizePublicScores,blendRatings,filmConsensus,FILM_SCORE_SOURCES} from './core.mjs';
+import {readLetterboxdZip} from './letterboxd_zip.mjs';
+import {runCoverBackfill,applyCovers,pruneCoverAttempts,letterboxdFilmUrl} from './cover_backfill.mjs';
+import {TYPES,singular,uid,today,escapeHTML as e,safeUrl,dateOnly,normalizeISBN,normalizeImport,mergeEntries,dedupeEntries,recapEntries,selectTracewall,tracewallLayout,tracewallArtifact,TRACEWALL_THEMES,TRACEWALL_FORMATS,tracewallShareCard,migrateEntry,normalizeAttachments,safeImageUrl,sameItem,normalizeGenres,reviewLinks,normalizePublicScores,blendRatings,filmConsensus,FILM_SCORE_SOURCES} from './core.mjs';
 import {DEMO} from './data.js';
+import {TV_STARTERS} from './tv_starters.mjs';
+import {COLLECTION_STARTERS} from './collection_starters.mjs';
+import {mediaConsensus,MEDIA_SCORE_SOURCES} from './core.mjs';
 import {createSocial} from './social.js';
-import {createLibrarySync,rebaseLibraryEntries} from './library_sync.mjs';
-import {calendarDays,shiftMonth,monthLabel,chapters,wheelItems,bookRows} from './views.mjs';
+import {createLibrarySync,rebaseLibraryEntries,inlinePhotoRefs,decodePhotoDataUrl,photoDigest,photoRefId,isPhotoRef} from './library_sync.mjs';
+import {calendarDays,shiftMonth,monthLabel,chapters,wheelItems,bookRows,starterResults} from './views.mjs';
+
+// Synced memory photos are stored as trace-photo:<sha256> refs and served by /api/photos/<id>.
+const photoPath=id=>`/api/photos/${id}`;
+const photoIdFromSrc=src=>/^\/api\/photos\/([0-9a-f]{64})$/.exec(src||'')?.[1]||null;
+const imageUrl=value=>{const id=photoRefId(value);return id?photoPath(id):safeImageUrl(value);};
+const storedImage=value=>isPhotoRef(value)?value:safeImageUrl(value);
+const artworkCandidates=item=>{const id=photoRefId(typeof item==='string'?item:item?.image);return id?[photoPath(id)]:providerArtwork(item);};
+function attachmentKey(item){return typeof item?.id==='string'&&/^[a-zA-Z0-9_-]{1,100}$/.test(item.id)?item.id:`${item?.type}:${String(item?.title||'')}:${String(item?.year||'').slice(0,4)}`;}
+// normalizeAttachments keeps only public image URLs; restore each linked item's photo ref.
+function attachmentsWithPhotos(source){
+ const refs=new Map();for(const item of Array.isArray(source)?source:[])if(isPhotoRef(item?.image))refs.set(attachmentKey(item),item.image);
+ return normalizeAttachments(source).map(item=>!item.image&&refs.has(attachmentKey(item))?{...item,image:refs.get(attachmentKey(item))}:item);
+}
+const PHOTO_CACHE_LIMIT=200,PHOTO_URL_LIMIT=60,photoUrls=new Map();let photoDatabase;
+function openPhotoCache(){
+ if(!photoDatabase)photoDatabase=new Promise((resolve,reject)=>{
+  if(!globalThis.indexedDB){reject(Error('Photo storage is unavailable.'));return;}
+  const request=indexedDB.open('trace-photo-cache',1);
+  request.onupgradeneeded=()=>request.result.createObjectStore('photos').createIndex('at','at');
+  request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error);request.onblocked=()=>reject(Error('Photo storage is blocked.'));
+ }).catch(error=>{photoDatabase=null;throw error;});
+ return photoDatabase;
+}
+async function photoTransaction(mode,work){
+ const db=await openPhotoCache();
+ return new Promise((resolve,reject)=>{const tx=db.transaction('photos',mode);let result=null;tx.oncomplete=()=>resolve(result);tx.onabort=tx.onerror=()=>reject(tx.error);work(tx.objectStore('photos'),value=>{result=value;});});
+}
+// Entries are keyed by account and photo ID and bounded to the most recently stored photos.
+async function cachedPhoto(key){try{return await photoTransaction('readonly',(store,done)=>{const read=store.get(key);read.onsuccess=()=>done(read.result?.blob||null);});}catch{return null;}}
+async function cachePhoto(key,blob){
+ try{await photoTransaction('readwrite',store=>{
+  store.put({blob,at:Date.now()},key);
+  const count=store.count();count.onsuccess=()=>{let extra=count.result-PHOTO_CACHE_LIMIT;if(extra<=0)return;store.index('at').openKeyCursor().onsuccess=event=>{const cursor=event.target.result;if(cursor&&extra-->0){store.delete(cursor.primaryKey);cursor.continue();}};};
+ });}catch{}
+}
+async function forgetCachedPhotos(userId){
+ for(const [key,url] of photoUrls)if(key.startsWith(userId+':')){URL.revokeObjectURL(url);photoUrls.delete(key);}
+ try{await photoTransaction('readwrite',store=>{store.delete(IDBKeyRange.bound(userId+':',userId+':\uffff'));});}catch{}
+}
+function photoBlobType(blob){const type=String(blob?.type||'').split(';')[0].trim().toLowerCase();return ['image/jpeg','image/png','image/webp'].includes(type)?new Blob([blob],{type}):null;}
+async function fetchPhoto(id){
+ try{
+  if(globalThis.TraceNative){const decoded=decodePhotoDataUrl(await globalThis.TraceMobile?.photo?.(id));return decoded?new Blob([decoded.bytes],{type:decoded.type}):null;}
+  const response=await apiFetch(photoPath(id),{credentials:'same-origin'});
+  return response.ok?photoBlobType(await response.blob()):null;
+ }catch{return null;}
+}
+async function photoBlob(id){
+ const owner=activeSession.user?.id;if(!owner||!/^[0-9a-f]{64}$/.test(id||''))return null;
+ const key=owner+':'+id;let blob=await cachedPhoto(key);
+ if(!blob){blob=await fetchPhoto(id);if(blob&&activeSession.user?.id===owner)await cachePhoto(key,blob);}
+ return activeSession.user?.id===owner?blob:null;
+}
+async function resolvePhoto(id){
+ const owner=activeSession.user?.id,key=owner+':'+id;
+ if(photoUrls.has(key))return photoUrls.get(key);
+ const blob=await photoBlob(id);if(!blob||activeSession.user?.id!==owner)return null;
+ if(photoUrls.has(key))return photoUrls.get(key);
+ const url=URL.createObjectURL(blob);photoUrls.set(key,url);
+ while(photoUrls.size>PHOTO_URL_LIMIT){const [oldest,old]=photoUrls.entries().next().value;URL.revokeObjectURL(old);photoUrls.delete(oldest);}
+ return url;
+}
+async function photoDataUrl(id){
+ const blob=await photoBlob(id);if(!blob)return null;
+ return new Promise(resolve=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result));reader.onerror=()=>resolve(null);reader.readAsDataURL(blob);});
+}
+// A photo that cannot load directly (offline, or a native WebView) is served from the device cache.
+function retryPhoto(img){
+ const id=photoIdFromSrc(img.getAttribute('src'));if(!id||img.dataset.photoRetry)return false;
+ img.dataset.photoRetry='1';
+ resolvePhoto(id).then(url=>{if(!img.isConnected)return;if(url)img.src=url;else if(img.matches('img[data-cover-title]'))failedCover(img);});
+ return true;
+}
+async function uploadPhoto(dataUrl){
+ const owner=activeSession.user?.id,photo=decodePhotoDataUrl(dataUrl);
+ if(!photo)throw Object.assign(Error('This photo format cannot be synced. Choose a JPEG, PNG, or WebP photo.'),{status:415});
+ const id=await photoDigest(photo.bytes),verified=await verifiedSession(owner),native=Boolean(globalThis.TraceNative);
+ // Native transport carries JSON text only, so native builds send the same bytes as base64.
+ const response=await apiFetch('/api/photos',{method:'POST',credentials:'same-origin',cache:'no-store',
+  headers:{'Content-Type':native?'application/json':photo.type,'X-Trace-Photo-Id':id,'X-Trace-CSRF':verified.csrf},
+  body:native?JSON.stringify({contentType:photo.type,data:dataUrl.slice(dataUrl.indexOf(',')+1)}):photo.bytes});
+ let data={};try{data=await response.json();}catch{}
+ if(!response.ok)throw Object.assign(Error(data.error||'Photo upload is temporarily unavailable.'),{status:response.status});
+ if(data.id!==undefined&&data.id!==id)throw Object.assign(Error('The server stored a different photo.'),{status:502});
+ if(activeSession.user?.id===owner)await cachePhoto(owner+':'+id,new Blob([photo.bytes],{type:photo.type}));
+ return 'trace-photo:'+id;
+}
 
 const $ = (s,root=document)=>root.querySelector(s);
 const paths={
@@ -42,16 +134,97 @@ let librarySaveTail=Promise.resolve();
 const guestStorageProblem=storageProblem;let guestCollection=collection;
 let syncStatus={state:'device',pendingCount:0,conflictCount:0};
 const libraryDialog=document.createElement('dialog');libraryDialog.id='library-dialog';libraryDialog.className='modal';libraryDialog.setAttribute('aria-label','Private library');document.body.append(libraryDialog);let pendingGuestCopy=null;
-const librarySync=createLibrarySync({request:libraryRequest,onChange:receiveLibrary,onStatus:status=>{syncStatus=status;renderLibraryStatus();}});
+const librarySync=createLibrarySync({request:libraryRequest,uploadPhoto,onChange:receiveLibrary,onStatus:status=>{syncStatus=status;renderLibraryStatus();}});
 const social=createSocial({main,onSession:handleSession,entries:()=>entries(),notify:message=>notify(message),openDraft:item=>{entryDraft={...item,id:uid(),status:'want',date:'',rating:0,notes:'',history:[],addedAt:new Date().toISOString()};renderEntryForm();logDialog.showModal();}});
 let logType='movie',searchResults=[],searchController=null,searchSequence=0,entryDraft=null,editingId=null,toastTimer;
 const entries=()=>collection.started?collection.entries:DEMO;
 const isDemo=()=>!collection.started;
+const tvBrowse={items:TV_STARTERS,total:TV_STARTERS.length,page:0,hasMore:true,previewId:null,sequence:0,scope:'shelf',loaded:false,query:'',genre:'',genres:[],error:''};
+
+function missingStarters(kind){
+ return COLLECTION_STARTERS[kind].filter(item=>!collection.entries.some(x=>sameItem(x,item)||x.type===item.type&&x.title.toLocaleLowerCase()===item.title.toLocaleLowerCase()&&x.year===item.year&&(kind==='tv'||x.creator?.toLocaleLowerCase()===item.creator.toLocaleLowerCase())));
+}
+function starterAction(kind){
+ const count=missingStarters(kind).length;
+ return count?`<button class="text-button" data-action="add-starters" data-value="${kind}">Add ${count} starter ${TYPES[kind].toLowerCase()} +</button>`:'<span class="source-hint">Starter selection added</span>';
+}
+let addingStarters=false;
+async function addStarterTitles(kind='tv'){
+ if(addingStarters)return;
+ addingStarters=true;
+ try{
+ const base=collection.entries;
+ const fresh=missingStarters(kind);
+ const additions=fresh.map(item=>({...item,id:uid(),status:'want',rating:0,date:'',history:[],notes:'',addedAt:new Date().toISOString()}));
+ if(!additions.length){notify('These starter titles are already on your shelf.');return;}
+ if(await persist({started:true,entries:[...base,...additions]})){
+  state.category=kind;state.previewId=null;render();notify(`${additions.length} ${TYPES[kind].toLowerCase()} added for later.`);
+ }
+ }finally{addingStarters=false;}
+}
 function notify(message){const t=$('#toast');t.textContent=message;t.classList.add('visible');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('visible'),4500);}
 async function persist(next){
  if(storageProblem){notify(storageProblem);return false;}if(next.entries.length>30000){notify('A library can contain up to 30,000 items.');return false;}const userId=activeSession.user?.id||null;
  try{if(userId){if(!libraryReady)throw Error('Your account library is still loading.');const base=structuredClone(collection.entries),desired=structuredClone(next.entries);const save=librarySaveTail.then(async()=>{if(activeSession.user?.id!==userId)return false;await librarySync.replaceEntries(rebaseLibraryEntries(base,desired,librarySync.getState().entries));return activeSession.user?.id===userId;});librarySaveTail=save.catch(()=>{});return await save;}else{localStorage.setItem(KEY,JSON.stringify(next));guestCollection=next;collection=next;}return true;}
  catch(error){notify(userId?'Could not save this change on your device. '+error.message:'Browser storage is full or unavailable. Download a backup, then free space and try again.');return false;}
+}
+// Collapse saved copies of one work (personal data is kept) and save through the normal path so it syncs. Idempotent.
+async function collapseDuplicates(){
+ const epoch=sessionEpoch;if(!collection.started||storageProblem||!libraryReady)return;
+ let next,merged;try{({entries:next,merged}=dedupeEntries(collection.entries));}catch{return;}if(!merged)return;
+ if(!await persist({...collection,entries:next})||epoch!==sessionEpoch)return;
+ if(!activeSession.user)redrawLibrary();notify(`Merged ${merged} ${merged===1?'duplicate':'duplicates'}.`);
+}
+// Entries without artwork, or with an auto-picked Wikimedia image, get covers from each type's primary source in the background; only image and a missing imdbId change.
+let coverRunning=false,coverAgain=false,coverTimer=0,coverProgress='';const coverAttemptsByAccount=new Map(),coverPaused=new Set();
+const coverAccount=()=>activeSession.user?.id||'guest';
+function coverAttempts(account){
+ if(!coverAttemptsByAccount.has(account)){let saved={};try{saved=JSON.parse(localStorage.getItem(preferenceKey('cover-attempts'))||'{}')||{};}catch{}coverAttemptsByAccount.set(account,pruneCoverAttempts(saved,new Set(collection.entries.map(x=>x.id)),Date.now()));}
+ return coverAttemptsByAccount.get(account);
+}
+function saveCoverAttempts(account,attempts){if(coverAccount()===account)try{localStorage.setItem(preferenceKey('cover-attempts'),JSON.stringify(attempts));}catch{}}
+async function coverSearch(entry){
+ const query=(entry.type==='book'&&normalizeISBN(entry.isbn))||entry.title.trim().slice(0,200);
+ const response=await apiFetch(`/api/search?type=${encodeURIComponent(entry.type)}&q=${encodeURIComponent(query)}`);
+ let items=[];if(response.ok){try{const data=await response.json();items=Array.isArray(data.items)?data.items:[];}catch{}}
+ return {status:response.status,items,retryAfter:Number(response.headers?.get?.('Retry-After'))||0};
+}
+async function coverLookup(entry){
+ const params=new URLSearchParams({type:entry.type,title:entry.title.trim().slice(0,300)});
+ const year=String(entry.year||'').slice(0,4);if(/^[12]\d{3}$/.test(year))params.set('year',year);
+ if(entry.type==='book'){const creator=String(entry.creator||'').trim().slice(0,300),isbn=normalizeISBN(entry.isbn);if(creator)params.set('creator',creator);if(isbn)params.set('isbn',isbn);}
+ const response=await apiFetch(`/api/cover?${params}`);
+ let image='';if(response.ok){try{const data=await response.json();image=typeof data.image==='string'?data.image:'';}catch{}}
+ return {status:response.status,image,retryAfter:Number(response.headers?.get?.('Retry-After'))||0};
+}
+async function letterboxdPoster(entry){
+ const response=await apiFetch(`/api/letterboxd-poster?url=${encodeURIComponent(letterboxdFilmUrl(entry.sourceUrl))}`);
+ let image='';if(response.ok){try{const data=await response.json();image=typeof data.image==='string'?data.image:'';}catch{}}
+ return {status:response.status,image,retryAfter:Number(response.headers?.get?.('Retry-After'))||0};
+}
+function scheduleCoverBackfill(delay=4000){clearTimeout(coverTimer);coverTimer=setTimeout(startCoverBackfill,delay);}
+function setCoverProgress(text){if(coverProgress!==text){coverProgress=text;renderLibraryStatus();}}
+async function startCoverBackfill(){
+ if(coverRunning){coverAgain=true;return;}
+ const account=coverAccount(),epoch=sessionEpoch;
+ if(!collection.started||storageProblem||!libraryReady||coverPaused.has(account))return;
+ const attempts=coverAttempts(account),cancelled=()=>epoch!==sessionEpoch||coverAccount()!==account;
+ coverRunning=true;coverAgain=false;let shownAt=0;
+ try{
+  const result=await runCoverBackfill({entries:collection.entries,attempts,search:coverSearch,poster:letterboxdPoster,cover:coverLookup,isCancelled:cancelled,
+   save:async matches=>{
+    if(cancelled()||!libraryReady)return false;
+    const ok=await persist({...collection,entries:applyCovers(collection.entries,matches)});saveCoverAttempts(account,attempts);
+    if(ok&&!activeSession.user&&!document.activeElement?.matches?.('input,textarea,select'))redrawLibrary();
+    return ok;
+   },
+   onProgress:({processed,total})=>{const at=Date.now();if(total>1&&processed<total&&at-shownAt>2000){shownAt=at;setCoverProgress(`Finding covers… ${processed}/${total}`);}}});
+  if(!cancelled()){
+   saveCoverAttempts(account,attempts);if(result.status==='auth')coverPaused.add(account);
+   if(result.matched)notify(`Added ${result.matched} ${result.matched===1?'cover':'covers'} to your shelf.`);
+  }
+ }catch{}
+ finally{coverRunning=false;setCoverProgress('');if(coverAgain)scheduleCoverBackfill();}
 }
 function saveWall(){try{localStorage.setItem(preferenceKey('wall'),JSON.stringify(wallConfig));}catch{notify('Recap settings could not be saved in this browser.');}}
 function validateEntries(rows){
@@ -61,9 +234,11 @@ function validateEntries(rows){
   if(!row || typeof row.title!=='string' || !row.title.trim() || !Object.hasOwn(TYPES,row.type))throw Error('This backup has an invalid entry.');
   const out={id:typeof row.id==='string'&&/^[a-zA-Z0-9_-]{1,100}$/.test(row.id)?row.id:uid(),title:row.title.slice(0,500),type:row.type,status:['done','want','progress'].includes(row.status)?row.status:'done',favorite:!!row.favorite,forLater:!!row.forLater,rating:Math.max(0,Math.min(5,Number(row.rating)||0)),date:dateOnly(row.date),history:Array.isArray(row.history)?row.history.map(dateOnly).filter(Boolean):[]};
   for(const key of ['creator','year','notes','description','source','externalId','addedAt','imdbId'])out[key]=typeof row[key]==='string'?row[key].slice(0,['notes','description'].includes(key)?20000:500):'';
-  out.publicScores=normalizePublicScores(row.publicScores);out.genres=normalizeGenres(row.genres||DEMO.find(x=>sameItem(x,row))?.genres);out.image=imageUrl(row.image);out.sourceUrl=safeUrl(row.sourceUrl||'');out.metadataSourceUrl=safeUrl(row.metadataSourceUrl||'');out.metadataSource=String(row.metadataSource||'').slice(0,100);out.attachments=normalizeAttachments(row.attachments);
+  if(row.type==='book'&&row.isbn)out.isbn=normalizeISBN(row.isbn);
+  out.publicScores=normalizePublicScores(row.publicScores);out.genres=normalizeGenres(row.genres||DEMO.find(x=>sameItem(x,row))?.genres);out.image=storedImage(row.image);out.sourceUrl=safeUrl(row.sourceUrl||'');out.metadataSourceUrl=safeUrl(row.metadataSourceUrl||'');out.metadataSource=String(row.metadataSource||'').slice(0,100);out.attachments=attachmentsWithPhotos(original.attachments);
   if(['restaurant','place'].includes(row.legacyType)){out.legacyType=row.legacyType;out.legacyRating=Number(row.legacyRating)||0;}
-  return {...row,...out};
+  const {coverChosen,...rest}=row;
+  return {...rest,...out,...(coverChosen===true?{coverChosen:true}:{})};
  });
 }
 function stars(r){return r?`${'★'.repeat(Math.floor(r))}${r%1?'½':''}`:'';}
@@ -74,9 +249,11 @@ const artClass=x=>x.type==='book'?'book':x.type==='album'?'vinyl':x.type==='memo
 const colorFor=x=>['#a84d32','#3f7472','#79414b','#8e6e29','#59683b'][Array.from(x.title).reduce((s,c)=>s+c.charCodeAt(0),0)%5];
 function fallback(x){return `<span class="cover-fallback" style="--cover-color:${colorFor(x)}"><span class="fallback-symbol">${x.type==='album'?'◉':x.type==='book'?'✴︎':'✧'}</span><span class="fallback-title" dir="auto">${e(x.title)}</span><span class="fallback-creator" dir="auto">${e(x.creator||singular[x.type])}</span><span class="cover-missing">${x.type==='memory'?'No photo added':'Cover unavailable'}</span></span>`;}
 function cover(x){const [url,...alternatives]=artworkCandidates(x);return url?`<img class="cover-art" src="${e(url)}" data-cover-alternatives="${e(JSON.stringify(alternatives))}" alt="${e(x.title)} cover" loading="lazy" data-cover-title="${e(x.title)}" data-cover-creator="${e(x.creator||'')}" data-cover-type="${e(x.type)}">`:fallback(x);}
-function failedCover(img){let alternatives=[];try{alternatives=JSON.parse(img.dataset.coverAlternatives||'[]');}catch{}const next=alternatives.shift();if(next){img.dataset.coverAlternatives=JSON.stringify(alternatives);img.src=next;return;}img.outerHTML=fallback({title:img.dataset.coverTitle,creator:img.dataset.coverCreator,type:img.dataset.coverType});}
-document.addEventListener('error',ev=>{if(ev.target.matches?.('img[data-cover-title]'))failedCover(ev.target);},true);
-document.addEventListener('load',ev=>{if(ev.target.matches?.('img[data-cover-title]')&&ev.target.naturalWidth<=2&&ev.target.naturalHeight<=2)failedCover(ev.target);},true);
+function failedCover(img){if(retryPhoto(img))return;let alternatives=[];try{alternatives=JSON.parse(img.dataset.coverAlternatives||'[]');}catch{}const next=alternatives.shift();if(next){img.dataset.coverAlternatives=JSON.stringify(alternatives);img.src=next;return;}img.outerHTML=fallback({title:img.dataset.coverTitle,creator:img.dataset.coverCreator,type:img.dataset.coverType});}
+document.addEventListener('error',ev=>{if(ev.target.matches?.('img[data-cover-title]'))failedCover(ev.target);else if(ev.target.matches?.('img[src^="/api/photos/"]'))retryPhoto(ev.target);},true);
+document.addEventListener('load',ev=>{if(ev.target.matches?.('img[data-cover-title]')&&ev.target.naturalWidth<=2&&ev.target.naturalHeight<=2)failedCover(ev.target);
+ // Keep viewed photos available offline.
+ else if(!globalThis.TraceNative&&ev.target.matches?.('img[src^="/api/photos/"]'))void photoBlob(photoIdFromSrc(ev.target.getAttribute('src')));},true);
 function artifact(x,orientation='face') {
  const kind=artClass(x);const spine=orientation==='spine'&&['book','dvd'].includes(kind);
  return `<span class="artifact ${kind} ${spine?'is-spine':''}" style="--cover-color:${colorFor(x)}">${kind==='vinyl'?`<span class="record"></span><span class="sleeve">${cover(x)}</span><span class="vinyl-stand" aria-hidden="true"></span>`:kind==='polaroid'?`${cover(x)}<span class="photo-caption">${e(x.title)}</span>`:`<span class="binding" aria-hidden="true"></span><span class="jacket">${kind==='dvd'?'<span class="case-label">DVD · VIDEO</span>':''}${cover(x)}</span><span class="page-block" aria-hidden="true"></span>${spine?`<span class="spine-type">${kind==='dvd'?'DVD':'✳︎'}</span><span class="spine-title" dir="auto">${e(x.title)}</span><span class="spine-author">${e(x.creator)}</span>`:''}`}</span>`;
@@ -91,12 +268,24 @@ function shelfPage(){
  <div class="category-tabs" role="group" aria-label="Filter category">${categoryOptions.map(([id,label,ic])=>`<button data-action="category" data-value="${id}" class="${state.category===id?'active':''}" aria-pressed="${state.category===id}">${label}<span class="tab-count">${entries().filter(x=>id==='all'||categoryFor(x)===id).length}</span></button>`).join('')}</div>
  <div class="toolbar"><label class="search-box">${icon('search')}<span class="sr-only">Search your shelf</span><input id="shelf-search" type="search" placeholder="Search your shelf" value="${e(state.search)}"></label><select id="status-filter" class="select-control" aria-label="Filter status"><option value="all">All items</option><option value="forLater">For later list</option><option value="done">Logged</option><option value="progress">In progress</option><option value="want">Want to try</option></select><select id="sort-filter" class="select-control" aria-label="Sort collection"><option value="collected">Shelf order</option><option value="recent">Latest logged</option><option value="rating">Highest rated</option><option value="title">A to Z</option></select><button data-action="favorites" class="favorite-filter ${state.favorites?'active':''}" aria-pressed="${state.favorites}" aria-label="Show favorites">${icon('heart')}<span>Favorites</span></button></div>
  <div class="shelf-invitation"><button class="text-button" data-action="keep-memory">${icon('camera')} Add memory</button></div><label class="genre-filter"><span>Genre</span><select id="genre-filter" aria-label="Filter genre"><option value="all">All genres</option><option value="missing">Missing genres</option>${[...new Set(entries().filter(x=>state.category==='all'||categoryFor(x)===state.category).flatMap(x=>x.genres||[]))].sort().map(g=>`<option value="${e(g)}">${e(g)}</option>`).join('')}</select></label><div id="shelf-content"></div>${sampleStrip()}`;
+ if(state.category==='tv'){
+  main.querySelector('.shelf-invitation').hidden=true;
+  const switcher=document.createElement('div');switcher.className='tv-room-navigation';
+  switcher.innerHTML=`<div class="view-switch" role="group" aria-label="TV room collection"><button data-action="tv-scope" data-value="shelf" aria-pressed="${tvBrowse.scope==='shelf'}" class="${tvBrowse.scope==='shelf'?'active':''}">My shows</button><button data-action="tv-scope" data-value="browse" aria-pressed="${tvBrowse.scope==='browse'}" class="${tvBrowse.scope==='browse'?'active':''}">Browse shows</button></div>${starterAction('tv')}`;
+  $('#shelf-content').before(switcher);
+  if(tvBrowse.scope==='browse'){main.querySelector('.toolbar').hidden=true;main.querySelector('.genre-filter').hidden=true;}
+ }
+ if(['book','album'].includes(state.category)){
+  const action=document.createElement('div');action.className='starter-collection-action';
+  action.innerHTML=`${starterAction(state.category)}`;
+  $('#shelf-content').before(action);
+ }
  $('#genre-filter').value=state.genre;$('#status-filter').value=state.status;$('#sort-filter').value=state.sort;renderShelfContents();
 }
 function filtered(){let list=entries().filter(x=>(state.category==='all'||categoryFor(x)===state.category)&&(state.status==='all'||(state.status==='forLater'?x.forLater:x.status===state.status))&&(state.genre==='all'||(state.genre==='missing'?!(x.genres||[]).length:(x.genres||[]).includes(state.genre)))&&(!state.favorites||x.favorite)&&`${x.title} ${x.creator}`.toLowerCase().includes(state.search.toLowerCase()));
  if(state.sort==='title')list.sort((a,b)=>a.title.localeCompare(b.title));if(state.sort==='rating')list.sort((a,b)=>b.rating-a.rating);if(state.sort==='recent')list.sort((a,b)=>(b.date||'').localeCompare(a.date||''));return list;}
 function empty(title,description,action='log'){return `<div class="empty-state"><span>✳</span><h2>${title}</h2><p>${description}</p><button class="button primary" data-action="${action}">${action==='reset'?'Clear filters':'Log something'} ${icon('plus')}</button></div>`;}
-function renderShelfContents(){const host=$('#shelf-content');if(!host)return;host.className='';const scrollPositions=new Map([...host.querySelectorAll('.shelf-rail')].map(rail=>[rail.dataset.category,rail.scrollLeft]));const list=filtered();if(!list.length){host.innerHTML=entries().length?empty('A little room to look around.','No items match these filters. Try a different search.','reset'):empty('Every shelf starts somewhere.','A favorite film. An ordinary day worth keeping. What will your first trace be?');return;}
+function renderShelfContents(){const host=$('#shelf-content');if(!host)return;host.className='';if(state.category==='tv'&&tvBrowse.scope==='browse'){renderTvBrowse(host);return;}const scrollPositions=new Map([...host.querySelectorAll('.shelf-rail')].map(rail=>[rail.dataset.category,rail.scrollLeft]));const list=filtered();if(!list.length){host.innerHTML=entries().length?empty('A little room to look around.','No items match these filters. Try a different search.','reset'):empty('Every shelf starts somewhere.','A favorite film. An ordinary day worth keeping. What will your first trace be?');return;}
  if(state.view==='list'){host.innerHTML=`<div class="entry-list">${list.map(listItem).join('')}</div>`;return;}
  if(state.category==='book'){renderBookRoom(host,list);return;}if(state.category==='album'){renderAlbumRoom(host,list);return;}if(state.category==='memory'){renderMemoryCalendar(host,list);return;}if(state.category==='movie'){renderMovieRoom(host,list);return;}if(state.category==='tv'){renderScreenRoom(host,list,'tv');return;}
  const groups=[['book','Books',''],['movie','Movies',''],['tv','TV shows',''],['album','Albums',''],['memory','Memories','']];
@@ -117,58 +306,175 @@ function updateShelfScroll(rail){const section=rail.closest('.shelf-row');if(!se
 function listItem(x,diary=false){return `<button class="list-entry" data-action="detail" data-id="${e(x.id)}">${diary?`<div class="diary-date">${x.date?`<b>${Number(x.date.slice(8))}</b>${new Date(x.date+'T12:00:00').toLocaleDateString('en-US',{weekday:'short'})}`:'—'}</div>`:''}<span class="list-thumb">${cover(x)}</span><div><h3>${e(x.title)}</h3><p>${e(x.creator)}${x.year?` · ${e(x.year)}`:''}</p>${diary&&x.notes?`<p class="diary-note">“${e(x.notes.slice(0,150))}”</p>`:''}</div><span class="type-badge">${singular[x.type]}</span><span class="list-rating">${e(statusLabel(x))}</span></button>`;}
 function renderBookRoom(host,list){host.className='room-books';const rows=bookRows(list,host.clientWidth,matchMedia('(max-width:760px)').matches?84:107);host.innerHTML=`<div class="room-caption"><span>${list.length} books</span><button class="text-button" data-action="log">Add a book +</button></div><div class="library-case cabinet">${rows.map((row,r)=>`<section class="book-row"><span class="library-row-label">${String(r+1).padStart(2,'0')}</span><div class="cabinet-stage">${row.map((x,i)=>roomCell(x,i,true)).join('')}</div><div class="library-plank"></div></section>`).join('')}</div>`;}
 function scoreSummary(scores,kind){
- if(kind==='movie'){const blend=filmConsensus(scores),single=blend.count===1?blend.sources[0]:null;return {...blend,label:single?single.source:'Trace score',display:single?single.value/single.max*10:blend.value,coverage:`${blend.count} of 4 sources · ${blend.count<2?'not blended':blend.count===4?'full blend':'partial blend'}`};}
- const blend=blendRatings(scores);return {...blend,label:blend.count===1?blend.sources[0].source:'Trace score',display:blend.value===null?null:blend.value*2,coverage:blend.count?blend.count+' source'+(blend.count===1?' · not blended':'s · blended'):'Not scored yet'};
+ const blend=mediaConsensus(scores,kind),single=blend.count===1?blend.sources[0]:null;
+ const total=(MEDIA_SCORE_SOURCES[kind]||[]).length;
+ return {...blend,label:single?single.source:'Trace score',display:single?single.value/single.max*10:blend.value,
+  coverage:`${blend.count} of ${total} sources · ${blend.count<2?'not blended':blend.count===total?'full blend':'partial blend'}`};
 }
 function traceBadge(scores,kind){const blend=scoreSummary(scores,kind);return `<span class="trace-score-badge ${blend.count===1?'single-source-badge':''}"><img class="trace-score-symbol" src="/assets/trace-icon.svg" alt="" width="22" height="22"><span class="trace-score-label">${e(blend.label)}</span><b>${blend.display===null?'—':blend.display.toFixed(1)}${blend.display===null?'':'<span class="trace-score-scale">/10</span>'}</b><small>${e(blend.coverage)}</small></span>`;}
-function scoreRow(row,metadata={}){const number=Number(row.value.toFixed(2)),native=row.source.startsWith('Rotten Tomatoes')?number+'%':number+' / '+row.max;const saved=metadata[row.via?.toLowerCase()];const savedText=saved?.fetchedAt?` · saved ${new Date(saved.fetchedAt*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})}${saved.stale?' · update pending':''}`:'';const content=`<span>${e(row.source)}${row.via?' · '+e(row.via):''}</span><b>${native}</b><small>${row.count===null?'Rating count unavailable':row.count.toLocaleString()+' ratings'}${e(savedText)}${/\/search(?:[/?]|$)/.test(row.url)?' · source search':''}</small>`;return row.url?`<a href="${e(row.url)}" target="_blank" rel="noopener noreferrer">${content}</a>`:`<div class="score-unlinked">${content}</div>`;}
+function scoreRow(row,metadata={}){const number=Number(row.value.toFixed(2)),native=row.source.startsWith('Rotten Tomatoes')?number+'%':number+' / '+row.max;const saved=metadata[(row.via||row.source).toLowerCase().replace(/\s/g,'')];const savedText=saved?.fetchedAt?` · saved ${new Date(saved.fetchedAt*1000).toLocaleDateString('en-US',{month:'short',day:'numeric'})}${saved.stale?' · update pending':''}`:'';const content=`<span>${e(row.source)}${row.via?' · '+e(row.via):''}</span><b>${native}</b><small>${row.count===null?'Rating count unavailable':row.count.toLocaleString()+' ratings'}${e(savedText)}${/\/search(?:[/?]|$)/.test(row.url)?' · source search':''}</small>`;return row.url?`<a href="${e(row.url)}" target="_blank" rel="noopener noreferrer">${content}</a>`:`<div class="score-unlinked">${content}</div>`;}
 function traceRatingPanel(scores,kind,status={},metadata={}){
- const blend=scoreSummary(scores,kind),film=kind==='movie';
- const rows=film?FILM_SCORE_SOURCES.map(name=>{const row=blend.sources.find(x=>x.source===name);return row?scoreRow(row,metadata):`<div class="score-missing"><span>${e(name)}</span><b>—</b><small>Not available</small></div>`}).join(''):blend.sources.map(row=>scoreRow(row,metadata)).join('');
- const formula=film?'The four sources each contribute 25% when all are available. IMDb stays on /10, Letterboxd is multiplied by 2, and each Rotten Tomatoes percentage is divided by 10. Missing sources are left out; available sources share the weight equally. At least two sources are needed for a Trace score. RT percentages measure approval, so this is a composite consensus score.': 'Available ratings are converted to /10. Known rating counts use log₁₀(count + 1) ÷ 4, capped between 0.2 and 1; sources without counts get weight 0.5. Each source counts once.';
+ const blend=scoreSummary(scores,kind),names=MEDIA_SCORE_SOURCES[kind]||[];
+ const rows=names.map(name=>{const row=blend.sources.find(x=>x.source===name);return row?scoreRow(row,metadata):`<div class="score-missing"><span>${e(name)}</span><b>—</b><small>Not available</small></div>`;}).join('');
  const unavailable=Object.values(status).some(x=>['unavailable','rate_limited','invalid_key'].includes(x));
- const notice=unavailable?'Some rating providers are temporarily unavailable. Available scores are shown.':film&&blend.count<4&&status.mdblist==='not_configured'?'Additional rating sources are not connected to this Trace server yet.':'';
- return `<details class="trace-rating-panel"><summary>${traceBadge(scores,kind)}</summary>${rows?`<div class="score-sources">${rows}</div>`:''}${film&&blend.other.length?`<div class="other-public-scores"><h4>Other scores · outside this blend</h4><div class="score-sources">${blend.other.map(row=>scoreRow(row,metadata)).join('')}</div></div>`:''}${notice?`<p class="score-notice">${notice}</p>`:''}<p>${formula} Your personal rating stays separate.</p>${!blend.count?'<p>No matching public scores yet. Check the correct release in Discover, or visit the other communities.</p>':''}</details>`;
+ const setup=kind==='book'&&status.googlebooks==='not_configured'?'Google Books ratings need a connection from the Trace server owner.':'';
+ const notice=unavailable?'Some rating providers are temporarily unavailable. Saved scores are shown.':status.mdblist==='not_configured'?'Additional screen rating sources are not connected to this Trace server yet.':'';
+ const formula='Available sources are converted to /10 and share the weight equally. At least two sources are needed for a Trace score. Missing sources are left out. Each community counts once.'+(kind==='movie'||kind==='tv'||kind==='anime'?' Rotten Tomatoes percentages measure approval, so this is a composite consensus score.':'');
+ return `<details class="trace-rating-panel"><summary>${traceBadge(scores,kind)}</summary><div class="score-sources">${rows}</div>${blend.other.length?`<div class="other-public-scores"><h4>Other public scores</h4><div class="score-sources">${blend.other.map(row=>scoreRow(row,metadata)).join('')}</div></div>`:''}${notice?`<p class="score-notice">${notice}</p>`:''}${setup?`<p class="score-notice">${setup}</p>`:''}<p>${formula} Your personal rating stays separate.</p>${!blend.count?'<p>No matching public scores yet. Choose the correct work in Discover to check its sources.</p>':''}</details>`;
 }
 function updateScorePanel(host,data,kind){const open=host.querySelector('details')?.open;host.innerHTML=traceRatingPanel(data.sources,kind,data.providerStatus,data.providerMeta);if(open)host.querySelector('details').open=true;}
+function ratingParams(item){
+ let externalId=item.externalId||'';
+ if(!externalId&&item.source==='TVmaze')externalId=String(item.sourceUrl||'').match(/tvmaze\.com\/shows\/(\d+)/)?.[1]||'';
+ if(!externalId&&item.source==='Apple Music')externalId=String(item.sourceUrl||'').match(/\/(\d+)(?:\?|$)/)?.[1]||'';
+ const isbn=item.isbn||String(item.sourceUrl||'').match(/\/isbn\/([0-9Xx-]+)/)?.[1]||'';
+ return new URLSearchParams({type:item.type,title:item.title,year:item.year||'',creator:item.creator||'',source:item.source||'',externalId,isbn,imdbId:item.imdbId||''});
+}
 async function refreshCatalogScores(host,items){
- const cards=[...host.querySelectorAll('.catalog-trace-score')],jobs=items.map((item,index)=>({item,card:cards[index]})).filter(({item})=>['movie','tv','anime'].includes(item.type)&&/^tt\d{5,12}$/.test(item.imdbId||''));let next=0;
- await Promise.all(Array.from({length:Math.min(2,jobs.length)},async()=>{while(next<jobs.length){const {item,card}=jobs[next++];if(!card?.isConnected)return;try{const params=new URLSearchParams({type:item.type,title:item.title,year:item.year||'',imdbId:item.imdbId});const response=await apiFetch('/api/ratings?'+params);if(!response.ok)throw Error();const data=await response.json();if(!card.isConnected)continue;item.publicScores=normalizePublicScores(data.sources);updateScorePanel(card,data,item.type);}catch{if(card.isConnected)card.insertAdjacentHTML('beforeend','<p class="source-hint">Additional scores could not be refreshed.</p>');}}}));
+ const cards=[...host.querySelectorAll('.catalog-trace-score')],jobs=items.map((item,index)=>({item,card:cards[index]})).filter(({item})=>item.type!=='memory').slice(0,12);let next=0;
+ await Promise.all(Array.from({length:Math.min(2,jobs.length)},async()=>{while(next<jobs.length){const {item,card}=jobs[next++];if(!card?.isConnected)return;try{const params=ratingParams(item);const response=await apiFetch('/api/ratings?'+params);if(!response.ok)throw Error();const data=await response.json();if(!card.isConnected)continue;item.publicScores=normalizePublicScores(data.sources);if(data.genres?.length){item.genres=normalizeGenres([...(item.genres||[]),...data.genres]);const chips=card.closest('.catalog-title')?.querySelector('.genre-chips');if(chips)chips.outerHTML=genreChips(item);}updateScorePanel(card,data,item.type);}catch{if(card.isConnected)card.insertAdjacentHTML('beforeend','<p class="source-hint">Additional scores could not be refreshed.</p>');}}}));
 }
 
 function elsewhere(item){const links=reviewLinks(item);return links.length?`<section class="elsewhere"><h4>Elsewhere</h4><p>Explore other communities’ reviews and details.</p><div>${links.map(x=>`<a href="${e(x.url)}" target="_blank" rel="noopener noreferrer">${e(x.label)} ↗</a>`).join('')}</div></section>`:'';}
 function genreChips(item){return (item.genres||[]).length?`<div class="genre-chips">${item.genres.slice(0,3).map(g=>`<span>${e(g)}</span>`).join('')}</div>`:'';}
 function renderMovieRoom(host,list){host.className='room-movie-columns';const visible=list.slice(0,state.movieLimit);const selected=list.find(x=>x.id===state.previewId);host.innerHTML=`<section class="screening-room cinema-room cinema-feature"><div class="screen-room-label"><span>TRACE CINEMA</span><span>${list.length} films</span></div><div class="screening-screen ${selected?'has-selection':''}">${selected?`<div class="screen-poster">${cover(selected)}</div><div class="screen-program"><span>${e(selected.year)} · ${e(selected.creator||'Film')}</span><h2>${e(selected.title)}</h2><p>${e((selected.description||'').slice(0,280))}</p><button class="button" data-action="open-entry" data-id="${e(selected.id)}">Open details ${icon('arrow')}</button></div>`:`<div class="screen-idle"><span>✦</span><h2>Choose tonight’s feature.</h2><p>Select a case or poster below to bring it onto the screen.</p></div>`}</div></section><section class="movie-library"><header class="movie-library-heading"><div><span class="calendar-kicker">THE FILM COLLECTION</span><h2>${list.length} films on your shelf</h2></div><div class="view-switch movie-mode" role="group" aria-label="Movie appearance"><button data-action="movie-mode" data-value="dvd" aria-pressed="${state.movieMode==='dvd'}" class="${state.movieMode==='dvd'?'active':''}">DVD cases</button><button data-action="movie-mode" data-value="poster" aria-pressed="${state.movieMode==='poster'}" class="${state.movieMode==='poster'?'active':''}">Posters</button></div></header><div class="movie-grid mode-${state.movieMode}">${visible.map(x=>{const selected=state.previewId===x.id;return `<article class="movie-card cabinet-cell face-cell ${selected?'is-preview':''}" data-orientation="face"><button class="movie-cover object-button" data-action="detail" data-id="${e(x.id)}" aria-label="${selected?'Open details for':'Preview'} ${e(x.title)}" aria-expanded="${selected}">${state.movieMode==='dvd'?artifact(x):cover(x)}</button><div class="movie-card-caption"><button data-action="detail" data-id="${e(x.id)}" class="title">${e(x.title)}</button><span>${e(x.year)}${x.creator?' · '+e(x.creator):''}</span><span class="rating">${e(statusLabel(x))}</span>${genreChips(x)}</div></article>`;}).join('')}</div>${visible.length<list.length?`<button class="button secondary movie-load-more" data-action="more-movies">Show 60 more · ${list.length-visible.length} remaining</button>`:''}</section>`;}
-function renderScreenRoom(host,list,kind){host.className='room-screen '+(kind==='tv'?'television-room':'cinema-room');const selected=list.find(x=>x.id===state.previewId);host.innerHTML=`<section class="screening-room cabinet"><div class="screen-room-label"><span>${kind==='tv'?'THE TV ROOM':'TRACE CINEMA'}</span><span>${list.length} ${kind==='tv'?'shows':'films'}</span></div><div class="screening-screen ${selected?'has-selection':''}">${selected?`<div class="screen-poster">${cover(selected)}</div><div class="screen-program"><span>${e(selected.year)} · ${e(selected.creator||singular[selected.type])}</span><h2>${e(selected.title)}</h2><p>${e((selected.description||selected.notes||'').slice(0,280))}</p><button class="button" data-action="open-entry" data-id="${e(selected.id)}">Open details ${icon('arrow')}</button></div>`:`<div class="screen-idle"><span>${kind==='tv'?'◯':'✦'}</span><h2>${kind==='tv'?'Pick a show. Settle in.':'Choose tonight’s feature.'}</h2><p>Select a case below to pull up its cover.</p></div>`}</div><div class="program-rail shelf-rail" role="group" aria-label="${kind==='tv'?'TV':'Movie'} cases" tabindex="0"><div class="cabinet-stage">${list.map((x,i)=>roomCell(x,i,true)).join('')}</div></div><div class="cinema-ledge"></div></section>`;}
+function renderScreenRoom(host,list,kind){host.className='room-screen '+(kind==='tv'?'television-room':'cinema-room');const selected=list.find(x=>x.id===state.previewId)||list[0];host.innerHTML=`<section class="screening-room cabinet"><div class="screen-room-label"><span>${kind==='tv'?'THE TV ROOM':'TRACE CINEMA'}</span><span>${list.length} ${kind==='tv'?'shows':'films'}</span></div><div class="screening-screen ${selected?'has-selection':''}">${selected?`<div class="screen-poster">${cover(selected)}</div><div class="screen-program"><span>${e(selected.year)} · ${e(selected.creator||singular[selected.type])}</span><h2>${e(selected.title)}</h2><p>${e((selected.description||selected.notes||'').slice(0,280))}</p><button class="button" data-action="open-entry" data-id="${e(selected.id)}">Open details ${icon('arrow')}</button></div>`:`<div class="screen-idle"><span>${kind==='tv'?'◯':'✦'}</span><h2>${kind==='tv'?'Pick a show. Settle in.':'Choose tonight’s feature.'}</h2><p>Select a case below to pull up its cover.</p></div>`}</div><div class="program-rail shelf-rail" role="group" aria-label="${kind==='tv'?'TV':'Movie'} cases" tabindex="0"><div class="cabinet-stage">${list.map((x,i)=>roomCell(x,i,true)).join('')}</div></div><div class="cinema-ledge"></div></section>`;const selectedCase=host.querySelector('.cabinet-cell.is-preview');if(selectedCase)host.querySelector('.program-rail').scrollLeft=Math.max(0,selectedCase.offsetLeft-24);}
+function renderTvBrowse(host){
+ host.className='room-screen television-room tv-browse';
+ const selected=tvBrowse.items.find(x=>x.id===tvBrowse.previewId)||tvBrowse.items[0];
+ const visible=tvBrowse.items.filter(x=>`${x.title} ${x.creator}`.toLocaleLowerCase().includes(tvBrowse.query.toLocaleLowerCase())&&(!tvBrowse.genre||(x.genres||[]).includes(tvBrowse.genre)));
+ host.innerHTML=`<form id="tv-browse-search" class="discover-search"><label class="field"><span class="sr-only">Search TV shows</span><input type="search" name="query" value="${e(tvBrowse.query)}" placeholder="Find a show, wherever it’s from…" maxlength="200"></label><label class="field"><span class="sr-only">TV genre</span><select name="genre" aria-label="TV browse genre"><option value="">All genres</option>${tvBrowse.genres.map(g=>`<option ${g===tvBrowse.genre?'selected':''} value="${e(g)}">${e(g)}</option>`).join('')}</select></label><button type="submit" class="button primary">Find shows</button></form>
+ <section class="screening-room"><div class="screen-room-label"><span>THE TV ROOM</span><span>${tvBrowse.total} shows to explore</span></div><div class="screening-screen">${selected?`<div class="screen-poster">${cover(selected)}</div><div class="screen-program"><span>${e(selected.year)} · ${e(selected.creator)}</span><h2 dir="auto">${e(selected.title)}</h2><p>${e((selected.description||'').slice(0,220))}</p><button class="button" data-action="tv-catalog-detail" data-id="${e(selected.id)}">Details & ratings</button><button class="text-button" data-action="tv-catalog-add" data-id="${e(selected.id)}">Add to shelf +</button></div>`:'<div class="screen-idle"><span>◯</span><h2>Find your next familiar world.</h2><p>Choose a show below. Select it again for details and ratings.</p></div>'}</div></section>
+ ${tvBrowse.error?`<p class="source-hint">${e(tvBrowse.error)}</p>`:''}<div class="movie-grid mode-dvd tv-browse-grid">${visible.map(item=>`<article class="movie-card cabinet-cell face-cell ${item.id===tvBrowse.previewId?'is-preview':''}"><button class="movie-cover object-button" data-action="tv-catalog-preview" data-id="${e(item.id)}" aria-label="${item.id===tvBrowse.previewId?'Open details for':'Preview'} ${e(item.title)}">${artifact(item)}</button><div class="movie-card-caption"><button class="title" data-action="tv-catalog-detail" data-id="${e(item.id)}" dir="auto">${e(item.title)}</button><span>${e(item.year)} · ${e(item.creator)}</span>${genreChips(item)}<button class="text-button" data-action="tv-catalog-add" data-id="${e(item.id)}">Add to shelf +</button></div></article>`).join('')}</div>${!visible.length?'<p class="source-hint">No shows match this search. Try another title or genre.</p>':''}<div class="feed-pagination">${tvBrowse.page?'<button class="button secondary" data-action="tv-page" data-value="-1">← Previous shows</button>':''}${tvBrowse.hasMore?'<button class="button secondary" data-action="tv-page" data-value="1">More shows →</button>':''}</div>`;
+ if(!tvBrowse.loaded)loadTvBrowse();
+}
+async function loadTvBrowse(){
+ const sequence=++tvBrowse.sequence;tvBrowse.loaded=true;
+ try{
+  const params=new URLSearchParams({type:'tv',q:tvBrowse.query,genre:tvBrowse.genre,page:tvBrowse.page});
+  const response=await apiFetch('/api/catalog?'+params);const data=await response.json();
+  if(!response.ok)throw Error();if(sequence!==tvBrowse.sequence)return;
+  tvBrowse.items=(data.items||[]).map((item,i)=>({...item,id:`tv-catalog-${tvBrowse.page}-${i}`}));
+  tvBrowse.total=data.total;tvBrowse.hasMore=data.hasMore;tvBrowse.genres=data.genres||[];tvBrowse.error='';
+ }catch{if(sequence===tvBrowse.sequence)tvBrowse.error='Showing the starter selection. Connect to Trace to browse more shows.';}
+ if(sequence===tvBrowse.sequence&&state.page==='shelf'&&state.category==='tv'&&tvBrowse.scope==='browse')renderShelfContents();
+}
+function tvCatalogDraft(id){
+ const item=tvBrowse.items.find(x=>x.id===id);if(!item)return;
+ entryDraft={...item,id:uid(),rating:0,status:'want',date:'',notes:'',history:[],addedAt:new Date().toISOString()};
+ if(detailDialog.open)detailDialog.close();renderEntryForm();logDialog.showModal();
+}
+main.addEventListener('submit',ev=>{
+ if(ev.target.id!=='tv-browse-search')return;ev.preventDefault();
+ tvBrowse.query=ev.target.elements.query.value.trim();tvBrowse.genre=ev.target.elements.genre.value;tvBrowse.page=0;tvBrowse.previewId=null;loadTvBrowse();
+});
 function renderAlbumRoom(host,list){host.className='room-albums';const index=((state.wheelIndex%list.length)+list.length)%list.length;state.wheelIndex=index;host.innerHTML=`<section class="jukebox cabinet"><div class="jukebox-label"><span>THE LISTENING ROOM</span><span>${list.length} albums · 33⅓</span></div><div class="jukebox-arch"><span></span><span></span><span></span></div><div class="jukebox-wheel">${wheelItems(list,index).map(({item,offset})=>`<div class="wheel-position" style="--offset:${offset};--distance:${Math.abs(offset)}">${roomCell(item,0,false)}</div>`).join('')}</div><div class="jukebox-controls"><button class="wheel-turn" data-action="wheel" data-value="-1" aria-label="Previous album">←</button><label class="album-dial"><span>TURN THE DIAL</span><input id="album-dial" type="range" min="0" max="${list.length-1}" step="1" value="${index}" aria-label="Choose album"></label><button class="wheel-turn" data-action="wheel" data-value="1" aria-label="Next album">→</button></div><p class="jukebox-hint">${state.previewId?'Select the cover again for details and ratings.':'Select a sleeve to reveal the album.'}</p></section>`;}
 function renderMemoryCalendar(host,list){host.className='room-memories';const dates=list.filter(x=>x.date).map(x=>x.date).sort().reverse();if(!state.calendarMonth)state.calendarMonth=dates[0]?.slice(0,7)||today().slice(0,7);const month=state.calendarMonth;const monthDates=dates.filter(x=>x.startsWith(month));if(!state.calendarDay?.startsWith(month))state.calendarDay=monthDates[0]||(month===today().slice(0,7)?today():month+'-01');const selected=list.filter(x=>x.date===state.calendarDay),undated=list.filter(x=>!x.date);host.innerHTML=`<section class="memory-calendar"><header><div><span class="calendar-kicker">MEMORIES</span><h2>${e(monthLabel(month))}</h2></div><div class="calendar-controls"><button data-action="calendar-month" data-value="-1" aria-label="Previous month">←</button><button data-action="calendar-today">Today</button><button data-action="calendar-month" data-value="1" aria-label="Next month">→</button></div></header><div class="calendar-weekdays">${['Mon','Tue','Wed','Thu','Fri','Sat','Sun'].map(d=>`<span>${d}</span>`).join('')}</div><div class="calendar-grid">${calendarDays(month).map(day=>{const memories=list.filter(x=>x.date===day.date);return `<button class="calendar-day ${day.inMonth?'':'outside-month'} ${day.date===state.calendarDay?'selected':''} ${day.date===today()?'today':''}" data-action="calendar-day" data-value="${day.date}" aria-label="${day.date}, ${memories.length} ${memories.length===1?'memory':'memories'}" aria-pressed="${day.date===state.calendarDay}"><span>${day.day}</span>${memories.length?`<div class="calendar-photo">${memories[0].image?`<img src="${e(imageUrl(memories[0].image))}" alt="" loading="lazy">`:'<span>✧</span>'}</div><small>${memories.length===1?'1 memory':memories.length+' memories'}</small>`:''}</button>`;}).join('')}</div></section><section class="calendar-day-story"><header><h3>${e(new Date(state.calendarDay+'T12:00:00').toLocaleDateString('en-US',{month:'long',day:'numeric'}))}</h3><button class="button secondary" data-action="memory-on-day" ${state.calendarDay>today()?'disabled':''}>Add memory +</button></header><div class="day-memory-cards">${selected.map(x=>`<button data-action="open-entry" data-id="${e(x.id)}" class="day-memory-card">${x.image?`<img src="${e(imageUrl(x.image))}" alt="">`:''}<strong dir="auto">${e(x.title)}</strong><p>${e(x.notes||'')}</p><span>${x.attachments?.length?x.attachments.length+' attached':''}</span></button>`).join('')||'<p class="calendar-empty">No memories on this day yet.</p>'}</div></section>${undated.length?`<section class="undated-memories"><h3>Undated</h3>${undated.map(x=>listItem(x)).join('')}</section>`:''}`;}
 
 function diaryPage(){const all=chapters(entries());if(!all.length){main.innerHTML=heading('Diary','A chapter for the things you keep.')+empty('Your first chapter.','Log a title or add a memory to begin.');return;}const index=Math.max(0,all.findIndex(x=>x.month===state.chapterMonth));const chapter=all[index];state.chapterMonth=chapter.month;
  main.innerHTML=heading('Diary','Your collection, in chapters.')+`<div class="chapter-navigation"><button class="button secondary" data-action="chapter" data-value="${all[Math.max(0,index-1)].month}" ${index===0?'disabled':''}>← Newer</button><span>Chapter ${chapter.number} of ${all.length}</span><button class="button secondary" data-action="chapter" data-value="${all[Math.min(all.length-1,index+1)].month}" ${index===all.length-1?'disabled':''}>Older →</button></div><article class="journal-chapter"><div class="journal-spine"></div><header><span class="chapter-kicker">CHAPTER ${String(chapter.number).padStart(2,'0')}</span><h2>${e(chapter.title)}</h2><p>${chapter.entries.length} entries</p></header><div class="journal-entries">${chapter.entries.map(x=>listItem(x,true)).join('')}</div><footer>trace. <span>${chapter.number}</span></footer></article>${sampleStrip()}`;
 }
+const ALBUM_GENRE_CHOICES=['Alternative','Rock','Pop','Hip-Hop','R&B','Soul','Jazz','Blues','Electronic','Dance','Ambient','Experimental','Folk','Country','Classical','Metal','Punk','Reggae','Latin','Afrobeat','Afrobeats','Highlife','Soukous','Raï','Chaâbi','Gnawa','Desert Blues','Arabic Pop'];
 const catalogState={kind:'movie',query:'',genre:'',page:0,mode:'browse',items:[],response:{},sequence:0};
-function discoverPage(){main.innerHTML=heading('Discover','Follow a title. Find your next favorite.')+`<form id="discover-search" class="discover-search"><label class="field"><span class="sr-only">Catalog category</span><select id="discover-kind" aria-label="Catalog category">${['movie','tv','anime','book','album'].map(k=>`<option value="${k}" ${catalogState.kind===k?'selected':''}>${TYPES[k]}</option>`).join('')}</select></label><label class="field"><span class="sr-only">Search catalogs</span><input name="query" dir="auto" type="search" value="${e(catalogState.query)}" maxlength="200" placeholder="A title, an author, an artist…"></label><button class="button primary" type="submit">Search</button></form><div class="catalog-toolbar"><button class="text-button" data-action="browse-catalog">Browse saved catalog ↗</button><label>Genre <select id="catalog-genre" aria-label="Catalog genre"><option value="">All genres</option></select></label></div><p class="catalog-explanation">Search real catalogs for films, TV, books, and albums. Found titles are saved here with their sources; your private ratings and notes stay on your shelf.</p><div id="catalog-results-view" aria-live="polite"></div>`;loadCatalog();}
-async function loadCatalog(){const sequence=++catalogState.sequence,host=$('#catalog-results-view');if(!host)return;host.innerHTML='<p class="source-hint">Looking through the catalog…</p>';const button=$('#discover-search [type="submit"]');button.disabled=true;try{const params=new URLSearchParams(catalogState.mode==='search'?{type:catalogState.kind,q:catalogState.query}:{type:catalogState.kind,q:catalogState.query,genre:catalogState.genre,page:String(catalogState.page)});const response=await apiFetch((catalogState.mode==='search'?'/api/search?':'/api/catalog?')+params);const data=await response.json();if(!response.ok)throw Error(data.error||'Catalog unavailable.');if(sequence!==catalogState.sequence||!host.isConnected)return;catalogState.items=data.items||[];const genres=[...new Set(data.genres||catalogState.items.flatMap(x=>x.genres||[]))].sort();const filter=$('#catalog-genre');filter.innerHTML='<option value="">All genres</option>'+genres.map(g=>`<option value="${e(g)}">${e(g)}</option>`).join('');filter.value=catalogState.genre;catalogState.response=data;renderCatalogItems(data);}catch(err){if(sequence===catalogState.sequence&&host.isConnected)host.innerHTML=`<p class="error-message" role="alert">${e(err instanceof TypeError?(window.TraceNative?"Cannot reach Trace’s server. Check your connection and try again.":"Cannot reach Trace’s local server. Start it with python3 server.py 5173, then try your search again."):err.message)}</p><button class="text-button" data-action="catalog-manual">Add a title yourself +</button>`;}finally{if(button.isConnected)button.disabled=false;}}
+function discoverPage(){main.innerHTML=heading('Discover','Follow a title. Find your next favorite.')+`<form id="discover-search" class="discover-search"><label class="field"><span class="sr-only">Catalog category</span><select id="discover-kind" aria-label="Catalog category">${['movie','tv','anime','book','album'].map(k=>`<option value="${k}" ${catalogState.kind===k?'selected':''}>${TYPES[k]}</option>`).join('')}</select></label><label class="field"><span class="sr-only">Search catalogs</span><input name="query" dir="auto" type="search" value="${e(catalogState.query)}" maxlength="200" placeholder="Title, creator, or book ISBN…"></label><button class="button primary" type="submit">Search</button></form><div class="catalog-toolbar"><button class="text-button" data-action="browse-catalog">Browse saved catalog ↗</button><label>Genre <select id="catalog-genre" aria-label="Catalog genre"><option value="">All genres</option></select></label></div><p class="catalog-explanation">Search real catalogs for films, TV, books, and albums. Found titles are saved here with their sources; your private ratings and notes stay on your shelf.</p><div id="catalog-results-view" aria-live="polite"></div>`;loadCatalog();}
+function catalogStarters(){return starterResults(COLLECTION_STARTERS[catalogState.kind]||[],catalogState);}
+function showCatalogStarters(items,message){
+ catalogState.items=items;
+ catalogState.response={local:true,total:items.length,warnings:[message]};
+ renderCatalogItems();
+}
+async function loadCatalog(){
+ const sequence=++catalogState.sequence,host=$('#catalog-results-view');if(!host)return;
+ const starters=catalogStarters(),currentGenre=$('#catalog-genre');
+ const initialGenres=catalogState.kind==='album'?ALBUM_GENRE_CHOICES:[...new Set((COLLECTION_STARTERS[catalogState.kind]||[]).flatMap(x=>x.genres||[]))].sort();
+ currentGenre.innerHTML='<option value="">All genres</option>'+initialGenres.map(g=>`<option value="${e(g)}">${e(g)}</option>`).join('');
+ if(catalogState.genre&&!Array.from(currentGenre.options).some(x=>x.value===catalogState.genre))currentGenre.add(new Option(catalogState.genre,catalogState.genre));
+ currentGenre.value=catalogState.genre;
+ if(starters.length)showCatalogStarters(starters,'Starter selection · checking the full catalog…');
+ else{catalogState.items=[];catalogState.response={};host.innerHTML='<p class="source-hint">Looking through the catalog…</p>';}
+ const button=$('#discover-search [type="submit"]');button.disabled=true;
+ try{
+  const params=new URLSearchParams(catalogState.mode==='search'?{type:catalogState.kind,q:catalogState.query,genre:catalogState.genre}:{type:catalogState.kind,q:catalogState.query,genre:catalogState.genre,page:String(catalogState.page)});
+  const response=await apiFetch((catalogState.mode==='search'?'/api/search?':'/api/catalog?')+params),data=await response.json();
+  if(!response.ok)throw Error(data.error||'Catalog unavailable.');
+  if(sequence!==catalogState.sequence||!host.isConnected)return;
+  catalogState.items=data.items||[];
+  const choices=[...(data.genres||catalogState.items.flatMap(x=>x.genres||[])),...(data.suggestedGenres||[])];
+  const genres=[...new Map(choices.map(g=>[g.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/-/g,' '),g])).values()].sort();
+  if(catalogState.genre&&!genres.includes(catalogState.genre))genres.push(catalogState.genre);
+  const filter=$('#catalog-genre');filter.innerHTML='<option value="">All genres</option>'+genres.map(g=>`<option value="${e(g)}">${e(g)}</option>`).join('');filter.value=catalogState.genre;
+  if(!catalogState.items.length&&starters.length){showCatalogStarters(starters,'These starter titles are ready to add. The full catalog returned no matching titles.');return;}
+  catalogState.response=data;renderCatalogItems(data);
+ }catch(err){
+  if(sequence!==catalogState.sequence||!host.isConnected)return;
+  const message=err instanceof TypeError?(window.TraceNative?"Cannot reach Trace’s server. Check your connection and try again.":"Cannot reach Trace’s local server. Start it with python3 server.py 5173, then try your search again."):err.message;
+  if(starters.length)showCatalogStarters(starters,'Showing matching starter titles. '+message);
+  else host.innerHTML=`<p class="error-message" role="alert">${e(message)}</p><button class="button secondary" data-action="catalog-retry">Try again</button><button class="text-button" data-action="catalog-manual">Add a title yourself +</button>`;
+ }finally{if(button.isConnected&&sequence===catalogState.sequence)button.disabled=false;}
+}
 function catalogSourceLinks(item){const rows=[{source:item.source,sourceUrl:item.sourceUrl},...(Array.isArray(item.catalogSources)?item.catalogSources:[])],seen=new Set();return rows.filter(row=>{const url=safeUrl(row?.sourceUrl);if(!/^https?:\/\//.test(url)||seen.has(url))return false;seen.add(url);return true;}).slice(0,3).map(row=>`<a class="catalog-source" href="${e(safeUrl(row.sourceUrl))}" target="_blank" rel="noopener noreferrer">${e(row.source||'Original source')} ↗</a>`).join(' ');}
-function renderCatalogItems(data=catalogState.response){const host=$('#catalog-results-view');if(!host)return;const items=catalogState.mode==='search'&&catalogState.genre?catalogState.items.filter(x=>(x.genres||[]).includes(catalogState.genre)):catalogState.items;const count=catalogState.mode==='browse'?(data.total??items.length):items.length;host.innerHTML=`<div class="catalog-count">${count} ${catalogState.mode==='browse'?'saved title':'result'}${count===1?'':'s'}${data.provider?' · '+e(data.provider):''}${data.cached?' · saved catalog result':''}${data.stale?' · provider is temporarily unavailable':''}</div>${(data.warnings||[]).map(message=>`<p class="source-hint">${e(message)}</p>`).join('')}${items.length?`<div class="discover-grid">${items.map(item=>{const index=catalogState.items.indexOf(item);return `<article class="catalog-title type-${e(item.type)}"><button class="catalog-cover" data-action="catalog-pick" data-value="${index}" aria-label="Add ${e(item.title)} to your shelf">${cover(item)}</button><h2 dir="auto">${e(item.title)}</h2><p dir="auto">${e(item.creator)}${item.year?' · '+e(item.year):''}</p>${genreChips(item)}<div class="catalog-trace-score">${traceRatingPanel(item.publicScores,item.type)}</div><button class="text-button" data-action="catalog-pick" data-value="${index}">Add to shelf +</button>${catalogSourceLinks(item)}</article>`;}).join('')}</div>`:'<div class="circle-empty"><h2>A little room for discovery.</h2><p>Search above to bring real titles and their details into the catalog.</p></div>'}<div class="feed-pagination">${catalogState.page?'<button class="button secondary" data-action="catalog-page" data-value="-1">← Previous</button>':''}${data.hasMore?'<button class="button secondary" data-action="catalog-page" data-value="1">Next titles →</button>':''}</div>`;refreshCatalogScores(host,items);}
-main.addEventListener('submit',ev=>{if(ev.target.id==='discover-search'){ev.preventDefault();catalogState.query=ev.target.elements.query.value.trim();catalogState.mode=catalogState.query?'search':'browse';catalogState.genre='';catalogState.page=0;loadCatalog();}});
-main.addEventListener('change',ev=>{if(ev.target.id==='discover-kind'){catalogState.kind=ev.target.value;catalogState.genre='';catalogState.page=0;loadCatalog();}if(ev.target.id==='catalog-genre'){catalogState.genre=ev.target.value;catalogState.page=0;if(catalogState.mode==='browse')loadCatalog();else renderCatalogItems();}});
-main.addEventListener('click',ev=>{const button=ev.target.closest('[data-action]');if(!button)return;const {action,value}=button.dataset;if(action==='browse-catalog'){catalogState.mode='browse';catalogState.query='';catalogState.genre='';catalogState.page=0;$('#discover-search').elements.query.value='';loadCatalog();}if(action==='catalog-page'){catalogState.page=Math.max(0,catalogState.page+Number(value));loadCatalog();}if(action==='catalog-pick'){const item=catalogState.items[Number(value)];if(item){entryDraft={...item,id:uid(),rating:0,date:'',status:'want',notes:'',history:[],addedAt:new Date().toISOString()};renderEntryForm();logDialog.showModal();}}if(action==='catalog-manual')openLog(catalogState.kind);});
+function renderCatalogItems(data=catalogState.response){const host=$('#catalog-results-view');if(!host)return;const items=catalogState.mode==='search'&&catalogState.genre&&catalogState.kind!=='album'?catalogState.items.filter(x=>(x.genres||[]).includes(catalogState.genre)):catalogState.items;const count=catalogState.mode==='browse'?(data.total??items.length):items.length;host.innerHTML=`<div class="catalog-count">${count} ${data.local?'starter title':catalogState.mode==='browse'?'saved title':'result'}${count===1?'':'s'}${data.provider?' · '+e(data.provider):''}${data.cached?' · saved catalog result':''}${data.stale?' · provider is temporarily unavailable':''}</div>${(data.warnings||[]).map(message=>`<p class="source-hint">${e(message)}</p>`).join('')}${items.length?`<div class="discover-grid">${items.map(item=>{const index=catalogState.items.indexOf(item);return `<article class="catalog-title type-${e(item.type)}"><button class="catalog-cover" data-action="catalog-pick" data-value="${index}" aria-label="Add ${e(item.title)} to your shelf">${cover(item)}</button><h2 dir="auto">${e(item.title)}</h2><p dir="auto">${e(item.creator)}${item.year?' · '+e(item.year):''}</p>${genreChips(item)}<div class="catalog-trace-score">${traceRatingPanel(item.publicScores,item.type)}</div><button class="text-button" data-action="catalog-pick" data-value="${index}">Add to shelf +</button>${catalogSourceLinks(item)}</article>`;}).join('')}</div>`:'<div class="circle-empty"><h2>A little room for discovery.</h2><p>Search above to bring real titles and their details into the catalog.</p></div>'}<div class="feed-pagination">${catalogState.page&&!data.local?'<button class="button secondary" data-action="catalog-page" data-value="-1">← Previous</button>':''}${data.hasMore?'<button class="button secondary" data-action="catalog-page" data-value="1">Next titles →</button>':''}${data.local?'<button class="button secondary" data-action="catalog-retry">Check full catalog</button>':''}</div>`;if(!data.local)refreshCatalogScores(host,items);}
+main.addEventListener('submit',ev=>{if(ev.target.id==='discover-search'){ev.preventDefault();catalogState.query=ev.target.elements.query.value.trim();catalogState.mode=catalogState.query||catalogState.kind==='album'&&catalogState.genre?'search':'browse';if(catalogState.kind!=='album')catalogState.genre='';catalogState.page=0;loadCatalog();}});
+main.addEventListener('change',ev=>{if(ev.target.id==='discover-kind'){catalogState.kind=ev.target.value;catalogState.genre='';catalogState.page=0;loadCatalog();}if(ev.target.id==='catalog-genre'){catalogState.genre=ev.target.value;catalogState.page=0;if(catalogState.kind==='album'){catalogState.query=$('#discover-search').elements.query.value.trim();catalogState.mode=catalogState.query||catalogState.genre?'search':'browse';loadCatalog();return;}if(catalogState.mode==='browse')loadCatalog();else renderCatalogItems();}});
+main.addEventListener('click',ev=>{const button=ev.target.closest('[data-action]');if(!button)return;const {action,value}=button.dataset;if(action==='browse-catalog'){catalogState.mode='browse';catalogState.query='';catalogState.genre='';catalogState.page=0;$('#discover-search').elements.query.value='';loadCatalog();}if(action==='catalog-page'){catalogState.page=Math.max(0,catalogState.page+Number(value));loadCatalog();}if(action==='catalog-pick'){const item=catalogState.items[Number(value)];if(item){entryDraft={...item,id:uid(),rating:0,date:'',status:'want',notes:'',history:[],addedAt:new Date().toISOString()};renderEntryForm();logDialog.showModal();}}if(action==='catalog-retry')loadCatalog();if(action==='catalog-manual')openLog(catalogState.kind);});
 function importsPage(){main.innerHTML=heading('Connections','Bring your public profiles into Trace.','No need to<br>start from scratch.<br><span>↙</span>')+
  libraryAccountPanel()+connectionsPanel()+`<details class="advanced-import"><summary>Import a full history or restore a backup</summary><p class="import-intro">Bring your ratings, notes, dates, and saved lists into one place. Your files are read in this browser. Preview everything before adding it to your shelf.</p>
- <div class="import-options"><article class="import-provider"><div class="provider-logo letterboxd-dots" aria-hidden="true"><i></i><i></i><i></i></div><h2>Letterboxd</h2><p>Open Settings → Data → Export your data. Unzip the download and choose diary.csv, ratings.csv, reviews.csv, watched.csv, or watchlist.csv. You can select several CSVs together.</p><a href="https://letterboxd.com/settings/data/" target="_blank" rel="noopener noreferrer">Open Letterboxd export ↗</a></article>
- <article class="import-provider"><div class="provider-logo" aria-hidden="true">goodreads</div><h2>Goodreads</h2><p>On the Goodreads website, go to My Books → Import and export → Export Library. Upload the CSV to bring your books, shelves, ratings, and reviews.</p><a href="https://www.goodreads.com/review/import" target="_blank" rel="noopener noreferrer">Open Goodreads export ↗</a></article></div>
- <div class="import-toolbar"><label for="import-source">Import from</label><select id="import-source"><option value="auto">Detect automatically</option><option value="letterboxd">Letterboxd</option><option value="goodreads">Goodreads</option><option value="imdb">IMDb ratings</option><option value="generic">Another service / Trace CSV</option></select><button class="text-button" data-action="csv-template">Download CSV template</button><button class="text-button" data-action="backup">Back up my collection</button></div>
- <label class="upload-area">${icon('upload')}<strong>Give your collection a new home</strong><span>Choose CSV files or a Trace JSON backup · up to 10 MB per file</span><input id="import-file" type="file" accept=".csv,.json,text/csv,application/json" multiple aria-label="Choose collection files"></label>
- <div id="import-feedback">${importFeedback()}</div><p class="import-help">Duplicates are matched by category, title, and year, with creator details when available. Existing ratings and notes are kept; missing details and diary dates are filled in. Undated imports stay undated. ZIP files must be extracted first.<br>Albums, memories, or exports from another service? Match the columns in the CSV template. Public feeds can omit older or private entries; exports remain available for a complete history.</p></details>`;$('#import-source').value=state.importSource;}
+ <div class="import-options"><article class="import-provider"><div class="provider-logo letterboxd-dots" aria-hidden="true"><i></i><i></i><i></i></div><h2>Letterboxd</h2><p>Open Settings → Data → Export your data. Choose the ZIP download or select diary.csv, ratings.csv, reviews.csv, watched.csv, and watchlist.csv together.</p><a href="https://letterboxd.com/settings/data/" target="_blank" rel="noopener noreferrer">Open Letterboxd export ↗</a></article>
+ <article class="import-provider"><div class="provider-logo" aria-hidden="true">goodreads</div><h2>Goodreads</h2><p>On the Goodreads website, go to My Books → Import and export → Export Library. Upload the CSV to bring your books, shelves, ratings, and reviews.</p><a href="https://www.goodreads.com/review/import" target="_blank" rel="noopener noreferrer">Open Goodreads export ↗</a></article>
+ <article class="import-provider"><div class="provider-logo" aria-hidden="true">Discogs</div><h2>Discogs</h2><p>Export your Collection as CSV. Trace imports albums and their ratings as saved items with no listening date.</p><a href="https://www.discogs.com/users/export" target="_blank" rel="noopener noreferrer">Open Discogs export ↗</a></article></div>
+ <div class="import-toolbar"><label for="import-source">Import from</label><select id="import-source"><option value="auto">Detect automatically</option><option value="letterboxd">Letterboxd</option><option value="goodreads">Goodreads</option><option value="imdb">IMDb ratings</option><option value="discogs">Discogs collection</option><option value="generic">Another service / Trace CSV</option></select><button class="text-button" data-action="csv-template">Download CSV template</button><button class="text-button" data-action="backup">Back up my collection</button></div>
+ <label class="upload-area">${icon('upload')}<strong>Give your collection a new home</strong><span>Choose a Letterboxd ZIP, CSV files, or Trace JSON · up to 10 MB per file</span><input id="import-file" type="file" accept=".zip,.csv,.json,application/zip,text/csv,application/json" multiple aria-label="Choose collection files"></label>
+ <div id="import-feedback">${importFeedback()}</div><p class="import-help">Trace checks source IDs, then compares title, year, and creator when available. Imports keep existing ratings and notes. Viewing dates stay blank when the export does not include one.<br>Albums, memories, or exports from another service? Match the columns in the CSV template. Public feeds can omit older or private entries; exports remain available for a complete history.</p></details>`;$('#import-source').value=state.importSource;}
 function connectionsPanel(){return `<p class="connection-intro">Link a public profile to import available ratings, notes, and dates. Trace keeps your existing ratings and notes.</p><div class="connection-grid">${[['letterboxd','Letterboxd','Username or profile URL','letterboxd.com/yourname'],['goodreads','Goodreads','Profile URL or user ID','goodreads.com/user/show/12345']].map(([service,name,label,placeholder])=>{const saved=connections[service];return `<section class="connection-card"><header><h2>${name}</h2><span class="connection-state">${saved?'Public profile linked':'Not linked'}</span></header><form data-connect-service="${service}"><label class="field"><span>${label}</span><input name="profile" required maxlength="200" value="${e(saved?.profileUrl||'')}" placeholder="${placeholder}"></label><button class="button primary" type="submit">${saved?'Refresh profile':'Link profile'}</button>${saved?`<button class="text-button" type="button" data-action="unlink-profile" data-value="${service}">Unlink</button>`:''}</form>${saved?`<p class="connection-last">${saved.count} feed entries · Updated ${e(new Date(saved.syncedAt).toLocaleDateString())}<br><a href="${e(safeUrl(saved.profileUrl))}" target="_blank" rel="noopener noreferrer">Open public profile ↗</a></p>`:''}<div data-connection-feedback="${service}">${connectionErrors[service]?`<p class="error-message" role="alert">${e(connectionErrors[service])}</p>`:''}</div></section>`;}).join('')}</div><p class="connection-limit">Public feeds import recent entries and reviews. For every Letterboxd rating, import ratings.csv from your full export. Posting edits back to Letterboxd needs approved API access and OAuth; it is not enabled by a profile link.</p>`;}
 async function connectProfile(service,profile,button=null,quiet=false){delete connectionErrors[service];if(button){button.disabled=true;button.textContent='Connecting…';}const feedback=document.querySelector(`[data-connection-feedback="${service}"]`);if(feedback)feedback.textContent='';try{
- const response=await apiFetch('/api/profile-connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service,profile})});const data=await response.json();if(!response.ok)throw Error(data.error||'Could not read this public profile.');const incoming=validateEntries(data.items);const merged=mergeEntries(collection.started?collection.entries:[],incoming);if(!await persist({started:true,entries:merged.entries}))return;connections[service]={identifier:data.identifier,profileUrl:data.profileUrl,count:data.items.length,syncedAt:new Date().toISOString()};try{localStorage.setItem(preferenceKey('connections'),JSON.stringify(connections));}catch{notify('Entries imported, but the profile connection could not be saved.');return;}if(!quiet)notify(`Profile linked. ${merged.added} entries added, ${merged.merged} enriched.`);render();
+ const response=await apiFetch('/api/profile-connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({service,profile})});const data=await response.json();if(!response.ok)throw Error(data.error||'Could not read this public profile.');const incoming=validateEntries(data.items);const merged=mergeEntries(collection.started?collection.entries:[],incoming);if(!await persist({started:true,entries:merged.entries}))return;connections[service]={identifier:data.identifier,profileUrl:data.profileUrl,count:data.items.length,syncedAt:new Date().toISOString()};try{localStorage.setItem(preferenceKey('connections'),JSON.stringify(connections));}catch{notify('Entries imported, but the profile connection could not be saved.');return;}if(!quiet)notify(`Profile linked. ${merged.added} entries added, ${merged.merged} enriched.`);render();scheduleCoverBackfill(1500);
  }catch(err){if(!quiet){connectionErrors[service]=err.message;const currentFeedback=document.querySelector(`[data-connection-feedback="${service}"]`);if(currentFeedback)currentFeedback.innerHTML=`<p class="error-message" role="alert">${e(err.message)}</p>`;else notify(err.message);}}finally{if(button){button.disabled=false;button.textContent=connections[service]?'Refresh profile':'Link profile';}}}
 main.addEventListener('submit',ev=>{const form=ev.target.closest('[data-connect-service]');if(!form)return;ev.preventDefault();connectProfile(form.dataset.connectService,form.elements.profile.value.trim(),form.querySelector('[type="submit"]'));});
-function importFeedback(){if(state.importError)return `<div class="error-message" role="alert">${e(state.importError)}</div>`;if(state.importNotice)return `<div class="success-message">${e(state.importNotice)}</div>`;if(!state.pending)return '';const p=state.pending;if(!p.preview||p.base!==collection.entries||p.started!==collection.started){p.preview=mergeEntries(collection.started?collection.entries:[],p.entries);p.base=collection.entries;p.started=collection.started;}const merged=p.preview;return `<div class="import-preview"><p class="eyebrow">READY WHEN YOU ARE</p><h2>A few familiar favorites.</h2><p>${p.entries.length} rows · ${merged.added} new items · ${merged.merged} entries enriched · ${merged.duplicates} unchanged duplicates${p.skipped?` · ${p.skipped} empty rows skipped`:''}</p><div class="preview-items">${p.entries.slice(0,60).map(x=>`<div class="preview-item"><span>${e(x.title)} <small>${x.year?`(${e(x.year)})`:''}</small></span><span>${singular[x.type]} · ${e(statusLabel(x))}${x.date?` · ${x.date}`:''}</span></div>`).join('')}${p.entries.length>60?`<p class="import-help">Showing the first 60 of ${p.entries.length} rows.</p>`:''}</div><button class="button primary" data-action="confirm-import">Add to my shelf ${icon('arrow')}</button> <button class="text-button" data-action="cancel-import">Cancel</button></div>`;}
+function importFeedback(){if(state.importError)return `<div class="error-message" role="alert">${e(state.importError)}</div>`;if(state.importNotice)return `<div class="success-message">${e(state.importNotice)}</div>`;if(!state.pending)return '';const p=state.pending;if(!p.preview||p.base!==collection.entries||p.started!==collection.started){p.preview=mergeEntries(collection.started?collection.entries:[],p.entries);p.base=collection.entries;p.started=collection.started;}const merged=p.preview;return `<div class="import-preview"><p class="eyebrow">READY WHEN YOU ARE</p><h2>A few familiar favorites.</h2><p>${p.entries.length} ${p.entries.length===1?'row':'rows'} · ${merged.added} new · ${merged.merged} enriched · ${merged.duplicates} unchanged${p.skipped?` · ${p.skipped} skipped`:''}</p><div class="preview-items">${p.entries.slice(0,60).map(x=>`<div class="preview-item"><span>${e(x.title)} <small>${x.year?`(${e(x.year)})`:''}</small></span><span>${singular[x.type]} · ${e(statusLabel(x))}${x.date?` · ${x.date}`:''}</span></div>`).join('')}${p.entries.length>60?`<p class="import-help">Showing the first 60 of ${p.entries.length} rows.</p>`:''}</div><button class="button primary" data-action="confirm-import">Add to my shelf ${icon('arrow')}</button> <button class="text-button" data-action="cancel-import">Cancel</button></div>`;}
 let importSequence=0;
-async function readImport(files){const seq=++importSequence;state.pending=null;state.importError='';state.importNotice='';const feedback=$('#import-feedback');feedback.innerHTML='<p class="loading-pulse">Finding your familiar favorites…</p>';try{let all=[],skipped=0;for(const file of files){if(file.size>10*1024*1024)throw Error(`${file.name} is over 10 MB. Choose a smaller export.`);if(/\.zip$/i.test(file.name))throw Error('Unzip your Letterboxd export first, then select the CSV files inside.');const text=await file.text();if(/\.json$/i.test(file.name)){const data=JSON.parse(text);if(data.format!=='trace-backup-v1'||!Array.isArray(data.entries))throw Error('Choose a Trace JSON backup or a supported CSV export.');all.push(...validateEntries(data.entries));}else{const parsed=normalizeImport(text,file.name,state.importSource);all.push(...parsed.entries);skipped+=parsed.skipped;}if(all.length>30000)throw Error('Import up to 30,000 entries at a time.');}if(!all.length)throw Error('No entries found in these files.');if(seq!==importSequence)return;state.pending={entries:all,skipped};}catch(err){if(seq!==importSequence)return;state.importError=err instanceof SyntaxError?'The backup is not valid JSON. Choose the original Trace backup.':err.message;}if(state.page==='imports')$('#import-feedback').innerHTML=importFeedback();}
+async function readImport(files){
+ const seq=++importSequence,source=state.importSource,owner=sessionEpoch;
+ state.pending=null;state.importError='';state.importNotice='';
+ $('#import-feedback').innerHTML='<p class="loading-pulse">Finding your familiar favorites…</p>';
+ const active=()=>seq===importSequence&&owner===sessionEpoch;
+ const all=[];
+ let skipped=0;
+ const append=rows=>{
+  if(all.length+rows.length>30000)throw Error('Import up to 30,000 entries at a time.');
+  all.push(...validateEntries(rows));
+ };
+ const appendCSV=(text,name,provider,options)=>{
+  const parsed=normalizeImport(text,name,provider,options);
+  append(parsed.entries);
+  skipped+=parsed.skipped;
+ };
+ try{
+  for(const file of files){
+   if(file.size>10*1024*1024)throw Error(`${file.name} is over 10 MB. Choose a smaller export.`);
+   if(/\.zip$/i.test(file.name)){
+    if(!['auto','letterboxd'].includes(source))throw Error('Select Letterboxd or Detect automatically for a Letterboxd ZIP.');
+    const archive=await readLetterboxdZip(await file.arrayBuffer());
+    if(!active())return;
+    for(const csv of archive)appendCSV(csv.text,csv.name,'letterboxd',{allowEmpty:true});
+    continue;
+   }
+   const text=await file.text();
+   if(!active())return;
+   if(/\.json$/i.test(file.name)){
+    const data=JSON.parse(text);
+    if(data.format!=='trace-backup-v1'||!Array.isArray(data.entries))throw Error('Choose a Trace JSON backup or a supported CSV export.');
+    append(data.entries);
+   }else appendCSV(text,file.name,source);
+  }
+  if(!all.length)throw Error(skipped?'No supported entries found. Check the selected export type and files.':'No entries found in these files.');
+  if(!active())return;
+  state.pending={entries:all,skipped};
+ }catch(err){
+  if(!active())return;
+  state.importError=err instanceof SyntaxError?'The backup is not valid JSON. Choose the original Trace backup.':err.message;
+ }
+ if(state.page==='imports')$('#import-feedback').innerHTML=importFeedback();
+}
 function periodOptions(){const dates=entries().filter(x=>x.date).map(x=>x.date);const months=[...new Set([today().slice(0,7),...dates.map(x=>x.slice(0,7))])].sort().reverse();const years=[...new Set([today().slice(0,4),...dates.map(x=>x.slice(0,4))])].sort().reverse();return `<option value="all">All time</option>${years.map(x=>`<option value="${x}">${x} · Year in review</option>`).join('')}${months.map(x=>`<option value="${x}">${new Date(x+'-01T12:00:00').toLocaleDateString('en-US',{month:'long',year:'numeric'})}</option>`).join('')}`;}
 function wallCandidates(){return recapEntries(entries(),wallConfig.period);}
 function selectedWall(){return selectTracewall(wallCandidates(),wallConfig.selected);}
@@ -288,7 +594,7 @@ function renderWall(){
  <h2 id="wall-display-title" style="top:${132/layout.height*100}%">${e(wallConfig.title||'The things that stayed.')}</h2><p class="keepsake-subtitle" style="color:${palette.muted};top:${264/layout.height*100}%">read, watched, played. lived.</p>
  ${selected.length?`<div class="keepsake-collage">${selected.map((item,i)=>wallTile(item,layout.slots[i],layout,palette)).join('')}</div>`:`<p class="keepsake-empty" style="color:${palette.muted}">Nothing kept here yet.<br>Choose another period, or log something you loved.</p>`}
  <div class="keepsake-footer" style="color:${palette.muted};border-color:${palette.rule};bottom:${42/layout.height*100}%"><span>${wallFooter(selected)}</span><em>good things leave a trace.</em></div></section>`}
- <aside class="wall-aside"><div><h3>A little of everything.</h3><p>${wallConfig.selected===null?'A mix from the things you logged.':'Your picks, in the order you chose them.'} Choose up to 12 keepsakes.</p><button class="text-button" data-action="wall-mix" ${wallConfig.selected===null?'disabled':''}>Use an automatic mix</button>${wallPaletteControls()}</div>
+ <aside class="wall-aside"><div><h3>A little of everything.</h3><p>${wallConfig.selected===null?'A mix from the things you logged.':'Your picks, in the order you chose them.'} Choose up to 12 keepsakes.${card?' Each share card holds one memory.':''}</p><button class="text-button" data-action="wall-mix" ${wallConfig.selected===null?'disabled':''}>Use an automatic mix</button>${wallPaletteControls()}</div>
  <div>${Object.entries(counts).map(([kind,count])=>`<div class="wall-stat"><b>${count}</b><span>${{movie:'movies watched',tv:'shows watched',book:'books read',album:'albums heard',memory:'moments kept'}[kind]}</span></div>`).join('')}</div></aside></div>
  <p class="wall-notice">The image stays on your device until you share it. Unavailable covers become title cards.</p>`;
  renderWallPicker(selected,candidates);
@@ -325,7 +631,7 @@ function fields(x,isEdit=false){const memory=x.type==='memory';return `
  <details class="field photo-field" ${memory?'open':''}><summary class="source-hint">${memory?'A photo from the day':'Cover or photo'} <small>(optional)</small></summary><label class="field"><span>Choose a photo · up to 25 MB</span><input type="file" name="photo" accept="image/jpeg,image/png,image/webp"></label><label class="field" data-memory-only><span>Take a photo</span><input type="file" name="cameraPhoto" accept="image/*" capture="environment"></label><label class="field"><span>Or use an image URL</span><input type="url" name="image" value="${/^https?:/.test(x.image||'')?e(x.image):''}" placeholder="https://…"></label></details>
  <section class="memory-attachments" data-memory-only><h3>Attached media</h3><p>Choose up to 12 books, albums, films, or shows from your shelf.</p><label class="field"><span class="sr-only">Find something to attach</span><input type="search" data-attachment-search placeholder="Find a book, album, film, or show…"></label><div data-attachment-options></div><span class="source-hint" data-attachment-count></span></section>
  ${x.sourceUrl?`<p class="entry-source">${memory?'Original entry':'Found via'} <a href="${e(safeUrl(x.sourceUrl))}" target="_blank" rel="noopener noreferrer">${e(x.source||'Original source')} ↗</a></p>`:''}<div id="entry-error"></div><div class="form-actions"><label class="check-field"><input type="checkbox" name="favorite" ${x.favorite?'checked':''}> ${icon('heart')} ${'Favorite'}</label><div>${!isEdit?'<button type="button" class="text-button" data-action="back-search">Back</button>':''}<button class="button primary" type="submit">${isEdit?'Save changes':memory?'Keep this memory':'Add to my shelf'}</button></div></div>`;}
-function prepareForm(form,x){form.traceLinks=normalizeAttachments(x.attachments);updateFormKind(form);}
+function prepareForm(form,x){form.traceLinks=attachmentsWithPhotos(x.attachments);updateFormKind(form);}
 function updateFormKind(form){const memory=form.elements.type.value==='memory';form.elements.title.closest('label').querySelector('span').textContent='Title';form.elements.title.placeholder=memory?'That rainy Sunday…':'What would you like to remember?';if(memory)form.querySelector('.photo-field').open=true;form.querySelector('[type="submit"]').textContent=form.id==='edit-form'?'Save changes':memory?'Keep this memory':'Add to my shelf';form.querySelectorAll('[data-media-only]').forEach(el=>{el.hidden=memory;el.querySelectorAll('input,select,button').forEach(input=>input.disabled=memory);});form.querySelectorAll('[data-memory-only]').forEach(el=>{el.hidden=!memory;el.querySelectorAll('input').forEach(input=>input.disabled=!memory);});if(memory)renderAttachments(form);}
 function renderAttachments(form){const selected=form.traceLinks||[];const query=form.querySelector('[data-attachment-search]').value.toLowerCase();const shelf=entries().filter(x=>x.type!=='memory');const seen=new Set();const options=[...selected,...shelf].filter(x=>{const key=x.id||x.type+':'+x.title;if(seen.has(key))return false;seen.add(key);return true;});const filtered=options.filter(x=>`${x.title} ${x.creator}`.toLowerCase().includes(query));
  form.traceOptions=options;
@@ -338,7 +644,7 @@ for(const dialog of [logDialog,detailDialog]){
   const other=ev.target.name==='photo'?'cameraPhoto':'photo';
   form.elements[other].value='';
  }
- if(ev.target.matches('[data-attachment-id]')){const item=(form.traceOptions||[]).find(x=>(x.id||x.type+':'+x.title)===ev.target.dataset.attachmentId);if(!item)return;if(ev.target.checked){if(form.traceLinks.length>=12){ev.target.checked=false;notify('Choose up to 12 things for one memory.');return;}form.traceLinks=normalizeAttachments([...form.traceLinks,item]);}else form.traceLinks=form.traceLinks.filter(x=>!(x.id&&x.id===item.id||sameItem(x,item)));renderAttachments(form);}});
+ if(ev.target.matches('[data-attachment-id]')){const item=(form.traceOptions||[]).find(x=>(x.id||x.type+':'+x.title)===ev.target.dataset.attachmentId);if(!item)return;if(ev.target.checked){if(form.traceLinks.length>=12){ev.target.checked=false;notify('Choose up to 12 things for one memory.');return;}form.traceLinks=attachmentsWithPhotos([...form.traceLinks,item]);}else form.traceLinks=form.traceLinks.filter(x=>!(x.id&&x.id===item.id||sameItem(x,item)));renderAttachments(form);}});
  dialog.addEventListener('input',ev=>{if(ev.target.matches('[data-attachment-search]'))renderAttachments(ev.target.closest('form'));});
 }
 function renderEntryForm(){searchController?.abort();searchSequence++;const memory=entryDraft.type==='memory';$('#log-content').innerHTML=modalHead(memory?'Add a memory':'Log this title',memory?'Add a photo, a note, and media from your shelf.':'Add your rating, date, and notes.')+`<form id="entry-form" class="modal-body">${fields(entryDraft)}</form>`;prepareForm($('#entry-form'),entryDraft);}
@@ -369,7 +675,8 @@ async function saveEntry(form,edit){const submit=form.querySelector('[type="subm
  const photo=cameraPhoto?.size?cameraPhoto:data.get('photo');
  const uploaded=photo?.size?await photoData(photo):'';
  if(!form.isConnected||!form.closest('dialog')?.open||owner!==activeSession.user?.id)return;
- const item={...original,id:edit?editingId:uid(),title:String(data.get('title')).trim(),creator:String(data.get(memory?'memoryContext':'creator')||'').trim(),type,year:memory?'':data.get('year'),status:memory?'done':data.get('status'),date:dateOnly(data.get('date')),rating:memory?0:Number(data.get('rating')),genres:normalizeGenres(String(data.get('genres')||'')),notes:String(data.get('notes')).trim(),favorite:data.get('favorite')==='on',image:uploaded||safeUrl(String(data.get('image')||''))||original?.image||'',attachments:memory?normalizeAttachments(form.traceLinks):[],addedAt:original?.addedAt||new Date().toISOString()};
+ const item={...original,id:edit?editingId:uid(),title:String(data.get('title')).trim(),creator:String(data.get(memory?'memoryContext':'creator')||'').trim(),type,year:memory?'':data.get('year'),status:memory?'done':data.get('status'),date:dateOnly(data.get('date')),rating:memory?0:Number(data.get('rating')),genres:normalizeGenres(String(data.get('genres')||'')),notes:String(data.get('notes')).trim(),favorite:data.get('favorite')==='on',image:uploaded||safeUrl(String(data.get('image')||''))||original?.image||'',attachments:memory?attachmentsWithPhotos(form.traceLinks):[],addedAt:original?.addedAt||new Date().toISOString()};
+ if(item.image&&item.image!==original?.image)item.coverChosen=true;
  if(!item.title)throw Error('Give this memory a title.');if(item.date>today())throw Error('Choose today or an earlier date.');item.history=[...new Set([...(original?.history||[]),...(item.status==='done'&&item.date?[item.date]:[])])];const current=collection.started?collection.entries:[];
  const result=edit?current.map(x=>x.id===editingId?item:x):memory?[...current,item]:mergeEntries(current,[item]).entries;
  if(!await persist({started:true,entries:result}))return;await closeModal(edit?'#detail-dialog':'#log-dialog');render();notify(edit?'Changes saved.':memory?'Memory saved.':'Added to your shelf.');
@@ -392,23 +699,27 @@ async function pickUp(id,button){if(picking)return;picking=true;const object=but
 function quickRating(x,demo){if(x.type==='memory')return '';const value=demo?0:x.rating||0;return `<section class="quick-rating"><span>Your rating</span><div class="quick-stars" role="group" aria-label="Rate this title">${[1,2,3,4,5].map(n=>`<button type="button" data-quick-rating="${n}" data-id="${e(x.id)}" class="${value>=n?'filled':''}" aria-label="Rate ${n} out of 5" aria-pressed="${value===n}">★</button>`).join('')}</div><label><span class="sr-only">Exact rating, including half stars</span><select data-exact-rating data-id="${e(x.id)}">${Array.from({length:11},(_,i)=>i/2).map(n=>`<option value="${n}" ${n===value?'selected':''}>${n?n+' / 5':'Not rated'}</option>`).join('')}</select></label></section>`;}
 async function setQuickRating(id,rating){rating=Math.round(Math.max(0,Math.min(5,Number(rating)||0))*2)/2;const source=entries().find(x=>x.id===id);if(!source||source.type==='memory')return;const existing=collection.entries.find(x=>sameItem(x,source));const item=existing?{...existing}:{...source,id:uid(),notes:'',favorite:false,forLater:false,attachments:[],date:'',history:[],addedAt:new Date().toISOString()};if(!existing&&!rating)return;item.rating=rating;if(rating){item.status='done';item.date=item.date||today();item.history=[...new Set([...(item.history||[]),item.date])];}const next=existing?collection.entries.map(x=>x.id===item.id?item:x):[...collection.entries,item];if(!await persist({started:true,entries:next}))return;state.previewId=null;render();openDetail(item.id);notify(rating?'Rating saved.':'Rating cleared.');}
 let detailRequest=0;
-function openDetail(id){const x=entries().find(x=>x.id===id);if(!x)return;editingId=id;const demo=isDemo(),memory=x.type==='memory',request=++detailRequest;
- $('#detail-content').innerHTML=modalHead(memory?'Memory':x.title,memory?'Your photo, notes, and attached media.':`${x.creator||singular[x.type]}${x.year?' · '+x.year:''}`,'#detail-dialog')+`<div class="modal-body"><div class="detail-summary physical-detail"><div class="detail-object">${artifact(x)}</div><div><h3>${e(x.title)}</h3><p>${e(x.creator)}${x.year?` · ${e(x.year)}`:''}</p><span class="type-badge">${singular[x.type]}</span><p class="list-rating">${e(statusLabel(x))}</p></div></div>
- ${genreChips(x)}${quickRating(x,demo)}${!memory?`<section id="public-rating">${traceRatingPanel(x.publicScores,x.type)}</section>`:''}${elsewhere(x)}${!memory&&!demo?`<section class="metadata-lookup"><button class="text-button" data-find-metadata="${e(id)}">Find cover & genres ↗</button><div id="metadata-results"></div></section>`:''}<div class="entry-description" id="entry-description">${x.description?`<h4>About</h4><p>${e(x.description)}</p>`:!memory?'<p class="source-hint">No description available yet.</p>':''}</div>${x.notes?`<div class="entry-description"><h4>${demo?'From the sample diary':'Your note'}</h4><p>${e(x.notes)}</p></div>`:''}
+function openDetail(id,publicEntry=null){const x=publicEntry||entries().find(x=>x.id===id);if(!x)return;editingId=id;const demo=isDemo()||!!publicEntry,memory=x.type==='memory',request=++detailRequest;
+ $('#detail-content').innerHTML=modalHead(memory?'Memory':x.title,memory?'Your photo, notes, and attached media.':`${x.creator||singular[x.type]}${x.year?' · '+x.year:''}`,'#detail-dialog')+`<div class="modal-body"><div class="detail-summary physical-detail"><div class="detail-object">${artifact(x)}</div><div><h3>${e(x.title)}</h3><p>${e(x.creator)}${x.year?` · ${e(x.year)}`:''}</p><span class="type-badge">${singular[x.type]}</span><p class="list-rating">${publicEntry?'Available to add':e(statusLabel(x))}</p></div></div>
+ ${genreChips(x)}${publicEntry?'':quickRating(x,demo)}${!memory?`<section id="public-rating">${traceRatingPanel(x.publicScores,x.type)}</section>`:''}${elsewhere(x)}${!memory&&!demo?`<section class="metadata-lookup"><button class="text-button" data-find-metadata="${e(id)}">Find cover & genres ↗</button><div id="metadata-results"></div></section>`:''}<div class="entry-description" id="entry-description">${x.description?`<h4>About</h4><p>${e(x.description)}</p>`:!memory?'<p class="source-hint">No description available yet.</p>':''}</div>${x.notes?`<div class="entry-description"><h4>${demo?'From the sample diary':'Your note'}</h4><p>${e(x.notes)}</p></div>`:''}
  ${x.sourceUrl?`<p class="entry-source"><a href="${e(safeUrl(x.sourceUrl))}" target="_blank" rel="noopener noreferrer">${e(x.source||'Original source')} ↗</a></p>`:''}${attachedMedia(x)}
- ${x.metadataSourceUrl?`<p class="entry-source">Details from <a href="${e(safeUrl(x.metadataSourceUrl))}" target="_blank" rel="noopener noreferrer">${e(x.metadataSource||'Catalog')} ↗</a></p>`:''}<div class="entry-actions">${!demo?`<button class="button secondary" data-share-entry="${e(id)}">Share a review ↗</button>`:''}${demo?`<button class="button primary" data-action="keep-sample" data-id="${e(id)}">${memory?'Add a memory':'Log this title'} ${icon('plus')}</button>`:''}<details class="list-menu" ${memory?'hidden':''}><summary class="button secondary">Add to list</summary><div><button type="button" data-save-list="later" data-id="${e(id)}">${x.forLater?'✓ ':''}For later</button><button type="button" data-save-list="favorite" data-id="${e(id)}">${x.favorite?'✓ ':''}Favorites</button></div></details></div>
+ ${x.metadataSourceUrl?`<p class="entry-source">Details from <a href="${e(safeUrl(x.metadataSourceUrl))}" target="_blank" rel="noopener noreferrer">${e(x.metadataSource||'Catalog')} ↗</a></p>`:''}<div class="entry-actions">${!demo?`<button class="button secondary" data-share-entry="${e(id)}">Share a review ↗</button>`:''}${publicEntry?`<button class="button primary" data-action="tv-catalog-add" data-id="${e(id)}">Add to shelf +</button>`:demo?`<button class="button primary" data-action="keep-sample" data-id="${e(id)}">${memory?'Add a memory':'Log this title'} ${icon('plus')}</button>`:''}<details class="list-menu" ${memory||publicEntry?'hidden':''}><summary class="button secondary">Add to list</summary><div><button type="button" data-save-list="later" data-id="${e(id)}">${x.forLater?'✓ ':''}For later</button><button type="button" data-save-list="favorite" data-id="${e(id)}">${x.favorite?'✓ ':''}Favorites</button></div></details></div>
  ${demo?'':`<details class="edit-entry"><summary>Edit entry</summary><form id="edit-form">${fields(x,true)}</form></details>`}</div>`;
  if(!demo)prepareForm($('#edit-form'),x);if(!detailDialog.open)detailDialog.showModal();
- if(!memory){const params=new URLSearchParams({type:x.type,title:x.title,year:x.year||'',imdbId:x.imdbId||''});apiFetch('/api/ratings?'+params).then(r=>{if(!r.ok)throw Error();return r.json();}).then(data=>{if(request===detailRequest&&editingId===id)updateScorePanel($('#public-rating'),data,x.type);}).catch(()=>{if(request===detailRequest&&editingId===id)$('#public-rating').insertAdjacentHTML('beforeend','<p class="source-hint">Public scores could not be refreshed. Saved scores, when available, are shown above.</p>');});}
+ if(!memory){const params=ratingParams(x);apiFetch('/api/ratings?'+params).then(r=>{if(!r.ok)throw Error();return r.json();}).then(data=>{if(request===detailRequest&&editingId===id){updateScorePanel($('#public-rating'),data,x.type);if(data.genres?.length){const chips=genreChips({...x,genres:normalizeGenres([...(x.genres||[]),...data.genres])});const current=$('#detail-content .genre-chips');if(current)current.outerHTML=chips;else $('#public-rating').insertAdjacentHTML('beforebegin',chips);}}}).catch(()=>{if(request===detailRequest&&editingId===id)$('#public-rating').insertAdjacentHTML('beforeend','<p class="source-hint">Public scores could not be refreshed. Saved scores, when available, are shown above.</p>');});}
  if(x.type==='book'&&!x.description&&/^\/works\/OL\d+W$/.test(x.externalId||'')){
   $('#entry-description').innerHTML='<p class="source-hint">Loading description…</p>';
   apiFetch('/api/book-description?id='+encodeURIComponent(x.externalId)).then(r=>{if(!r.ok)throw Error();return r.json();}).then(data=>{if(request!==detailRequest||editingId!==id)return;$('#entry-description').innerHTML=data.description?`<h4>About</h4><p>${e(data.description)}</p>`:'<p class="source-hint">No description available. You can open the original source above.</p>';}).catch(()=>{if(request===detailRequest&&editingId===id)$('#entry-description').innerHTML='<p class="source-hint">Description unavailable right now. You can still log or save this title.</p>';});
  }
 }
 detailDialog.addEventListener('click',ev=>{const share=ev.target.closest('[data-share-entry]');if(share){const item=entries().find(x=>x.id===share.dataset.shareEntry);detailDialog.close();social.share(item);}});
+detailDialog.addEventListener('click',ev=>{
+ const add=ev.target.closest('[data-action="tv-catalog-add"]');
+ if(add)tvCatalogDraft(add.dataset.id);
+});
 let metadataMatches=[];
 async function findMetadata(id,button){const item=entries().find(x=>x.id===id);if(!item)return;button.disabled=true;const host=$('#metadata-results');host.innerHTML='<p class="source-hint">Searching the catalog…</p>';try{const response=await apiFetch('/api/search?type='+encodeURIComponent(item.type)+'&q='+encodeURIComponent(item.title));const data=await response.json();if(!response.ok)throw Error(data.error||'Catalog unavailable.');if(editingId!==id||!host.isConnected)return;metadataMatches=data.items;host.innerHTML=metadataMatches.length?`<p class="source-hint">Choose the matching release. Your rating and notes are kept.</p>${metadataMatches.slice(0,8).map((x,i)=>`<button class="metadata-match" data-use-metadata="${i}" data-entry="${e(id)}">${x.image?`<img src="${e(imageUrl(x.image))}" alt="">`:''}<span><strong dir="auto">${e(x.title)}</strong><small>${e(x.year)} · ${e(x.creator||x.source)}</small><small>${e((x.genres||[]).join(' · '))}</small></span><b>Use cover & genres +</b></button>`).join('')}`:'<p class="source-hint">No matches. You can add genres in Edit entry.</p>';}catch(err){if(host.isConnected)host.innerHTML=`<p class="error-message" role="alert">${e(err.message)}</p>`;}finally{button.disabled=false;}}
-async function useMetadata(id,index){const candidate=metadataMatches[index],item=collection.entries.find(x=>x.id===id);if(!candidate||!item)return;const updated={...item,genres:normalizeGenres([...(item.genres||[]),...(candidate.genres||[])]),metadataSource:candidate.source,metadataSourceUrl:safeUrl(candidate.sourceUrl)};updated.publicScores=normalizePublicScores([...normalizePublicScores(candidate.publicScores),...normalizePublicScores(item.publicScores)]);if(candidate.image)updated.image=imageUrl(candidate.image);for(const key of ['description','creator','year','imdbId'])if(!updated[key]&&candidate[key])updated[key]=candidate[key];if(!await persist({...collection,entries:collection.entries.map(x=>x.id===id?updated:x)}))return;render();openDetail(id);notify('Cover and genres updated.');}
+async function useMetadata(id,index){const candidate=metadataMatches[index],item=collection.entries.find(x=>x.id===id);if(!candidate||!item)return;const updated={...item,genres:normalizeGenres([...(item.genres||[]),...(candidate.genres||[])]),metadataSource:candidate.source,metadataSourceUrl:safeUrl(candidate.sourceUrl)};updated.publicScores=normalizePublicScores([...normalizePublicScores(candidate.publicScores),...normalizePublicScores(item.publicScores)]);if(candidate.image){updated.image=imageUrl(candidate.image);updated.coverChosen=true;}for(const key of ['description','creator','year','imdbId'])if(!updated[key]&&candidate[key])updated[key]=candidate[key];if(!await persist({...collection,entries:collection.entries.map(x=>x.id===id?updated:x)}))return;render();openDetail(id);notify('Cover and genres updated.');}
 detailDialog.addEventListener('click',ev=>{const find=ev.target.closest('[data-find-metadata]');if(find)findMetadata(find.dataset.findMetadata,find);const use=ev.target.closest('[data-use-metadata]');if(use)useMetadata(use.dataset.entry,Number(use.dataset.useMetadata));});
 async function saveToList(id,list){const source=entries().find(x=>x.id===id);if(!source)return;const existing=collection.entries.find(x=>sameItem(x,source));const item=existing?{...existing}:{...source,id:uid(),notes:'',rating:0,date:'',status:'want',history:[],attachments:[],favorite:false,forLater:false,addedAt:new Date().toISOString()};if(list==='later')item.forLater=true;else item.favorite=true;
  const next=existing?collection.entries.map(x=>x.id===item.id?item:x):[...collection.entries,item];if(!await persist({started:true,entries:next}))return;state.previewId=null;render();openDetail(item.id);notify(list==='later'?'Saved to For later. Find it in the shelf filter.':'Added to Favorites.');}
@@ -428,6 +739,16 @@ main.addEventListener('click',async ev=>{const b=ev.target.closest('[data-action
  if(action==='more-movies'){state.movieLimit+=60;renderShelfContents();}
  if(action==='shelf-scroll'){const rail=b.closest('.shelf-row').querySelector('.shelf-rail');rail.scrollBy({left:Number(b.dataset.direction)*rail.clientWidth*.8,behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});}
  if(action==='unlink-profile'){delete connections[value];try{localStorage.setItem(preferenceKey('connections'),JSON.stringify(connections));}catch{notify('Could not save this change.');return;}importsPage();notify('Profile unlinked. Imported entries stay on your shelf.');}
+ if(action==='add-starters'&&Object.hasOwn(COLLECTION_STARTERS,value))await addStarterTitles(value);
+ if(action==='tv-scope'){tvBrowse.scope=value;shelfPage();}
+ if(action==='tv-page'){tvBrowse.page=Math.max(0,tvBrowse.page+Number(value));tvBrowse.previewId=null;await loadTvBrowse();main.querySelector('.tv-browse')?.scrollIntoView({block:'start'});}
+ if(action==='tv-catalog-add')tvCatalogDraft(id);
+ if(action==='tv-catalog-detail'){const item=tvBrowse.items.find(x=>x.id===id);if(item)openDetail(id,item);}
+ if(action==='tv-catalog-preview'){
+  const item=tvBrowse.items.find(x=>x.id===id);
+  if(item&&tvBrowse.previewId===id)openDetail(id,item);
+  else if(item){tvBrowse.previewId=id;renderShelfContents();main.querySelector('.screening-screen')?.scrollIntoView({block:'nearest',behavior:matchMedia('(prefers-reduced-motion: reduce)').matches?'instant':'smooth'});}
+ }
  if(action==='wheel'){const list=filtered();if(list.length){state.wheelIndex=(state.wheelIndex+Number(value)+list.length)%list.length;state.previewId=null;renderShelfContents();}}
  if(action==='open-entry')openDetail(id);
  if(action==='calendar-today'){state.calendarMonth=today().slice(0,7);state.calendarDay=today();renderShelfContents();}
@@ -446,7 +767,7 @@ main.addEventListener('click',async ev=>{const b=ev.target.closest('[data-action
  if(action==='start'){if(await persist({started:true,entries:collection.entries})){wallConfig.selected=null;render();openLog();}}
  if(action==='csv-template')download('trace-import-template.csv','Title,Type,Creator,Year,Rating,Date,Status,Notes,Favorite,Image,URL\nIn Rainbows,album,Radiohead,2007,5,2026-10-23,done,"A late-night favorite",true,,\nA rainy Sunday,memory,,,0,2026-11-01,done,A small day worth keeping,false,,\n','text/csv');
  if(action==='cancel-import'){importSequence++;state.pending=null;state.importError='';state.importNotice='';$('#import-feedback').innerHTML='';$('#import-file').value='';}
- if(action==='confirm-import'&&state.pending){const p=state.pending;const m=p.preview&&p.base===collection.entries&&p.started===collection.started?p.preview:mergeEntries(collection.started?collection.entries:[],p.entries);if(await persist({started:true,entries:m.entries})){state.pending=null;state.importNotice=`Your collection is home. ${m.added} new items added, ${m.merged} entries enriched, ${m.duplicates} duplicates left unchanged.`;$('#import-feedback').innerHTML=importFeedback();$('#import-file').value='';notify('Your collection is home.');}}
+ if(action==='confirm-import'&&state.pending){const p=state.pending;const m=p.preview&&p.base===collection.entries&&p.started===collection.started?p.preview:mergeEntries(collection.started?collection.entries:[],p.entries);if(await persist({started:true,entries:m.entries})){state.pending=null;state.importNotice=`Import complete. ${m.added} added · ${m.merged} enriched · ${m.duplicates} unchanged.`;$('#import-feedback').innerHTML=importFeedback();$('#import-file').value='';notify('Your collection is home.');await collapseDuplicates();scheduleCoverBackfill(1500);}}
  if(action==='wall-mix'){wallConfig.selected=null;wallPageIndex=0;saveWall();renderWall();}
  if(action==='wall-card'){
   wallPageIndex+=Number(value);
@@ -489,9 +810,10 @@ main.addEventListener('click',async ev=>{const b=ev.target.closest('[data-action
 });
 $('#log-top').addEventListener('click',()=>openLog());
 function download(name,data,type){const url=URL.createObjectURL(new Blob([data],{type}));const a=document.createElement('a');a.href=url;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);}
-function backupCollection(){download(`trace-backup-${today()}.json`,JSON.stringify({format:'trace-backup-v1',exportedAt:new Date().toISOString(),entries:collection.entries},null,2),'application/json');notify(collection.entries.length?'Your collection backup is ready.':'Backup saved. Sample entries aren’t included in your personal collection.');}
+async function backupCollection(){const {entries,missing}=await inlinePhotoRefs(collection.entries,photoDataUrl);download(`trace-backup-${today()}.json`,JSON.stringify({format:'trace-backup-v1',exportedAt:new Date().toISOString(),entries},null,2),'application/json');if(missing){notify(`Backup saved, but ${missing} photo${missing===1?'':'s'} could not be included. Connect to the internet and try again.`);return;}notify(collection.entries.length?'Your collection backup is ready.':'Backup saved. Sample entries aren’t included in your personal collection.');}
 $('#backup').addEventListener('click',backupCollection);
-function loadImage(src){return new Promise(resolve=>{const urls=artworkCandidates(src);if(!urls.length)return resolve(null);const img=new Image();img.crossOrigin='anonymous';let settled=false;const finish=result=>{if(settled)return;settled=true;clearTimeout(timer);img.onload=img.onerror=null;if(!result)img.src='';resolve(result);};const timer=setTimeout(()=>finish(null),9000);const next=()=>{if(settled)return;if(urls.length)img.src=urls.shift();else finish(null);};img.onload=()=>{if(img.naturalWidth<=2&&img.naturalHeight<=2)next();else finish(img);};img.onerror=next;next();});}
+function loadImage(src){const id=photoRefId(typeof src==='string'?src:src?.image);if(id)return resolvePhoto(id).then(url=>url?loadImageUrls([url]):null);return loadImageUrls(artworkCandidates(src));}
+function loadImageUrls(urls){return new Promise(resolve=>{if(!urls.length)return resolve(null);const img=new Image();img.crossOrigin='anonymous';let settled=false;const finish=result=>{if(settled)return;settled=true;clearTimeout(timer);img.onload=img.onerror=null;if(!result)img.src='';resolve(result);};const timer=setTimeout(()=>finish(null),9000);const next=()=>{if(settled)return;if(urls.length)img.src=urls.shift();else finish(null);};img.onload=()=>{if(img.naturalWidth<=2&&img.naturalHeight<=2)next();else finish(img);};img.onerror=next;next();});}
 function fitCover(ctx,img,x,y,w,h){const box=artworkFit(img.naturalWidth||img.width,img.naturalHeight||img.height,w,h);if(!box)return;ctx.fillStyle='#fff4df';ctx.fillRect(x,y,w,h);ctx.drawImage(img,x+box.x,y+box.y,box.width,box.height);}
 function crop(ctx,img,x,y,w,h){const ratio=Math.max(w/img.width,h/img.height),sw=w/ratio,sh=h/ratio;ctx.drawImage(img,(img.width-sw)/2,(img.height-sh)/2,sw,sh,x,y,w,h);}
 function canvasText(ctx,text,x,y,maxWidth,lineHeight,maxLines=2){const words=String(text).split(/\s+/);let lines=[],line='';for(const word of words){const next=line?line+' '+word:word;if(ctx.measureText(next).width>maxWidth&&line){lines.push(line);line=word;}else line=next;}if(line)lines.push(line);lines=lines.slice(0,maxLines);lines.forEach((l,i)=>{if(ctx.measureText(l).width>maxWidth){while(ctx.measureText(l+'…').width>maxWidth&&l.length)l=l.slice(0,-1);l+='…';}ctx.fillText(l,x,y+i*lineHeight);});}
@@ -652,7 +974,7 @@ async function exportWall(button){
  }catch(err){notify(`Image export failed. ${err.message}`);}finally{button.disabled=!selectedWall().length;button.innerHTML=`${icon('download')} Save as image`;}
 }
 let resizeTimer;window.addEventListener('resize',()=>{clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>{if(state.page==='shelf'&&state.view==='shelf')renderShelfContents();else if(state.page==='wall'&&wallFormat()==='full'&&wallColumnsRendered!==wallColumns())renderWall();},120);});
-route();if(storageProblem)notify(storageProblem);
+route();if(storageProblem)notify(storageProblem);else scheduleCoverBackfill(8000);
 for(const [service,link] of Object.entries(connections))if(Date.now()-Date.parse(link.syncedAt||'')>6*60*60*1000)connectProfile(service,link.identifier,null,true);
 
 function preferenceKey(name){return activeSession.user?`trace.${name}.account.${activeSession.user.id}.v1`:`trace.${name}.v1`;}
@@ -666,10 +988,19 @@ function loadAccountPreferences(){
 function redrawLibrary(){if(['shelf','diary','wall','imports'].includes(state.page))render();}
 function receiveLibrary(snapshot){
  if(!snapshot.userId||snapshot.userId!==activeSession.user?.id)return;
- try{collection={started:true,entries:validateEntries(snapshot.entries)};redrawLibrary();}catch{storageProblem='This account library could not be read. Download a backup before changing it.';}
+ try{collection={started:true,entries:validateEntries(snapshot.entries)};redrawLibrary();scheduleCoverBackfill();}catch{storageProblem='This account library could not be read. Download a backup before changing it.';}
  renderLibraryStatus();
 }
 async function handleSession(next,context={}){
+ if(context.reason==='delete'&&context.deletedUserId){
+  const removed=context.deletedUserId;
+  void forgetCachedPhotos(removed);
+  try{await librarySync.forgetAccount(removed);}catch{notify('Your server account was deleted. This device could not clear its offline copy. Clear Trace’s site data to remove it.');}
+  try{
+   for(const name of ['connections','wall'])localStorage.removeItem(`trace.${name}.account.${removed}.v1`);
+   localStorage.setItem('trace.deleted-account.v1',JSON.stringify({id:removed,at:Date.now()}));
+  }catch{}
+ }
  if(context.reason==='login')try{localStorage.removeItem('trace.pending-logout.v1');}catch{}
  if(context.reason==='refresh'&&localStorage.getItem('trace.pending-logout.v1'))return;
  const previous=activeSession.user?.id||null,id=next.user?.id||null;activeSession=next;
@@ -678,15 +1009,22 @@ async function handleSession(next,context={}){
  collection=id?{started:true,entries:[]}:guestCollection;
  state.previewId=null;state.search='';state.genre='all';state.category='all';state.pending=null;pendingGuestCopy=null;
  logDialog.close();detailDialog.close();libraryDialog.close();loadAccountPreferences();
+ $('#log-content').replaceChildren();$('#detail-content').replaceChildren();libraryDialog.replaceChildren();
+ searchController?.abort();++searchSequence;++detailRequest;
+ entryDraft=null;editingId=null;searchResults=[];metadataMatches=[];
  try{if(id)localStorage.setItem('trace.active-account.v1',JSON.stringify({id,username:next.user.username,displayName:next.user.displayName}));else localStorage.removeItem('trace.active-account.v1');}catch{}
  redrawLibrary();renderLibraryStatus();
- try{await librarySync.setSession(next);if(epoch===sessionEpoch){libraryReady=true;renderLibraryStatus();redrawLibrary();}}
+ try{await librarySync.setSession(next);if(epoch===sessionEpoch){libraryReady=true;renderLibraryStatus();redrawLibrary();await collapseDuplicates();scheduleCoverBackfill();}}
  catch(error){if(epoch===sessionEpoch){libraryReady=false;notify(error.message);renderLibraryStatus();}}
 }
-async function libraryRequest(path,body){
- const id=activeSession.user?.id;if(!id)throw Object.assign(Error('Sign in to sync your library.'),{status:401});
+async function verifiedSession(id){
+ if(!id)throw Object.assign(Error('Sign in to sync your library.'),{status:401});
  const check=await apiFetch('/api/auth/session',{credentials:'same-origin',cache:'no-store'});if(!check.ok)throw Object.assign(Error('Sign in again to sync.'),{status:check.status});
  const verified=await check.json();if(activeSession.user?.id!==id||verified.user?.id!==id||localStorage.getItem('trace.pending-logout.v1'))throw Object.assign(Error('Your account changed. Sign in again before syncing.'),{status:401});
+ return verified;
+}
+async function libraryRequest(path,body){
+ const id=activeSession.user?.id,verified=await verifiedSession(id);
  const response=await apiFetch(path,{method:body?'POST':'GET',credentials:'same-origin',cache:'no-store',...(body?{headers:{'Content-Type':'application/json','X-Trace-CSRF':verified.csrf},body:JSON.stringify(body)}:{})});
  let data;try{data=await response.json();}catch{throw Error('The library server could not be reached. Changes remain saved on this device.');}
  if(!response.ok)throw Object.assign(Error(data.error||'Library sync is temporarily unavailable.'),{status:response.status});return data;
@@ -713,13 +1051,13 @@ function renderLibraryStatus(){
  const pending=user&&syncStatus.pendingCount?` · ${syncStatus.pendingCount} pending`:'';
  const update=window.TraceMobile?.state?.updateAvailable||window.TraceMobile?.state?.refreshRequired;
  const installNote=mobileGuidance||(window.TraceMobile?.state?.offlineError?'Offline installation could not start. Open Trace in Safari or Chrome to try again.':'');
- host.innerHTML=`<div class="library-status-copy"><strong>${e(user?user.displayName||user.username:'Your device shelf')}</strong><span>${e(status+pending)}</span></div><div class="library-status-actions">${user?`<button type="button" data-library-action="sync" ${!libraryReady?'disabled':''}>Sync now</button>${syncStatus.conflictCount?`<button type="button" data-library-action="conflicts">Review ${syncStatus.conflictCount} changes</button>`:''}<button type="button" data-library-action="signout">Sign out</button>`:'<button type="button" data-library-action="signin">Sign in</button>'}<button type="button" data-install-trace ${window.TraceMobile?.state?.standalone?'hidden':''}>Install app</button><button type="button" data-update-trace ${update?'':'hidden'}>Update app</button></div>${syncStatus.state==='error'&&syncStatus.error?`<p class="library-status-error" role="alert">${e(syncStatus.error)}</p>`:''}<p data-install-trace-status class="install-guidance" role="status">${e(installNote)}</p>`;
+ host.innerHTML=`<div class="library-status-copy"><strong>${e(user?user.displayName||user.username:'Your device shelf')}</strong><span>${e(status+pending+(coverProgress?' · '+coverProgress:''))}</span></div><div class="library-status-actions">${user?`<button type="button" data-library-action="sync" ${!libraryReady?'disabled':''}>Sync now</button>${syncStatus.conflictCount?`<button type="button" data-library-action="conflicts">Review ${syncStatus.conflictCount} changes</button>`:''}<button type="button" data-library-action="signout">Sign out</button>`:'<button type="button" data-library-action="signin">Sign in</button>'}<button type="button" data-install-trace ${window.TraceMobile?.state?.standalone?'hidden':''}>Install app</button><button type="button" data-update-trace ${update?'':'hidden'}>Update app</button></div>${syncStatus.state==='error'&&syncStatus.error?`<p class="library-status-error" role="alert">${e(syncStatus.error)}</p>`:''}<p data-install-trace-status class="install-guidance" role="status">${e(installNote)}</p>`;
  $('#log-top').disabled=!!user&&!libraryReady;
  const badge=document.querySelector('.local-badge');if(badge)badge.textContent=user?(syncStatus.state==='synced'?'Synced':'Saved on device'):'Saved on this device';
  const profile=document.querySelector('.sidebar .profile');if(profile){profile.querySelector('.avatar').textContent=Array.from(user?.displayName||user?.username||'Y')[0].toUpperCase();profile.querySelector('strong').textContent=user?user.displayName||user.username:'Your collection';profile.querySelector('strong').nextElementSibling.textContent=user?'Private account library':'Saved on this browser';}
 }
 function libraryAccountPanel(){
- return `<section class="library-account-panel"><h2>${activeSession.user?'Your private account library':'Keep your shelf with you'}</h2><p>${activeSession.user?'Your ratings, diary, and memories sync privately. Only reviews you choose to post appear in Circle.':'Sign in to keep a private library across devices. Your current device shelf remains here until you choose to copy it.'}</p>${activeSession.user?`${guestCollection.entries.length?`<p>Your separate device shelf contains ${guestCollection.entries.length} items.</p><button class="button secondary" data-library-action="copy-preview" ${!libraryReady?'disabled':''}>Preview copying device shelf</button>`:''}<button class="text-button" data-library-action="sync">Sync now</button>`:'<button class="button primary" data-library-action="signin">Sign in to Trace</button>'}<p class="source-hint">Other devices need the same hosted Trace server. Localhost is this computer only.</p></section>`;
+ return `<section class="library-account-panel"><h2>${activeSession.user?'Your private account library':'Keep your shelf with you'}</h2><p>${activeSession.user?'Your ratings, diary, and memories sync privately. Only reviews you choose to post appear in Circle.':'Sign in to keep a private library across devices. Your current device shelf remains here until you choose to copy it.'}</p>${activeSession.user?`${guestCollection.entries.length?`<p>Your separate device shelf contains ${guestCollection.entries.length} items.</p><button class="button secondary" data-library-action="copy-preview" ${!libraryReady?'disabled':''}>Preview copying device shelf</button>`:''}<button class="text-button" data-library-action="sync">Sync now</button><button class="text-button" data-library-action="account-settings">Account settings & recovery</button>`:'<button class="button primary" data-library-action="signin">Sign in to Trace</button>'}<p class="source-hint">Other devices need the same hosted Trace server. Localhost is this computer only.</p></section>`;
 }
 function showLibraryDialog(content){libraryDialog.innerHTML=`<div class="modal-head"><h2>Private library</h2><button class="close-button" aria-label="Close library dialog" data-library-action="close">×</button></div><div class="modal-body">${content}</div>`;if(!libraryDialog.open)libraryDialog.showModal();}
 function previewGuestCopy(){
@@ -737,6 +1075,7 @@ document.addEventListener('click',async event=>{
   if(action==='signin')social.showAuth();
   if(action==='sync'){await initializeLibrarySession();await librarySync.syncNow();}
   if(action==='signout'){try{await social.signOut();}catch{localStorage.setItem('trace.pending-logout.v1','true');await handleSession({user:null,csrf:''},{reason:'logout'});notify('Signed out on this device. Server sign-out will finish when connected.');}}
+  if(action==='account-settings')social.showAccountSettings();
   if(action==='copy-preview')previewGuestCopy();
   if(action==='copy-confirm'&&pendingGuestCopy?.userId===activeSession.user?.id){const merged=mergeEntries(collection.entries,guestCollection.entries);if(await persist({started:true,entries:merged.entries})){libraryDialog.close();pendingGuestCopy=null;redrawLibrary();notify('Copied to your private account library.');}}
   if(action==='conflicts')renderLibraryConflicts();
@@ -756,6 +1095,13 @@ window.addEventListener('online',()=>initializeLibrarySession());
 window.addEventListener('offline',()=>renderLibraryStatus());
 
 window.addEventListener('storage',async event=>{
+ if(event.key==='trace.deleted-account.v1'){
+  try{const removed=JSON.parse(event.newValue);if(typeof removed.id==='string'){
+   await librarySync.forgetAccount(removed.id);
+   if(activeSession.user?.id===removed.id)await handleSession({user:null,csrf:''},{reason:'logout'});
+  }}catch{renderLibraryStatus();}
+  return;
+ }
  if(!['trace.active-account.v1','trace.pending-logout.v1'].includes(event.key))return;
  try{if(!localStorage.getItem('trace.active-account.v1')||localStorage.getItem('trace.pending-logout.v1'))await handleSession({user:null,csrf:''},{reason:'logout'});await initializeLibrarySession();}catch{renderLibraryStatus();}
 });

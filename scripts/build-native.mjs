@@ -4,7 +4,7 @@ import {fileURLToPath} from 'node:url';
 
 // This list is deliberately independent of directory contents. New assets need review.
 export const PUBLIC_NATIVE_FILES = Object.freeze([
-  'styles.css', 'manifest.webmanifest',
+  'styles.css', 'manifest.webmanifest', 'privacy.html', 'support.html',
   'assets/trace-icon.svg', 'assets/trace-wordmark.png',
   'assets/trace-app-192.png', 'assets/trace-app-512.png', 'assets/sources.json',
   ...[
@@ -34,6 +34,7 @@ function debugHttpHost(hostname) {
 export function validateNativeConfig(env = {}, {release = false} = {}) {
   const development = env.TRACE_NATIVE_DEVELOPMENT === '1';
   const raw = env.TRACE_NATIVE_API_ORIGIN || '';
+  if (release && env.TRACE_NATIVE_ALLOW_OFFLINE === '1') throw Error('Release packages cannot allow an offline downgrade.');
   if (release && development) throw Error('Release packages cannot enable native development mode.');
   if (!raw) {
     if (release) throw Error('Release packages require TRACE_NATIVE_API_ORIGIN with a hosted HTTPS origin.');
@@ -104,6 +105,16 @@ export async function buildNative({rootDir = resolve(dirname(fileURLToPath(impor
   const index = nativeIndex(await readFile(join(root, 'index.html'), 'utf8'));
   await safeDirectory(out);
   await auditOutput(out, new Set(files));
+  if (!config.apiOrigin && env.TRACE_NATIVE_ALLOW_OFFLINE !== '1') {
+    try {
+      const priorFile = join(out, 'native-config.json');
+      if ((await lstat(priorFile)).size > 4096) throw Error('Existing native configuration is invalid.');
+      const prior = JSON.parse(await readFile(priorFile, 'utf8'));
+      if (prior.apiOrigin) throw Error('This native bundle is connected to a server. Set TRACE_NATIVE_API_ORIGIN again, or explicitly set TRACE_NATIVE_ALLOW_OFFLINE=1 to prepare an offline development build.');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
   const build = bundle || (await import('esbuild')).build;
   await build({
     absWorkingDir: root, entryPoints: ['native-entry.mjs'], outfile: join(out, 'trace-native.js'),

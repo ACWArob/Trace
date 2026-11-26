@@ -19,7 +19,7 @@ The illustrated identity carries through the app: warm cream, terracotta, mustar
 - **Trace score:** movies combine IMDb, Rotten Tomatoes critics, Rotten Tomatoes audience, and Letterboxd equally on /10, with visible source coverage. A single source keeps its own name. Missing scores stay missing, and your personal rating is separate.
 - **Elsewhere:** IMDb, Letterboxd, Goodreads, and other community links on a title. Exact review links are used when IDs are known; otherwise the link is labeled as a search.
 - **Your circle:** profiles, following, a public review feed, likes, comments, spoiler controls, editing, and removal with undo. Private account libraries sync ratings, notes, diary entries, and memories separately; only reviews you choose to post enter the feed.
-- **Tracewall:** browse logged items in a mini shelf, filter by category, and tap covers to add or remove them from your ordered tray. Customize the paper, then save a Story (1080 × 1920), portrait post (1080 × 1350), square post (1080 × 1080), or full keepsake. Each social PNG uses the preview and follows your pick order. Missing covers become labeled title cards.
+- **Tracewall:** browse logged items in a mini shelf, filter by category, and tap covers to add or remove them from your ordered tray. Customize the paper, then save a Story (1080 × 1920), portrait post (1080 × 1350), square post (1080 × 1080), or full keepsake. Each social PNG uses the preview and follows your pick order. A share card holds one memory. Extra memories carry onto later cards. Missing covers become labeled title cards.
 - **Take Trace with you:** iPhone/Android home-screen installation and Capacitor native projects, an offline account cache, queued edits, and explicit conflict review. Native debug builds are verified; store distribution remains pending.
 
 ![Sample profiles in Trace Circle](assets/screenshots/circle.png)
@@ -56,9 +56,11 @@ This is a local development server bound to `127.0.0.1`. A public multi-user dep
 
 Link a public Letterboxd/Goodreads profile for available recent feed entries, or import full exports. Public feeds can be unavailable or incomplete.
 
-For **every Letterboxd rating**, export your data, unzip it, and import `ratings.csv` alongside `diary.csv`, `reviews.csv`, `watched.csv`, and `watchlist.csv`. Ratings without diary entries are included and keep unknown watch dates blank. Goodreads library CSV and IMDb ratings CSV are supported too.
+For **every Letterboxd rating**, select the ZIP from [Letterboxd’s data export](https://letterboxd.com/user/exportdata/). Trace reads the current ratings, diary, reviews, watched list, and watchlist in the browser. You can also select those CSVs directly. Ratings without diary entries keep unknown watch dates blank. On browsers that cannot open compressed ZIPs, extract the archive first.
 
-Imports preview before saving, match duplicates, preserve existing ratings/notes, and fill missing details. JSON backup/restore retains genres, attachments, ratings, and known diary history. Maximum 10 MB per file and 30,000 rows per batch.
+Goodreads library CSV and IMDb ratings CSV are supported. A [Discogs Collection CSV](https://support.discogs.com/hc/en-us/articles/360007331534-How-Does-The-Collection-Feature-Work) imports album releases with ratings and source links. A collection date records ownership, so these imports stay saved for later with no listening date.
+
+Imports preview before saving, use source IDs and ISBNs when available, preserve existing ratings and notes, and fill missing details. JSON backup/restore retains genres, attachments, ratings, and known diary history. Maximum 10 MB per file and 30,000 rows per batch. ZIP history files may expand to 20 MB in total.
 
 Letterboxd exports/public feeds import your reviews with original links. **Two-way Letterboxd publishing is not enabled:** its [official API](https://api-docs.letterboxd.com/) supports writes through OAuth, but [access requires approval](https://letterboxd.com/api-beta/access/). A profile/feed link is read-only. Other communities’ reviews open on their original sites.
 
@@ -68,7 +70,7 @@ The catalog grows through searches; it does not claim to contain every title loc
 
 ### International search and a populated Browse
 
-The local browse catalog contains **932 attributed entries** as of 2026-11-05: 66 movies, 82 TV shows, 71 anime titles, 237 books, and 476 albums. These counts describe saved provider records, not a complete world catalog. Live search goes beyond those records. Source editions may remain separate; missing artwork and descriptions are never invented.
+The local Browse catalog reached **2,013 attributed records**, including **768 TV records** and **436 book records**, after the TV and books expansion. Open **Discover** and choose **TV shows** or **Books** to browse by genre or search by title or creator. Browse ranks exact titles first and supports title plus creator and accent-insensitive searches. Discover accepts a book's ISBN-10 or ISBN-13 and retrieves the matching Open Library edition, including its cover when available. Live search goes beyond the saved records. Source editions may remain separate. TV, books, and albums show an attributed starter selection immediately while Discover checks the server. Matching starters remain available when the server is unreachable, with their original source links and an option to retry. Offline search covers those bundled titles only; remote cover art may need a connection.
 
 International discovery is the default starter collection, with Algerian/North African work alongside African, Asian, Middle Eastern, and Latin American creators. Verified searches include *Nedjma*, *ذاكرة الجسد*, *Cien años de soledad*, **دار لفشوش**, and Souad Massi through **سعاد ماسي**. Screen searches select a Wikidata language from the query's script, use work-type claims instead of relying on English descriptions, and retain localized titles/creators. TVmaze has a Wikidata fallback for missing regional shows. MusicBrainz is not restricted to Apple's US store; bounded artist-alias lookup supports non-Latin names. Titles, creators, search fields, and notes use automatic text direction for mixed Arabic/Latin content.
 
@@ -80,7 +82,14 @@ Populate or refresh a bounded public starter batch:
 python3 catalog_seed.py                                  # dry run: international, 40 queries
 python3 catalog_seed.py --apply --report /tmp/trace-catalog-report.json
 python3 catalog_seed.py --collection classic             # inspect the original starter plan
+python3 catalog_seed.py --collection expanded --apply    # international books, albums, and screens
+python3 catalog_seed.py --collection tv-books --apply    # regional TV and covered works by selected authors
+python3 catalog_seed.py --tv-page 0 --apply               # one TVmaze index page per request
 ```
+
+Use `--collection tv-books --kind book` to select only the author batch. The TV index imports up to 250 shows per page, keeping TVmaze's own posters and attribution and skipping entries marked as anime. Pages `0`, `100`, and `200` were used for the local expansion. Reapplying a page updates entries by provider ID. Omit `--apply` to preview either operation. [TVmaze show index](https://www.tvmaze.com/api#show-index)
+
+The curated batch uses Open Library's author search with cover IDs and checks the returned author before saving. Use [Open Library's monthly dumps](https://openlibrary.org/data) for bulk book data.
 
 The command uses at most three workers, honors provider pacing and cached queries, never loads the private ratings key, and makes no credentialed score lookups. Reports contain public aggregate coverage. Existing report files are not overwritten. The ordinary app does not automatically run a population job. Before this development population, the existing database was backed up; original account, review, private-library, and stored-score counts were preserved.
 
@@ -92,7 +101,13 @@ The 2026-11-05 artwork audit checked all 882 supplied URLs in the 932-entry cata
 
 Movie Trace scores use four distinct feeds: **IMDb**, **Rotten Tomatoes critics (Tomatometer)**, **Rotten Tomatoes audience (Popcornmeter)**, and **Letterboxd**. IMDb stays on /10, Letterboxd is multiplied by 2, and each RT percentage is divided by 10. All four contribute 25% when present. With two or three, available feeds share the weight equally; missing feeds are never zero. With only one, the badge uses that source’s name and says “not blended.” Coverage always shows “N of 4 sources.” RT percentages measure approval, so the result is a composite consensus score. Duplicate provider copies count once. Metacritic and native Trace community ratings remain visible in details, outside this movie blend.
 
-Other media retain their existing public scores and vote-aware blend: known counts use log₁₀(votes + 1) ÷ 4, bounded from 0.2 to 1, or 0.5 when unknown. Catalog providers include TVmaze, Kitsu, and Open Library. [See the score and source breakdown](assets/screenshots/discover.png).
+TV uses **IMDb**, **Rotten Tomatoes critics**, **Rotten Tomatoes audience**, and **TVmaze**. Anime can also use Kitsu. Letterboxd is omitted from these series breakdowns. Books use **Open Library** and **Google Books**. Albums use **MusicBrainz** and the **Trace community**. Each category converts its available sources to /10, gives them equal weight, and requires two distinct communities for a Trace blend. A single score carries its source's name. Counts, missing sources, native scales, and source links remain visible. A private shelf rating contributes to the community score only after its owner publishes a review.
+
+The TV room includes 20 additional real starter shows immediately and a **Browse shows** view of the persistent TV catalog. Its first selection works while the catalog server is unavailable. The library and listening room also offer international starter sets. **Add starter titles** saves only titles you do not already have, with status **Want to try**, a blank experience date, and no personal rating. The preview remains a sample until you save titles.
+
+Album genre search supports raï, chaâbi, gnawa, desert blues, afrobeat, afrobeats, highlife, soukous, Arabic pop, and other styles alongside rock, jazz, hip-hop, classical, and electronic music. Choosing a genre in Discover searches the album providers directly, even with an empty title field. Results must carry matching provider genre metadata. MusicBrainz release-group lookups enrich saved album genres and ratings by exact ID, title, and artist. Each lookup is cached durably and coalesced when simultaneous requests target the same release.
+
+Google Books public requests require a server API key. Enable the Books API in your Google Cloud project, create a key restricted to that API, set `GOOGLE_BOOKS_API_KEY` in the server environment, and restart Trace. Keep the key out of browser storage, chat, and Git. Without a configured key, the breakdown shows the available Open Library rating and the missing Google Books source. [Google Books setup](https://developers.google.com/books/docs/v1/using#APIKey)
 
 ### Connect the four movie scores
 
@@ -141,9 +156,19 @@ The service worker caches a fixed public app shell. API requests, credentials, s
 
 This is a home-screen web app, not an App Store/Google Play release. Phone-width layouts, offline edit/reconnect behavior, worker cache behavior, and account isolation are tested. Cold offline launch has **not** been confirmed on a physical Safari/Chrome device; the embedded development browser did not provide a reliable cold-reload result. To verify before distribution: open the hosted app online, install it, close it, enable airplane mode, reopen it, edit an entry, then reconnect and confirm sync.
 
-For an HTTPS reverse proxy, configure `TRACE_PUBLIC_ORIGIN=https://your-trace-domain.example`, preserve that Host header, and proxy to the loopback server. Trace validates the configured origin for writes and marks hosted session cookies Secure. Account recovery, moderation/abuse controls, operational backups, hosting, and native signing/store submission still belong to the release phase.
+For an HTTPS reverse proxy, configure `TRACE_PUBLIC_ORIGIN=https://your-trace-domain.example`, preserve that Host header, and proxy to the loopback server. Trace validates the configured origin for writes and marks hosted session cookies Secure. The friends-beta release work adds invite-only registration, recovery codes, account deletion, hosted request limits, and backup tooling. Hosting, configured offsite backups, physical-device checks, and native signing/store submission remain release gates.
 
 The detailed five-specialist plan, API contracts, ownership, validation, and native release steps are in [the implementation plan](docs/implementation-plan.md).
+
+### Friends beta deployment
+
+The hosted release uses one bounded Waitress process behind Caddy HTTPS, with SQLite in a persistent private directory. Production defaults to single-use invitations, requires sign-in for provider searches and score refreshes, limits requests by the trusted proxy client address, and defaults to 100 MiB of library data per account. Photo-heavy library pulls are byte-bounded. Recovery codes reset passwords and revoke previous sessions. Account deletion removes active server data and clears the current device’s account cache; offline copies on other devices and earlier backups require separate retirement.
+
+Prepare a public-code-only deployment archive with `python3.11 scripts/package_server.py --output .trace/releases/trace-beta-20261124.tar.gz` after creating that private output directory. Its manifest verifies the explicit file allowlist. Transfer public catalog records with `scripts/public_catalog_transfer.py`; never upload the development database as a shortcut. Your personal device shelf reaches a hosted account only through an explicit backup/import or copy action.
+
+Follow [server deployment](docs/deployment.md), [backup and restore](docs/backup-restore.md), and [phone beta distribution](docs/friends-beta.md). `scripts/prepare-release.mjs` checks the live HTTPS server, then verifies both native projects use that address. Android release signing reads private environment variables and refuses an unsigned release. A connected native bundle refuses accidental offline rebuilds.
+
+Verified locally on 2026-11-13: real Waitress HTTP probes, Caddy configuration validation, a fresh unsigned iOS simulator build, temporary-database invitation/recovery/deletion and isolation checks, library quota and pagination tests, backup/restore and package tests, and browser signup/account settings. The focused release checks passed 73 Python tests and 56 Node tests. A real `age` encryption/decryption and SQLite restore drill passed with synthetic data; offsite delivery remains simulated until a destination is configured. No cloud server, hosted URL, signed friend build, or store upload has been created by this pass. The deployed beta must pass the runbook gates before invitations are shared. Public [privacy](privacy.html) and [help](support.html) pages describe the beta’s actual data boundaries.
 
 ### Native iOS and Android
 

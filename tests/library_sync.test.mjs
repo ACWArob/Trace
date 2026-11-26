@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {createLibrarySync,rebaseLibraryEntries} from '../library_sync.mjs';
+import {createHash} from 'node:crypto';
+import {createLibrarySync,rebaseLibraryEntries,inlinePhotoRefs,decodePhotoDataUrl,photoDigest,isPhotoRef,MAX_BYTES} from '../library_sync.mjs';
 
 const clone=value=>structuredClone(value);
 const entry=(id,title=id)=>({id,title,type:'movie',notes:'Personal note',history:['2026-10-01'],attachments:[{id:'kept'}]});
@@ -35,11 +36,26 @@ function server(){
  }
  return {connect,remote,calls,account};
 }
-async function client(connection,storage=memory(),user='user'){
+async function client(connection,storage=memory(),user='user',uploadPhoto){
  const changes=[],statuses=[];
- const sync=createLibrarySync({request:connection.request,storage,onChange:value=>changes.push(value),onStatus:value=>statuses.push(value)});
+ const sync=createLibrarySync({request:connection.request,uploadPhoto,storage,onChange:value=>changes.push(value),onStatus:value=>statuses.push(value)});
  await sync.setSession({user:{id:user}});await sync.syncNow();return {sync,storage,changes,statuses};
 }
+
+test('account deletion clears local queues and an old network response cannot restore them',async()=>{
+ const backend=server(),connection=backend.connect('user'),store=memory(),a=await client(connection,store);
+ connection.offline=true;
+ await a.sync.replaceEntries([entry('private-photo')]);
+ await a.sync.syncNow();
+ const gate={kind:'get',started:deferred(),release:deferred()};connection.gate=gate;connection.offline=false;
+ const sync=a.sync.syncNow();await gate.started.promise;
+ await a.sync.forgetAccount('user');
+ gate.release.resolve();await sync;
+ assert.equal(a.sync.getState().userId,null);
+ assert.deepEqual(store.values.get('user').entries,{});
+ assert.deepEqual(store.values.get('user').pending,{});
+ assert.deepEqual(store.values.get('user').conflicts,{});
+});
 function gate(connection,kind){const value={kind,started:deferred(),release:deferred()};connection.gate=value;return value;}
 
 test('two clients merge distinct entries and preserve every entry field',async()=>{
@@ -127,11 +143,12 @@ test('storage failure leaves the prior durable state and emits no successful cha
 
 test('large entries respect UTF-8 byte and count limits without dropping fields',async()=>{
  const backend=server(),connection=backend.connect('user'),a=await client(connection);
- const rows=Array.from({length:102},(_,index)=>entry(String(index)));rows[0].notes='💿'.repeat(1400000);rows[1].notes=rows[0].notes;
+ const rows=Array.from({length:102},(_,index)=>entry(String(index)));rows[0].notes='💿'.repeat(600000);rows[1].notes=rows[0].notes;
  await a.sync.replaceEntries(rows);await a.sync.syncNow();
  const pushes=backend.calls.filter(x=>x.body);
  assert.ok(pushes.length>=3);assert.ok(pushes.every(x=>x.body.changes.length<=100));
- assert.ok(pushes.every(x=>new TextEncoder().encode(JSON.stringify(x.body)).length<=9_500_000));
+ assert.equal(MAX_BYTES,4_000_000);
+ assert.ok(pushes.every(x=>new TextEncoder().encode(JSON.stringify(x.body)).length<=4_000_000));
  assert.equal(backend.account('user').rows.size,102);assert.equal(a.sync.getState().pendingCount,0);
  assert.equal(backend.account('user').rows.get('0').entry.notes,rows[0].notes);
 });
@@ -192,4 +209,86 @@ test('two offline tabs sharing atomic account storage preserve both queues',asyn
  assert.deepEqual(reopened.getState().entries.map(x=>x.id).sort(),['a','b']);assert.equal(reopened.getState().pendingCount,2);await reopened.syncNow();
  a.offline=false;await reopened.syncNow();assert.equal(reopened.getState().pendingCount,0);
  first.destroy();second.destroy();reopened.destroy();
+});
+
+const photoBytes=Buffer.from('a resized memory photo');
+const photo='data:image/jpeg;base64,'+photoBytes.toString('base64');
+const photoRef='trace-photo:'+createHash('sha256').update(photoBytes).digest('hex');
+function uploader(){
+ const calls=[];
+ const upload=async dataUrl=>{
+  calls.push(dataUrl);
+  if(upload.offline)throw new TypeError('Network unavailable');
+  if(upload.status)throw Object.assign(new Error('Photo rejected'),{status:upload.status});
+  return 'trace-photo:'+await photoDigest(decodePhotoDataUrl(dataUrl).bytes);
+ };
+ upload.calls=calls;return upload;
+}
+const memoryEntry=(id,image=photo)=>({...entry(id),type:'memory',image,attachments:[{id:'film',type:'movie',title:'Film',image}]});
+
+test('offline photo entries stay pending, upload once on reconnect, and sync only refs',async()=>{
+ const backend=server(),connection=backend.connect('user'),upload=uploader(),a=await client(connection,memory(),'user',upload);
+ connection.offline=true;
+ await a.sync.replaceEntries([memoryEntry('day')]);await a.sync.syncNow();
+ assert.equal(a.statuses.at(-1).state,'offline');assert.equal(upload.calls.length,0);
+ assert.equal(a.storage.values.get('user').pending.day.baseRevision,0);
+ assert.equal(a.sync.getState().entries[0].image,photo);
+ connection.offline=false;await a.sync.syncNow();
+ assert.equal(upload.calls.length,1,'one photo used twice uploads once');
+ const saved=backend.account('user').rows.get('day').entry;
+ assert.equal(saved.image,photoRef);assert.equal(saved.attachments[0].image,photoRef);
+ assert.equal(a.sync.getState().entries[0].image,photoRef);assert.equal(a.sync.getState().pendingCount,0);
+ assert.ok(backend.calls.filter(call=>call.body).every(call=>!JSON.stringify(call.body).includes('data:image')));
+ await a.sync.replaceEntries([{...a.sync.getState().entries[0],title:'Renamed'}]);await a.sync.syncNow();
+ assert.equal(upload.calls.length,1,'a referenced photo is never uploaded again');
+ assert.equal(backend.account('user').rows.get('day').entry.title,'Renamed');
+ assert.equal(a.statuses.at(-1).state,'synced');
+});
+
+test('a failed photo upload leaves only that entry pending with its base revision',async()=>{
+ const backend=server();backend.remote('user','day',entry('day'));
+ const connection=backend.connect('user'),upload=uploader(),a=await client(connection,memory(),'user',upload);
+ upload.status=413;
+ await a.sync.replaceEntries([memoryEntry('day'),entry('plain')]);await a.sync.syncNow();
+ assert.equal(a.statuses.at(-1).state,'error');assert.match(a.statuses.at(-1).error,/photo/i);
+ assert.equal(a.storage.values.get('user').pending.day.baseRevision,1);
+ assert.equal(a.sync.getState().entries.find(x=>x.id==='day').image,photo);
+ assert.equal(backend.account('user').rows.get('day').revision,1);
+ assert.ok(backend.account('user').rows.has('plain'));assert.equal(a.sync.getState().pendingCount,1);
+ upload.status=0;upload.offline=true;await a.sync.syncNow();
+ assert.equal(a.statuses.at(-1).state,'offline');assert.equal(a.storage.values.get('user').pending.day.baseRevision,1);
+ upload.offline=false;await a.sync.syncNow();
+ assert.equal(a.statuses.at(-1).state,'synced');assert.equal(backend.account('user').rows.get('day').entry.image,photoRef);
+});
+
+test('photo batches stay under 4,000,000 bytes and an oversized entry explains the limit',async()=>{
+ const backend=server(),connection=backend.connect('user'),upload=uploader(),a=await client(connection,memory(),'user',upload);
+ const rows=Array.from({length:5},(_,index)=>({...memoryEntry('m'+index),notes:'x'.repeat(1_500_000)}));
+ await a.sync.replaceEntries(rows);await a.sync.syncNow();
+ const pushes=backend.calls.filter(call=>call.body);
+ assert.ok(pushes.length>=3);assert.ok(pushes.every(call=>new TextEncoder().encode(JSON.stringify(call.body)).length<=4_000_000));
+ assert.equal(a.sync.getState().pendingCount,0);
+ await a.sync.replaceEntries([...a.sync.getState().entries,{...entry('huge'),notes:'x'.repeat(4_100_000)}]);await a.sync.syncNow();
+ assert.equal(a.statuses.at(-1).state,'error');assert.match(a.statuses.at(-1).error,/4 MB/);
+});
+
+test('photo refs are strict and data URLs decode to their SHA-256 identity',async()=>{
+ assert.ok(isPhotoRef(photoRef));
+ for(const value of ['trace-photo:'+'A'.repeat(64),'trace-photo:abc',photo,' '+photoRef,null])assert.equal(isPhotoRef(value),false);
+ const decoded=decodePhotoDataUrl(photo);
+ assert.equal(decoded.type,'image/jpeg');assert.deepEqual(Buffer.from(decoded.bytes),photoBytes);
+ assert.equal('trace-photo:'+await photoDigest(decoded.bytes),photoRef);
+ assert.equal(decodePhotoDataUrl('data:text/html;base64,PGI+'),null);
+});
+
+test('exporting entries with photo refs inlines each photo and counts missing ones',async()=>{
+ const missingRef='trace-photo:'+'0'.repeat(64);
+ const rows=[memoryEntry('day',photoRef),{...entry('film'),image:'https://covers.openlibrary.org/b/id/1-L.jpg'},{...entry('lost'),image:missingRef}];
+ const before=clone(rows),asked=[];
+ const result=await inlinePhotoRefs(rows,async id=>{asked.push(id);return 'trace-photo:'+id===photoRef?photo:null;});
+ assert.deepEqual(rows,before,'the library is not modified');
+ assert.equal(result.entries[0].image,photo);assert.equal(result.entries[0].attachments[0].image,photo);
+ assert.equal(result.entries[1].image,rows[1].image);
+ assert.equal(result.entries[2].image,missingRef);assert.equal(result.missing,1);
+ assert.equal(asked.length,2,'each photo is resolved once');
 });

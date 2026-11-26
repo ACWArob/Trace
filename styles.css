@@ -545,3 +545,17 @@ button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible,
 .wall-share-empty{padding:22px;background:#fff4df;border:1px dashed #b3956c;border-radius:4px}
 .wall-share-pages{margin-bottom:12px;color:#775238;font-size:12px}
 .wall-share-pages .button{min-height:38px}
+
+/* The TV room keeps its television above a browsable wall of DVD cases. */
+.tv-room-navigation{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:18px 0 24px}
+.tv-browse .discover-search>.field:first-child{flex:1;min-width:160px}
+.tv-browse .discover-search>.field:nth-child(2){flex:0 1 190px}
+.tv-browse .screening-room{padding-bottom:22px!important}
+.tv-browse-grid{margin-top:32px;grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+.tv-browse .movie-card-caption .text-button{font-size:12px;margin-top:8px}
+.tv-browse .screen-program .text-button{display:block;margin-top:12px}
+.toolbar[hidden],.genre-filter[hidden]{display:none}
+@media(max-width:760px){.tv-room-navigation{gap:12px}.tv-room-navigation .text-button{font-size:12px}.tv-browse .discover-search{flex-wrap:wrap}.tv-browse .discover-search>.field:first-child{flex-basis:100%}.tv-browse .discover-search>.field:nth-child(2){flex:1}.tv-browse-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:26px 18px}}
+.starter-collection-action{display:flex;justify-content:flex-end;margin:16px 0 22px}
+.shelf-invitation[hidden]{display:none}
+@media(max-width:760px){.tv-room-navigation{margin:12px 0 16px}}

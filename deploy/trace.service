@@ -1,0 +1,37 @@
+[Unit]
+Description=Trace friends beta API and public app
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=trace
+Group=trace
+WorkingDirectory=/opt/trace/current
+EnvironmentFile=/etc/trace/trace.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=TRACE_DATA_DIR=/var/lib/trace
+Environment=TRACE_ENV=production
+Environment=TRACE_TRUST_PROXY=1
+ExecStart=/opt/trace/venv/bin/python /opt/trace/current/production.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+StateDirectory=trace
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/trace
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+LimitNOFILE=1024
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

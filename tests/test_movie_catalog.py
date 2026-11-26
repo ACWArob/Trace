@@ -1,11 +1,10 @@
 import json
-from pathlib import Path
-import tempfile
 import unittest
 
 from catalog_store import CatalogStore
 from movie_catalog import (EXCLUDED_REASON, FILM_CLASSES, WIKIDATA_SOURCE,
                            is_movie_metadata, is_movie_result, reconcile_movie_catalog)
+from tests.pg_support import PostgresTestCase
 
 
 def claim(class_id):
@@ -106,11 +105,10 @@ class MovieEligibilityTests(unittest.TestCase):
                                           'description': 'The Artist is a 2011 film about an actor.'}))
 
 
-class MovieCatalogReconciliationTests(unittest.TestCase):
+class MovieCatalogReconciliationTests(PostgresTestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.catalog = CatalogStore(Path(directory.name) / 'test.sqlite3')
+        super().setUp()
+        self.catalog = CatalogStore(self.database)
 
     def row(self, identifier, description, source=WIKIDATA_SOURCE, kind='movie', marker=None):
         item = {'title': 'A title ' + identifier, 'type': kind, 'source': source, 'externalId': identifier,
@@ -150,7 +148,7 @@ class MovieCatalogReconciliationTests(unittest.TestCase):
         self.assertIsNotNone(self.catalog.matching('movie', 'A title Q2', '2000'))
         self.assertEqual(reconcile_movie_catalog(self.catalog), {'checked': 3, 'excluded': 0, 'restored': 0})
         with self.catalog.connect() as db:
-            row = db.execute("SELECT item_key,payload FROM catalog WHERE json_extract(payload,'$.externalId')='Q1'").fetchone()
+            row = db.execute("SELECT item_key,payload FROM catalog WHERE payload->>'externalId'='Q1'").fetchone()
             item = json.loads(row['payload']); item['description'] = '2000 film'
             db.execute('UPDATE catalog SET payload=? WHERE item_key=?', (json.dumps(item), row['item_key']))
         self.assertEqual(reconcile_movie_catalog(self.catalog), {'checked': 3, 'excluded': 0, 'restored': 1})

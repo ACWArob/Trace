@@ -1,0 +1,24 @@
+# Not uploaded to Vercel. The build stages public/ from the root shell files,
+# and api/index.py imports only the root Python modules.
+.git
+.trace/
+.venv/
+.vercel
+node_modules/
+public/
+tests/
+docs/
+deploy/
+native/
+migrations/
+scripts/*
+!scripts/build_public.py
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.env*
+*.keystore
+*.jks
+mdblist-api-key
+__pycache__/
+*.pyc

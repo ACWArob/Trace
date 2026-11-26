@@ -1,4 +1,5 @@
 """Trace's local server: static UI + small, cached public-catalog adapters."""
+from collections import OrderedDict
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs, urlencode, quote
 from urllib.request import Request, urlopen
@@ -7,26 +8,36 @@ from pathlib import Path
 import json
 import os
 import re
-import html
 import sys
 import time
 import threading
 import ssl
 import hmac
-import sqlite3
+import hashlib
 from http.cookies import SimpleCookie
-from catalog_store import CatalogStore, query_cache_ttl
-from music_catalog import search_albums, CATALOG_VERSION as MUSIC_CATALOG_VERSION
-from screen_catalog import search_wikidata, CATALOG_VERSION as SCREEN_CATALOG_VERSION
+import base64
+import database
+import cover_maintenance
+import maintenance
+import photo_store
+from durable_budget import DurableBudget
+from catalog_store import CatalogStore, query_cache_ttl, catalog_search_text
+from book_catalog import search_books, normalize_isbn, openlibrary_scores, google_books_scores, CATALOG_VERSION as BOOK_CATALOG_VERSION
+from music_catalog import search_albums, album_details, match_album, ALBUM_GENRES, CATALOG_VERSION as MUSIC_CATALOG_VERSION
+from screen_catalog import search_wikidata, tvmaze_item, CATALOG_VERSION as SCREEN_CATALOG_VERSION
 from movie_catalog import is_movie_metadata, is_non_work_description, WIKIDATA_SOURCE
 from social import SocialStore, SocialError
 from library_store import LibraryStore
 from score_service import ScoreService
 from ratings import RatingsStore, omdb_scores, mdblist_scores, merge_scores, load_local_rating_key
-from profile_feeds import read_profile_feed, FeedUnavailable
+from profile_feeds import read_profile_feed, FeedUnavailable, letterboxd_film_url, fetch_letterboxd_poster
+from cover_sources import cover_params, find_cover, openlibrary_isbn_cover, COVER_READ_LIMIT
+from release_policy import production_mode, signup_mode, client_ip, RequestBudget, library_byte_limit
 
 ROOT = Path(__file__).resolve().parent
-CACHE = {}
+CACHE = OrderedDict()
+CACHE_LIMIT = 2000
+CACHE_LOCK = threading.Lock()
 LOCK = threading.Lock()
 LAST = {}
 def create_tls_context():
@@ -43,16 +54,19 @@ def create_tls_context():
 
 
 TLS_CONTEXT = create_tls_context()
+COVER_PROVIDERS = {'tv': 'TVmaze', 'anime': 'Kitsu', 'book': 'Open Library'}
 PROVIDERS = {'movie': 'Wikidata / Wikipedia', 'tv': 'TVmaze / Wikidata', 'anime': 'Kitsu',
              'book': 'Open Library', 'album': 'Apple / MusicBrainz'}
 
+DATABASE = None
 CATALOG_STORE = None
 SOCIAL_STORE = None
 RATINGS_STORE = None
 LIBRARY_STORE = None
-STORE_LOCK = threading.Lock()
-AUTH_ATTEMPTS = {}
-PUBLIC_FILES = frozenset(('/', '/index.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/social.js', '/library_sync.mjs', '/api_client.mjs', '/artwork.mjs', '/mobile.js', '/sw.js', '/manifest.webmanifest'))
+STORE_LOCK = threading.RLock()
+AUTH_BUDGET = None  # DurableBudget shared by every instance; see auth_budget().
+API_BUDGET = RequestBudget()  # Per-instance burst limiter only.
+PUBLIC_FILES = frozenset(('/', '/index.html', '/privacy.html', '/support.html', '/styles.css', '/app.js', '/core.mjs', '/data.js', '/views.mjs', '/social.js', '/library_sync.mjs', '/api_client.mjs', '/artwork.mjs', '/letterboxd_zip.mjs', '/tv_starters.mjs', '/collection_starters.mjs', '/cover_backfill.mjs', '/mobile.js', '/sw.js', '/manifest.webmanifest'))
 SCORE_SERVICE = None
 
 
@@ -67,11 +81,37 @@ def public_origin():
     return 'https://' + parsed.hostname.lower() + (':' + str(port) if port and port != 443 else '')
 
 
+def _vercel_origin(host):
+    host = (host or '').strip().lower()
+    if not re.fullmatch(r'[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?', host):
+        return ''
+    return 'https://' + host
+
+
+def allowed_origins():
+    """HTTPS origins this deployment answers on: TRACE_PUBLIC_ORIGIN, plus a
+    Vercel preview's own deployment and branch URLs. Production never accepts
+    other *.vercel.app aliases."""
+    origins = [public_origin()]
+    if os.environ.get('VERCEL_ENV') == 'preview':
+        origins += [_vercel_origin(os.environ.get('VERCEL_URL')), _vercel_origin(os.environ.get('VERCEL_BRANCH_URL'))]
+    return tuple(dict.fromkeys(origin for origin in origins if origin))
+
+
+def get_database():
+    """The one Database (connection settings only) shared by every store."""
+    global DATABASE
+    with STORE_LOCK:
+        if DATABASE is None:
+            DATABASE = database.Database.from_env()
+        return DATABASE
+
+
 def get_catalog():
     global CATALOG_STORE
     with STORE_LOCK:
         if CATALOG_STORE is None:
-            CATALOG_STORE = CatalogStore()
+            CATALOG_STORE = CatalogStore(get_database())
     return CATALOG_STORE
 
 
@@ -79,7 +119,7 @@ def get_social():
     global SOCIAL_STORE
     with STORE_LOCK:
         if SOCIAL_STORE is None:
-            SOCIAL_STORE = SocialStore()
+            SOCIAL_STORE = SocialStore(get_database())
     return SOCIAL_STORE
 
 
@@ -87,70 +127,204 @@ def get_ratings():
     global RATINGS_STORE
     with STORE_LOCK:
         if RATINGS_STORE is None:
-            RATINGS_STORE = RatingsStore()
+            RATINGS_STORE = RatingsStore(get_database())
     return RATINGS_STORE
 
 
 def get_library():
-    get_social()  # Existing accounts own private library rows.
     global LIBRARY_STORE
     with STORE_LOCK:
         if LIBRARY_STORE is None:
-            LIBRARY_STORE = LibraryStore()
+            LIBRARY_STORE = LibraryStore(get_database(), byte_limit=library_byte_limit() if production_mode() else None)
     return LIBRARY_STORE
+
+
+def auth_budget():
+    """Login/signup/recovery budget shared by every instance (table auth_budget)."""
+    global AUTH_BUDGET
+    with STORE_LOCK:
+        if AUTH_BUDGET is None:
+            AUTH_BUDGET = DurableBudget(get_database())
+        return AUTH_BUDGET
 
 
 def attach_scores(result):
     for item in result.get('items', []):
         sources = list(item.get('publicScores') or [])
+        saved = get_catalog().identified(item.get('type'), item.get('source', ''), item.get('externalId', ''))
+        if saved:
+            sources.extend(saved.get('publicScores') or [])
+            item['genres'] = list(dict.fromkeys(list(item.get('genres') or []) + list(saved.get('genres') or [])))
+            if saved.get('verifiedYear') and saved['verifiedYear'] == saved.get('year'):
+                item['year'] = saved['verifiedYear']
         sources.extend(get_ratings().lookup(item.get('imdbId', '')))
         item['publicScores'] = merge_scores(sources)
     return result
 
 
-def remote_scores(kind, title, imdb_id):
+def score_service():
     global SCORE_SERVICE
     store = get_ratings()
     with STORE_LOCK:
         if SCORE_SERVICE is None or SCORE_SERVICE.store is not store:
             SCORE_SERVICE = ScoreService(store)
         service = SCORE_SERVICE
-    return service.lookup(kind, imdb_id, {
+    return service
+
+
+def remote_scores(kind, title, imdb_id):
+    return score_service().lookup(kind, imdb_id, {
         'omdb': {'enabled': bool(os.environ.get('OMDB_API_KEY')), 'load': lambda: omdb_scores(imdb_id, title, fetch)},
         'mdblist': {'enabled': bool(os.environ.get('MDBLIST_API_KEY')), 'load': lambda: mdblist_scores(imdb_id, title, kind, fetch)},
-    })
+    }, title=title)
 
 
-def title_scores(kind, title, year, imdb_id=''):
-    item = get_catalog().matching(kind, title, year) or {'type': kind, 'title': title, 'year': year}
+def score_loader(provider, kind, external_id, title):
+    """Rebuild a queued key's provider loader for the cron, or None to drop it
+    (provider not configured, or one whose loader needs the full record)."""
+    title = title or ''
+    if provider == 'omdb' and os.environ.get('OMDB_API_KEY'):
+        return lambda: omdb_scores(external_id, title, fetch)
+    if provider == 'mdblist' and os.environ.get('MDBLIST_API_KEY'):
+        return lambda: mdblist_scores(external_id, title, kind, fetch)
+    if provider == 'openlibrary' and kind == 'book':
+        if re.fullmatch(r'/works/OL\d+W', external_id):
+            return lambda: openlibrary_scores({'externalId': external_id, 'title': title}, fetch)
+        if external_id.startswith('isbn:'):
+            return lambda: openlibrary_scores({'isbn': external_id[5:], 'title': title}, fetch)
+    return None
+
+
+def title_scores(kind, title, year, imdb_id='', *, creator='', source='', external_id='', isbn=''):
+    item = get_catalog().identified(kind, source, external_id) if source and external_id else None
+    if not item and kind == 'anime' and source == 'TVmaze' and external_id:
+        item = get_catalog().identified('tv', source, external_id)
+    item = item or get_catalog().matching(kind, title, year, creator) or {
+        'type': kind, 'title': title, 'year': year, 'creator': creator,
+        'source': source, 'externalId': external_id, 'isbn': normalize_isbn(isbn)}
+    if kind in ('book', 'album'):
+        return media_scores(item, isbn)
     imdb_id = item.get('imdbId') or imdb_id
     if not re.fullmatch(r'tt\d{5,12}', imdb_id or ''):
         imdb_id = ''
     scores = list(item.get('publicScores') or []) + get_ratings().lookup(imdb_id)
     extra = remote_scores(kind, title, imdb_id)
     scores.extend(extra['sources'])
-    community = get_social().community_rating(item)
+    community = get_social().community_rating({**item, 'type': kind})
     if community:
         scores.append(community)
-    return {'sources': merge_scores(scores), 'imdbId': imdb_id, 'providerStatus': extra['providerStatus'], 'providerMeta': extra['providerMeta']}
+    scores = merge_scores(scores)
+    if kind in ('tv', 'anime'):
+        scores = [row for row in scores if row['source'] != 'Letterboxd']
+    return {'sources': scores, 'imdbId': imdb_id, 'providerStatus': extra['providerStatus'], 'providerMeta': extra['providerMeta']}
 
 
-def fetch(url, provider):
-    # Coalesce public-provider requests and respect a modest per-provider request rate.
+def media_scores(item, isbn=''):
+    kind = item['type']
+    providers = {}
+    identifier = ''
+    if kind == 'book':
+        isbn = normalize_isbn(item.get('isbn') or isbn)
+        if item.get('source') == 'Open Library' and re.fullmatch(r'/works/OL\d+W', item.get('externalId') or ''):
+            identifier = item['externalId']
+        elif isbn:
+            identifier = 'isbn:' + isbn
+        providers['openlibrary'] = {'enabled': True, 'load': lambda: openlibrary_scores({**item, 'isbn': isbn}, fetch)}
+        providers['googlebooks'] = {'enabled': bool(os.environ.get('GOOGLE_BOOKS_API_KEY')),
+                                   'load': lambda: google_books_scores({**item, 'isbn': isbn}, fetch)}
+    else:
+        sources = [{'source': item.get('source'), 'externalId': item.get('externalId')}] + list(item.get('catalogSources') or [])
+        identifier = next((s['externalId'] for s in sources if isinstance(s, dict) and s.get('source') == 'MusicBrainz'
+                           and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', str(s.get('externalId') or ''))), '')
+        musicbrainz_id = identifier
+        if not identifier and item.get('source') == 'Apple Music' and re.fullmatch(r'[1-9]\d{0,19}', str(item.get('externalId') or '')):
+            identifier = 'apple:' + item['externalId']
+        def load_album():
+            target = musicbrainz_id
+            if not target:
+                matched = match_album(item, fetch)
+                if not matched:
+                    return []
+                target = matched['externalId']
+            details = album_details(target, fetch)
+            if (catalog_search_text(details['title']) != catalog_search_text(item['title'])
+                    or catalog_search_text(details['creator']) != catalog_search_text(item.get('creator') or '')):
+                raise ValueError('Album title or artist did not match the selected record.')
+            # The original provider identity and artwork remain attached to this record.
+            enriched = {**item, 'genres': list(dict.fromkeys(list(item.get('genres') or []) + details['genres'])),
+                        'publicScores': merge_scores(item.get('publicScores') or [], details['publicScores']),
+                        'catalogSources': list(item.get('catalogSources') or []) + [{
+                            'source': 'MusicBrainz', 'externalId': target, 'sourceUrl': details['sourceUrl']}]}
+            get_catalog().save(kind, None, {'items': [details]}, metadata_only=True)
+            if item.get('source') != 'MusicBrainz' or item.get('externalId') != target:
+                get_catalog().save(kind, None, {'items': [enriched]}, metadata_only=True)
+            if identifier != target:
+                get_ratings().save_provider_cache('musicbrainz', kind, target, details['publicScores'])
+            return details['publicScores']
+        providers['musicbrainz'] = {'enabled': True, 'load': load_album}
+    extra = score_service().lookup(kind, identifier, providers, title=item.get('title'))
+    scores = merge_scores(item.get('publicScores') or [], extra['sources'])
+    community = get_social().community_rating(item)
+    if community:
+        scores = merge_scores(scores, [community])
+    # Metadata may have been enriched during the cached provider lookup.
+    saved = get_catalog().identified(kind, item.get('source', ''), item.get('externalId', ''))
+    genres = list((saved or item).get('genres') or [])
+    if kind == 'album' and identifier:
+        canonical = get_catalog().identified(kind, 'MusicBrainz', identifier)
+        if canonical:
+            genres = list(dict.fromkeys(genres + list(canonical.get('genres') or [])))
+    return {'sources': scores, 'providerStatus': extra['providerStatus'], 'providerMeta': extra['providerMeta'],
+            'genres': genres}
+
+
+def wait_turn(provider):
+    # Respect a modest per-provider request rate.
     with LOCK:
         wait = max(0, LAST.get(provider, 0) + 1.1 - time.monotonic())
         if wait:
             time.sleep(wait)
         LAST[provider] = time.monotonic()
+
+
+def fetch(url, provider, limit=None):
+    wait_turn(provider)
     req = Request(url, headers={'User-Agent': 'Trace/0.1 (https://github.com/ACWArob/Trace)', 'Accept': 'application/vnd.api+json' if provider == 'kitsu' else 'application/json'})
-    with urlopen(req, timeout=18, context=TLS_CONTEXT) as response:
-        return json.load(response)
+    with urlopen(req, timeout=9, context=TLS_CONTEXT) as response:
+        if limit is None:
+            return json.load(response)
+        body = response.read(limit + 1)
+        if len(body) > limit:
+            raise ValueError('The provider response is too large.')
+        return json.loads(body)
+
+
+def cache_lifetime(key, result):
+    if key[0] == 'profile':
+        return 300
+    if key[0] == 'book-description':
+        return 3600
+    return min(3600, query_cache_ttl(result))
+
+
+def cache_put(key, result):
+    with CACHE_LOCK:
+        now = time.time()
+        CACHE[key] = (now, result)
+        CACHE.move_to_end(key)
+        if len(CACHE) > CACHE_LIMIT:
+            expired = [entry for entry, (cached_at, value) in CACHE.items()
+                       if now - cached_at >= cache_lifetime(entry, value)]
+            for entry in expired:
+                del CACHE[entry]
+            while len(CACHE) > CACHE_LIMIT:
+                CACHE.popitem(last=False)
 
 
 def catalog_cache_current(kind, result):
-    if kind not in ('album', 'movie', 'tv'):
-        return True
-    return result.get('catalogVersion') == (MUSIC_CATALOG_VERSION if kind == 'album' else SCREEN_CATALOG_VERSION)
+    versions = {'album': MUSIC_CATALOG_VERSION, 'movie': SCREEN_CATALOG_VERSION,
+                'tv': SCREEN_CATALOG_VERSION, 'book': BOOK_CATALOG_VERSION}
+    return kind not in versions or result.get('catalogVersion') == versions[kind]
 
 
 def safe_cached_catalog(result):
@@ -162,14 +336,19 @@ def safe_cached_catalog(result):
     return {**result, 'items': [item for item in result.get('items', []) if isinstance(item, dict) and eligible(item)]}
 
 
-def search(kind, query):
-    cache_key = (kind, query.casefold())
-    if cache_key in CACHE:
-        cached_at, cached_result = CACHE[cache_key]
-        lifetime = min(3600, query_cache_ttl(cached_result))
+def search(kind, query, *, persist=True, genre=''):
+    if kind == 'book':
+        query = normalize_isbn(query) or query
+    cache_query = query if not (kind == 'album' and genre) else f'trace-genre:{genre}:{query}'
+    cache_key = (kind, cache_query.casefold())
+    with CACHE_LOCK:
+        cached = CACHE.get(cache_key)
+    if cached is not None:
+        cached_at, cached_result = cached
+        lifetime = cache_lifetime(cache_key, cached_result)
         if time.time() - cached_at < lifetime and catalog_cache_current(kind, cached_result):
             return attach_scores(cached_result)
-    saved = get_catalog().cached(kind, query)
+    saved = get_catalog().cached(kind, cache_query)
     if saved and catalog_cache_current(kind, saved):
         return attach_scores(saved)
     provider = PROVIDERS[kind]
@@ -178,9 +357,10 @@ def search(kind, query):
     if kind == 'movie':
         items = search_wikidata(query, 'movie', fetch)
     elif kind == 'album':
-        result = attach_scores(search_albums(query, fetch))
-        result = get_catalog().save(kind, query, result)
-        CACHE[cache_key] = (time.time(), result)
+        result = attach_scores(search_albums(query, fetch, genre=genre))
+        if persist:
+            result = get_catalog().save(kind, cache_query, result)
+            cache_put(cache_key, result)
         return result
     elif kind == 'tv':
         try:
@@ -188,12 +368,13 @@ def search(kind, query):
         except (HTTPError, URLError, TimeoutError, ValueError, OSError):
             data = []
             warnings.append('TVmaze is unavailable. Other television results are shown when available.')
+        if not isinstance(data, list):
+            data = []
+            warnings.append('TVmaze returned an invalid response. Other television results are shown when available.')
         for result in data[:16]:
-            row = result['show']
-            items.append({'title': row['name'], 'creator': (row.get('network') or row.get('webChannel') or {}).get('name', ''),
-                          'year': (row.get('premiered') or '')[:4], 'type': kind,
-                          'image': (row.get('image') or {}).get('medium', ''), 'source': 'TVmaze',
-                          'sourceUrl': row.get('url', ''), 'externalId': str(row['id']), 'genres': row.get('genres') or [], 'imdbId': (row.get('externals') or {}).get('imdb') or '', 'publicScores': [{'source':'TVmaze','value':row['rating']['average'],'max':10,'count':None,'url':row.get('url','')}] if (row.get('rating') or {}).get('average') is not None else [], 'description': html.unescape(re.sub(r'<[^>]*>', '', row.get('summary') or ''))})
+            item = tvmaze_item(result.get('show')) if isinstance(result, dict) else None
+            if item:
+                items.append(item)
         if not any(row['title'].casefold() == query.casefold() for row in items):
             try:
                 items.extend(search_wikidata(query, 'tv', fetch))
@@ -212,32 +393,94 @@ def search(kind, query):
                           'source': provider, 'sourceUrl': 'https://kitsu.app/anime/' + str(row['id']),
                           'externalId': str(row['id']), 'publicScores': [{'source':'Kitsu','value':float(attr['averageRating']),'max':100,'count':None,'url':'https://kitsu.app/anime/'+str(row['id'])}] if attr.get('averageRating') else [], 'genres': [category_names.get(r['id'], '') for r in row.get('relationships', {}).get('categories', {}).get('data', []) if category_names.get(r['id'])][:8], 'description': attr.get('synopsis') or ''})
     elif kind == 'book':
-        data = fetch('https://openlibrary.org/search.json?' + urlencode({'q': query, 'limit': 16,
-                     'fields': 'key,title,author_name,first_publish_year,cover_i,subject,ratings_average,ratings_count'}), 'openlibrary')
-        for row in data.get('docs', []):
-            items.append({'title': row['title'], 'creator': ', '.join(row.get('author_name', [])[:2]),
-                          'year': str(row.get('first_publish_year', '')), 'type': kind,
-                          'image': f"https://covers.openlibrary.org/b/id/{row['cover_i']}-L.jpg" if row.get('cover_i') else '',
-                          'source': provider, 'sourceUrl': 'https://openlibrary.org' + row['key'], 'externalId': row['key'], 'genres': (row.get('subject') or [])[:8], 'publicScores': [{'source':'Open Library','value':row['ratings_average'],'max':5,'count':row.get('ratings_count'),'url':'https://openlibrary.org'+row['key']}] if row.get('ratings_average') is not None else []})
+        items = search_books(query, fetch)
     unique = list({(r['type'], r['externalId']): r for r in items}.values())
-    result = attach_scores({'items': unique, 'provider': provider, 'warnings': warnings, **({'catalogVersion':SCREEN_CATALOG_VERSION} if kind in ('movie','tv') else {})})
-    result = get_catalog().save(kind, query, result)
-    CACHE[cache_key] = (time.time(), result)
+    result = {'items': unique, 'provider': provider, 'warnings': warnings}
+    if kind in ('movie', 'tv'):
+        result['catalogVersion'] = SCREEN_CATALOG_VERSION
+    elif kind == 'book':
+        result['catalogVersion'] = BOOK_CATALOG_VERSION
+    result = attach_scores(result)
+    if persist:
+        result = get_catalog().save(kind, query, result)
+        cache_put(cache_key, result)
     return result
+
+
+def letterboxd_poster(url):
+    """A Letterboxd film's poster URL ('' when it has none), cached by film link."""
+    url = letterboxd_film_url(url)
+    key = ('letterboxd-poster', url)
+    with CACHE_LOCK:
+        cached = CACHE.get(key)
+    if cached is not None and time.time() - cached[0] < cache_lifetime(key, cached[1]):
+        return cached[1]['image']
+    # boxd.it codes are case-sensitive but stored queries are casefolded, so hex-encode them.
+    cache_query = 'trace-letterboxd-poster:' + url.encode().hex()
+    saved = get_catalog().cached('movie', cache_query)
+    if saved is None:
+        with LOCK:
+            wait = max(0, LAST.get('letterboxd', 0) + 1.1 - time.monotonic())
+            if wait:
+                time.sleep(wait)
+            LAST['letterboxd'] = time.monotonic()
+        saved = get_catalog().save('movie', cache_query, {'items': [], 'provider': 'Letterboxd',
+                                                         'image': fetch_letterboxd_poster(url, TLS_CONTEXT)})
+    result = {'image': saved.get('image') if isinstance(saved.get('image'), str) else ''}
+    cache_put(key, result)
+    return result['image']
+
+
+def isbn_cover(isbn):
+    wait_turn('openlibrary-covers')
+    return openlibrary_isbn_cover(isbn, TLS_CONTEXT)
+
+
+def cover(kind, title, year='', creator='', isbn=''):
+    """The primary-source cover for validated parameters ('' when there is none), cached by request."""
+    kind, title, year, creator, isbn = cover_params(kind, title, year, creator, isbn)
+    digest = hashlib.sha256(json.dumps([1, kind, title.casefold(), year, creator.casefold(), isbn]).encode()).hexdigest()
+    key = ('cover', digest)
+    with CACHE_LOCK:
+        cached = CACHE.get(key)
+    if cached is not None and time.time() - cached[0] < cache_lifetime(key, cached[1]):
+        return cached[1]['image']
+    cache_query = 'trace-cover:' + digest
+    saved = get_catalog().cached(kind, cache_query)
+    if saved is None:
+        image = find_cover(kind, title, year, creator, isbn,
+                           lambda url, provider: fetch(url, provider, limit=COVER_READ_LIMIT),
+                           isbn_cover)
+        saved = get_catalog().save(kind, cache_query, {'items': [], 'provider': COVER_PROVIDERS[kind], 'image': image})
+    result = {'image': saved.get('image') if isinstance(saved.get('image'), str) else ''}
+    cache_put(key, result)
+    return result['image']
+
+
+class _CoverLookups:
+    letterboxd = staticmethod(lambda url: letterboxd_poster(url))
+    cover = staticmethod(lambda kind, title, year, creator, isbn: cover(kind, title, year, creator, isbn))
+
+
+COVER_LOOKUPS = _CoverLookups()
 
 
 def book_description(book_id):
     if not re.fullmatch(r'/works/OL\d+W', book_id):
         raise ValueError('Invalid book ID')
     key = ('book-description', book_id)
-    if key in CACHE and time.time() - CACHE[key][0] < 3600:
-        return CACHE[key][1]
+    with CACHE_LOCK:
+        cached = CACHE.get(key)
+    if cached is not None:
+        cached_at, cached_result = cached
+        if time.time() - cached_at < cache_lifetime(key, cached_result):
+            return cached_result
     data = fetch('https://openlibrary.org' + book_id + '.json', 'openlibrary')
     description = data.get('description', '')
     if isinstance(description, dict):
         description = description.get('value', '')
     result = {'description': str(description or '')[:20000]}
-    CACHE[key] = (time.time(), result)
+    cache_put(key, result)
     return result
 
 
@@ -248,20 +491,41 @@ class Handler(SimpleHTTPRequestHandler):
     def valid_host(self):
         try:
             host = urlparse('http://' + self.headers.get('Host', '')).hostname
-            configured = public_origin()
-            return host in ('localhost', '127.0.0.1', '::1') or bool(configured and 'https://' + self.headers.get('Host', '').lower().removesuffix(':443') == configured)
+            hosted = 'https://' + self.headers.get('Host', '').lower().removesuffix(':443') in allowed_origins()
+            if production_mode():
+                return hosted
+            return host in ('localhost', '127.0.0.1', '::1') or hosted
         except ValueError:
             return False
 
     def request_origin(self):
-        configured = public_origin()
         host = self.headers.get('Host', '')
-        if configured and 'https://' + host.lower().removesuffix(':443') == configured:
-            return configured
+        origin = 'https://' + host.lower().removesuffix(':443')
+        if origin in allowed_origins():
+            return origin
         return 'http://' + host
 
     def cookie_secure(self):
         return '; Secure' if self.request_origin().startswith('https://') else ''
+
+    def budget(self, group, limit=120):
+        key = (group, client_ip(self.client_address[0], self.headers))
+        if not API_BUDGET.allow(key, limit):
+            self.send_json({'error': 'Too many requests. Please try again in a minute.'}, 429, {'Retry-After': '60'})
+            return False
+        return True
+
+    def hosted_catalog_access(self):
+        if not production_mode():
+            return True
+        try:
+            if not get_social().session(self.session_token())['user']:
+                self.send_json({'error': 'Sign in to search the live catalogs and refresh scores.'}, 401)
+                return False
+        except database.Error:
+            self.send_json({'error': 'Trace is temporarily unavailable.'}, 503)
+            return False
+        return self.budget('catalog', 90)
 
     def library_get(self, parsed):
         try:
@@ -275,7 +539,7 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({'error': str(exc)}, exc.status)
         except ValueError:
             return self.send_json({'error': 'Invalid library cursor or page size.'}, 400)
-        except sqlite3.Error:
+        except database.Error:
             return self.send_json({'error': 'The library database is busy. Your device changes are still saved.'}, 503)
 
     def library_post(self):
@@ -292,8 +556,78 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json(get_library().sync(session['user']['id'], payload.get('changes')))
         except SocialError as exc:
             return self.send_json({'error': str(exc)}, exc.status)
-        except sqlite3.Error:
+        except database.Error:
             return self.send_json({'error': 'The library database is busy. Your device changes are still saved.'}, 503)
+
+    def photo_library(self):
+        # On Vercel the function's OIDC token arrives per request; env vars cover cron and local dev.
+        store = photo_store.store_from_env(self.headers.get('x-vercel-oidc-token') or None)
+        if store is None:
+            raise photo_store.PhotoStoreError('Photo storage is not configured.')
+        return photo_store.PhotoLibrary(get_database(), store)
+
+    def photo_post(self):
+        try:
+            if self.headers.get('Origin') != self.request_origin():
+                raise SocialError('This action must come from Trace.', 403)
+            session = get_social().session(self.session_token())
+            if not session['user']:
+                raise SocialError('Sign in to sync your photos.', 401)
+            csrf = self.headers.get('X-Trace-CSRF', '')
+            if not csrf or not hmac.compare_digest(csrf, session['csrf']):
+                raise SocialError('Refresh Trace and try again.', 403)
+            content_type = self.headers.get('Content-Type', '').split(';')[0].strip().lower()
+            native = content_type == 'application/json'
+            if not native and content_type not in photo_store.PHOTO_TYPES:
+                raise photo_store.PhotoError('Choose a JPEG, PNG, or WebP photo.', 415)
+            max_bytes = photo_store.photo_byte_limit()
+            # Native bodies carry base64 (4 characters per 3 bytes) inside a small JSON object.
+            limit = -(-max_bytes // 3) * 4 + 256 if native else max_bytes
+            try:
+                length = int(self.headers.get('Content-Length', ''))
+            except ValueError:
+                length = 0
+            if length > limit:
+                raise photo_store.PhotoError('The photo is too large.', 413)
+            if length <= 0:
+                raise photo_store.PhotoError('Send a photo.')
+            body = self.rfile.read(length)
+            if native:
+                try:
+                    payload = json.loads(body)
+                except (ValueError, UnicodeError) as exc:
+                    raise photo_store.PhotoError('The request is not valid JSON.') from exc
+                if not isinstance(payload, dict):
+                    raise photo_store.PhotoError('Send a JSON object.')
+                content_type, body = photo_store.decode_native(payload)
+            photo_id = self.headers.get('X-Trace-Photo-Id', '')
+            return self.send_json(self.photo_library().upload(session['user']['id'], photo_id, content_type, body))
+        except (SocialError, photo_store.PhotoError) as exc:
+            return self.send_json({'error': str(exc)}, exc.status)
+        except (photo_store.PhotoStoreError, database.Error):
+            return self.send_json({'error': 'Photo sync is temporarily unavailable. Your device changes are still saved.'}, 503)
+
+    def photo_get(self, parsed):
+        try:
+            session = get_social().session(self.session_token())
+            if not session['user']:
+                raise SocialError('Sign in to open your photos.', 401)
+            photo_id = parsed.path[len('/api/photos/'):]
+            content_type, data = self.photo_library().read(session['user']['id'], photo_id)
+        except SocialError as exc:
+            return self.send_json({'error': str(exc)}, exc.status)
+        except photo_store.PhotoMissing:
+            return self.send_json({'error': 'Photo not found.'}, 404)
+        except (photo_store.PhotoStoreError, database.Error):
+            return self.send_json({'error': 'Photos are temporarily unavailable.'}, 503)
+        if parse_qs(parsed.query).get('encoding') == ['base64']:
+            return self.send_json({'contentType': content_type, 'data': base64.b64encode(data).decode()})
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Cache-Control', 'private, max-age=86400')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def session_token(self):
         cookie = SimpleCookie()
@@ -323,14 +657,18 @@ class Handler(SimpleHTTPRequestHandler):
                 raise SocialError('This action must come from Trace.', 403)
             payload = self.read_json()
             store, token = get_social(), self.session_token()
-            if path in ('/api/auth/signup', '/api/auth/login'):
-                key, now = self.client_address[0], time.monotonic()
-                with STORE_LOCK:
-                    attempts = [t for t in AUTH_ATTEMPTS.get(key, []) if now - t < 60]
-                    if len(attempts) >= 15:
-                        raise SocialError('Too many sign-in attempts. Try again in a minute.', 429)
-                    AUTH_ATTEMPTS[key] = attempts + [now]
-                result, new_token = store.register(payload) if path.endswith('signup') else store.login(payload)
+            if path in ('/api/auth/signup', '/api/auth/login', '/api/auth/recover'):
+                if not auth_budget().allow('auth:' + client_ip(self.client_address[0], self.headers), 15):
+                    raise SocialError('Too many sign-in attempts. Try again in a minute.', 429)
+                if path.endswith('signup'):
+                    mode = signup_mode()
+                    if mode == 'closed':
+                        raise SocialError('New accounts are currently closed.', 403)
+                    result, new_token = store.register(payload, invite_required=mode == 'invite')
+                elif path.endswith('recover'):
+                    result, new_token = store.recover(payload)
+                else:
+                    result, new_token = store.login(payload)
                 return self.send_json(result, 201 if path.endswith('signup') else 200,
                                       {'Set-Cookie': f'trace_session={new_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{self.cookie_secure()}'})
             session = store.session(token)
@@ -343,6 +681,17 @@ class Handler(SimpleHTTPRequestHandler):
             if path == '/api/auth/logout':
                 store.logout(token)
                 return self.send_json({'user': None}, headers={'Set-Cookie': 'trace_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0' + self.cookie_secure()})
+            if path == '/api/auth/recovery-codes':
+                if not auth_budget().allow('auth:' + client_ip(self.client_address[0], self.headers), 15):
+                    raise SocialError('Too many account requests. Try again in a minute.', 429)
+                return self.send_json(store.issue_recovery_codes(user_id, payload.get('password')))
+            if path == '/api/auth/delete':
+                if not auth_budget().allow('auth:' + client_ip(self.client_address[0], self.headers), 15):
+                    raise SocialError('Too many account requests. Try again in a minute.', 429)
+                if payload.get('confirmation') != session['user']['username']:
+                    raise SocialError('Type your username to confirm account deletion.')
+                result = store.delete_account(user_id, payload.get('password'), payload.get('confirmation'))
+                return self.send_json(result, headers={'Set-Cookie': 'trace_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0' + self.cookie_secure()})
             if path == '/api/social/profile':
                 return self.send_json({'user': store.update_profile(user_id, payload)})
             if path == '/api/social/follow':
@@ -357,8 +706,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(store.set_hidden(user_id, str(payload.get('id', '')), payload.get('hidden') is True))
             raise SocialError('Unknown social action.', 404)
         except SocialError as exc:
-            return self.send_json({'error': str(exc)}, exc.status)
-        except sqlite3.Error:
+            return self.send_json({'error': str(exc)}, exc.status, {'Retry-After': '60'} if exc.status == 429 else None)
+        except database.Error:
             return self.send_json({'error': 'The social database is busy. Please try again.'}, 503)
 
     def social_get(self, parsed):
@@ -384,19 +733,25 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_json({'error': str(exc)}, exc.status)
         except ValueError:
             return self.send_json({'error': 'Invalid page.'}, 400)
-        except sqlite3.Error:
+        except database.Error:
             return self.send_json({'error': 'The social database is busy. Please try again.'}, 503)
 
     def do_POST(self):
         if not self.valid_host():
             return self.send_json({'error': 'Unknown host.'}, 403)
+        if production_mode() and not self.budget('write', 180):
+            return
         path = urlparse(self.path).path
         if path == '/api/library/sync':
             return self.library_post()
+        if path == '/api/photos':
+            return self.photo_post()
         if path.startswith(('/api/social/', '/api/auth/')):
             return self.social_post(path)
         if path != '/api/profile-connect':
             return self.send_json({'error': 'Unknown endpoint.'}, 404)
+        if not self.hosted_catalog_access():
+            return
         try:
             length = int(self.headers.get('Content-Length', '0'))
             if not 0 < length <= 2048 or 'application/json' not in self.headers.get('Content-Type', ''):
@@ -405,22 +760,78 @@ class Handler(SimpleHTTPRequestHandler):
             service = payload.get('service', '')
             profile = payload.get('profile', '')
             key = ('profile', str(service), str(profile))
-            if key in CACHE and time.time() - CACHE[key][0] < 300:
-                return self.send_json(CACHE[key][1])
+            with CACHE_LOCK:
+                cached = CACHE.get(key)
+            if cached is not None:
+                cached_at, cached_result = cached
+                if time.time() - cached_at < cache_lifetime(key, cached_result):
+                    return self.send_json(cached_result)
             result = read_profile_feed(service, profile, TLS_CONTEXT)
-            CACHE[key] = (time.time(), result)
+            cache_put(key, result)
             return self.send_json(result)
         except (ValueError, TypeError, AttributeError):
             return self.send_json({'error': 'Use a Letterboxd member profile or a Goodreads member profile URL.'}, 400)
         except (FeedUnavailable, HTTPError, URLError, TimeoutError, OSError):
             return self.send_json({'error': 'This public profile feed is unavailable. Check that the profile is public, try again later, or import its CSV export.'}, 502)
 
+    def cron_authorized(self):
+        # Authenticated by the shared secret, not cookies, so it skips the Host
+        # check: Vercel's scheduler may call a deployment URL, not the domain.
+        secret = os.environ.get('CRON_SECRET', '')
+        supplied = self.headers.get('Authorization', '') or ''
+        if not secret or not hmac.compare_digest(supplied.encode(), ('Bearer ' + secret).encode()):
+            self.send_json({'error': 'Unauthorized.'}, 401)
+            return False
+        return True
+
+    def cron_covers(self):
+        if not self.cron_authorized():
+            return
+        try:
+            # The same cached, throttled lookups as /api/letterboxd-poster and /api/cover.
+            return self.send_json(cover_maintenance.run_cover_pass(get_database(), lookups=COVER_LOOKUPS, library=get_library()))
+        except database.Error:
+            return self.send_json({'error': 'The cover pass could not reach the database.'}, 503)
+
+    def cron_maintenance(self):
+        if not self.cron_authorized():
+            return
+        try:
+            store = photo_store.store_from_env(self.headers.get('x-vercel-oidc-token') or None)
+            return self.send_json(maintenance.run(get_database(), service=score_service(), loader_for=score_loader, photo_store=store))
+        except database.Error:
+            return self.send_json({'error': 'Maintenance could not reach the database.'}, 503)
+
     def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == '/api/cron/maintenance':
+            return self.cron_maintenance()
+        if parsed.path == '/api/cron/covers':
+            return self.cron_covers()
         if not self.valid_host():
             return self.send_json({'error': 'Unknown host.'}, 403)
-        parsed = urlparse(self.path)
+        if parsed.path == '/api/health':
+            # Shallow by default so uptime checks never wake the database.
+            if parse_qs(parsed.query).get('deep') != ['1']:
+                return self.send_json({'status': 'ok'})
+            if production_mode() and not self.budget('read', 240):
+                return
+            try:
+                with get_database().connect() as db:
+                    db.execute('SELECT 1').fetchone()
+                return self.send_json({'status': 'ok', 'database': 'ok'})
+            except database.Error:
+                return self.send_json({'status': 'unavailable'}, 503)
+        if production_mode() and parsed.path.startswith('/api/') and not self.budget('read', 240):
+            return
+        if parsed.path == '/api/auth/config':
+            return self.send_json({'signupMode': signup_mode(), 'recovery': 'codes'})
+        if parsed.path in ('/api/search', '/api/ratings', '/api/book-description', '/api/letterboxd-poster', '/api/cover') and not self.hosted_catalog_access():
+            return
         if parsed.path == '/api/library':
             return self.library_get(parsed)
+        if parsed.path.startswith('/api/photos/'):
+            return self.photo_get(parsed)
         if parsed.path.startswith(('/api/social/', '/api/auth/')):
             return self.social_get(parsed)
         if parsed.path == '/api/ratings':
@@ -430,8 +841,10 @@ class Handler(SimpleHTTPRequestHandler):
             if kind not in PROVIDERS or not title:
                 return self.send_json({'error': 'Choose a catalog title.'}, 400)
             try:
-                return self.send_json(title_scores(kind, title, year, params.get('imdbId', [''])[0]))
-            except sqlite3.Error:
+                return self.send_json(title_scores(kind, title, year, params.get('imdbId', [''])[0],
+                    creator=params.get('creator', [''])[0][:500], source=params.get('source', [''])[0][:100],
+                    external_id=params.get('externalId', [''])[0][:100], isbn=params.get('isbn', [''])[0][:40]))
+            except database.Error:
                 return self.send_json({'error': 'The ratings database is busy. Try again shortly.'}, 503)
         if parsed.path == '/api/catalog':
             params = parse_qs(parsed.query)
@@ -447,16 +860,50 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(book_description(book_id))
             except (HTTPError, URLError, TimeoutError, ValueError, OSError):
                 return self.send_json({'error': 'Description unavailable.'}, 502)
+        if parsed.path == '/api/letterboxd-poster':
+            try:
+                image = letterboxd_poster(parse_qs(parsed.query).get('url', [''])[0])
+            except ValueError:
+                return self.send_json({'error': 'Use a Letterboxd film link.'}, 400)
+            except (HTTPError, URLError, TimeoutError, OSError):
+                return self.send_json({'error': 'Letterboxd is unavailable right now.'}, 502)
+            except database.Error:
+                return self.send_json({'error': 'The catalog database is busy. Try again shortly.'}, 503)
+            if not image:
+                return self.send_json({'error': 'No Letterboxd poster found.'}, 404)
+            return self.send_json({'image': image})
+        if parsed.path == '/api/cover':
+            params = {key: values[0] for key, values in parse_qs(parsed.query).items()}
+            try:
+                cover_params(params.get('type', ''), params.get('title', ''), params.get('year', ''),
+                             params.get('creator', ''), params.get('isbn', ''))
+            except ValueError:
+                return self.send_json({'error': 'Choose TV, anime, or a book and a title of up to 300 characters.'}, 400)
+            try:
+                image = cover(params.get('type', ''), params.get('title', ''), params.get('year', ''),
+                              params.get('creator', ''), params.get('isbn', ''))
+            except (HTTPError, URLError, TimeoutError, ValueError, OSError):
+                return self.send_json({'error': 'The cover catalog is unavailable right now.'}, 502)
+            except database.Error:
+                return self.send_json({'error': 'The catalog database is busy. Try again shortly.'}, 503)
+            if not image:
+                return self.send_json({'error': 'No cover found.'}, 404)
+            return self.send_json({'image': image})
         if parsed.path == '/api/search':
             params = parse_qs(parsed.query)
             kind = params.get('type', ['book'])[0]
             query = params.get('q', [''])[0].strip()
-            if kind not in PROVIDERS or not 2 <= len(query) <= 200:
+            genre = params.get('genre', [''])[0][:80] if kind == 'album' else ''
+            valid_genre = bool(re.fullmatch(r"[\w &+/'’\-]{2,80}", genre))
+            if kind not in PROVIDERS or len(query) > 200 or (genre and not valid_genre) or (len(query) < 2 and not (kind == 'album' and valid_genre)):
                 return self.send_json({'error': 'Choose a category and enter 2–200 characters.'}, 400)
+            if kind == 'book':
+                query = normalize_isbn(query) or query
             try:
-                return self.send_json(search(kind, query))
+                return self.send_json(search(kind, query, genre=genre))
             except (HTTPError, URLError, TimeoutError, ValueError, KeyError, OSError):
-                saved = get_catalog().cached(kind, query, stale=True)
+                cache_query = query if not genre else f'trace-genre:{genre}:{query}'
+                saved = get_catalog().cached(kind, cache_query, stale=True)
                 if saved:
                     return self.send_json(safe_cached_catalog(saved))
                 return self.send_json({'error': f'{PROVIDERS[kind]} is unavailable right now. Try again or add it manually.'}, 502)

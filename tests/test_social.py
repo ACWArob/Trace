@@ -1,14 +1,13 @@
 import http.client
 import json
 from pathlib import Path
-import tempfile
 import threading
 import unittest
-from unittest.mock import patch
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import server
-from social import SocialStore
+from social import SocialStore, image_url
+from tests.pg_support import PostgresTestCase, bind_server
 
 
 class QuietHandler(server.Handler):
@@ -16,13 +15,11 @@ class QuietHandler(server.Handler):
         pass
 
 
-class SocialHTTPTests(unittest.TestCase):
+class SocialHTTPTests(PostgresTestCase):
     def setUp(self):
-        self.directory=tempfile.TemporaryDirectory();self.addCleanup(self.directory.cleanup)
-        path=Path(self.directory.name)/'test.sqlite3'
-        for name,store in [('SOCIAL_STORE',server.SocialStore),('CATALOG_STORE',server.CatalogStore),('RATINGS_STORE',server.RatingsStore)]:
-            patcher=patch.object(server,name,store(path));patcher.start();self.addCleanup(patcher.stop)
-        server.AUTH_ATTEMPTS.clear()
+        super().setUp()
+        bind_server(self,self.database)
+        server.auth_budget().clear()
         self.http=server.ThreadingHTTPServer(('127.0.0.1',0),QuietHandler)
         self.thread=threading.Thread(target=self.http.serve_forever,daemon=True);self.thread.start()
         self.addCleanup(self.http.server_close);self.addCleanup(self.http.shutdown)
@@ -53,6 +50,7 @@ class SocialHTTPTests(unittest.TestCase):
         self.assertEqual(self.request('/api/auth/login',{},headers={'Origin':'https://evil.example'})[0],403)
         self.assertEqual(self.request('/api/auth/session',headers={'Host':'evil.example'})[0],403)
         self.assertEqual(self.request('/api/auth/signup',{'username':'alice','password':'another-test-password'})[0],409)
+        self.assertEqual(self.request('/api/auth/signup',{'username':'ALICE','password':'another-test-password'})[0],409)
         self.assertEqual(self.request('/api/auth/login',{'username':'alice','password':'wrong-password'})[0],401)
         self.assertEqual(self.request('/api/auth/logout',{},alice)[0],200)
         self.assertIsNone(self.request('/api/auth/session',account=alice)[1]['user'])
@@ -91,11 +89,66 @@ class SocialHTTPTests(unittest.TestCase):
         self.assertEqual(result['displayName'],'Reader <b>One</b>')
         self.assertNotIn('password_hash',result);self.assertNotIn('salt',result)
 
+    def test_people_search_is_case_insensitive_and_escapes_wildcards(self):
+        alice,bob=self.signup('alice'),self.signup('bob')
+        self.request('/api/social/profile',{'displayName':'Wonder_Land 100%'},bob)
+        store=server.get_social()
+        self.assertEqual([p['username'] for p in store.people('ALIC')],['alice'])
+        self.assertEqual([p['username'] for p in store.people('wonder_land')],['bob'])
+        self.assertEqual([p['username'] for p in store.people('100%')],['bob'])
+        self.assertEqual([p['username'] for p in store.people('%')],['bob'])
+        self.assertEqual([p['username'] for p in store.people('b_b')],[])
+        self.assertEqual(len(store.people('')),2)
+
+    def test_community_rating_matches_creator_case_insensitively_for_books(self):
+        alice=self.signup('alice')
+        item={'type':'book','title':'A Book','creator':'Some Author','year':'2020'}
+        self.request('/api/social/reviews',{'item':item,'text':'x','rating':4},alice)
+        store=server.get_social()
+        self.assertEqual(store.community_rating({**item,'title':'a BOOK','creator':'SOME author'})['count'],1)
+        self.assertIsNone(store.community_rating({**item,'creator':'Other'}))
+        self.assertIsNone(store.community_rating({**item,'type':'album'}))
+
     def test_invalid_reviews_are_rejected_without_creating_posts(self):
         alice=self.signup('alice')
         for payload in [{'item':{'type':[],'title':'A Film'},'text':'test'},{'item':{'type':{},'title':'A Film'},'text':'test'},{'item':{'type':'movie','title':'A Film'},'rating':float('nan')}, {'item':{'type':'bogus','title':'A Film'},'text':'test'}, {'item':{'type':'movie','title':'A Film'},'rating':4.3}]:
             self.assertEqual(self.request('/api/social/reviews',payload,alice)[0],400)
         self.assertEqual(self.request('/api/social/feed')[1]['items'],[])
+
+
+class SocialPhotoTests(PostgresTestCase):
+    REF = 'trace-photo:' + 'a' * 64
+
+    def test_image_url_rejects_private_photo_refs(self):
+        self.assertEqual(image_url(self.REF), '')
+        self.assertEqual(image_url('TRACE-PHOTO:' + 'a' * 64), '')
+        self.assertEqual(image_url('/api/photos/' + 'a' * 64), '')
+        self.assertEqual(image_url('https://covers.example/x.jpg'), 'https://covers.example/x.jpg')
+
+    def test_publish_with_a_photo_ref_stores_an_empty_image(self):
+        store = SocialStore(self.database)
+        session, _ = store.register({'username': 'ref_author', 'password': 'synthetic-password-1'})
+        review = store.publish(session['user']['id'], {'item': {'type': 'memory', 'title': 'Synthetic memory', 'image': self.REF, 'sourceUrl': self.REF}, 'rating': 4, 'text': 'Synthetic'})
+        self.assertEqual(review['item']['image'], '')
+        self.assertEqual(review['item']['sourceUrl'], '')
+        self.assertEqual(store.feed()['items'][0]['item']['image'], '')
+        with self.database.connect() as db:
+            self.assertNotIn('trace-photo:', db.execute('SELECT item FROM reviews').fetchone()[0])
+
+    def test_delete_account_marks_only_that_accounts_photos(self):
+        store = SocialStore(self.database)
+        ids = []
+        for name in ['photo_owner', 'photo_keeper']:
+            session, _ = store.register({'username': name, 'password': 'synthetic-password-1'})
+            ids.append(session['user']['id'])
+        with self.database.connect() as db:
+            for user_id in ids:
+                db.execute("INSERT INTO photos(user_id,id,pathname,content_type,bytes,created_at) VALUES(?,?,?,'image/jpeg',1,0)",
+                           (user_id, 'b' * 64, f'photos/{user_id}/' + 'b' * 64 + '.jpg'))
+        store.delete_account(ids[0], 'synthetic-password-1')
+        with self.database.connect() as db:
+            marked = dict(db.execute('SELECT user_id,deleted_at IS NOT NULL FROM photos').fetchall())
+        self.assertEqual(marked, {ids[0]: True, ids[1]: False})
 
 
 if __name__=='__main__':unittest.main()

@@ -1,0 +1,23 @@
+[Unit]
+Description=Encrypted offsite Trace SQLite snapshot
+After=network-online.target
+Wants=network-online.target
+OnFailure=trace-backup-alert.service
+
+[Service]
+Type=oneshot
+User=trace
+Group=trace
+WorkingDirectory=/opt/trace/current
+Environment=TRACE_DATA_DIR=/var/lib/trace
+EnvironmentFile=/etc/trace/backup.env
+ExecStart=/opt/trace/venv/bin/python /opt/trace/current/scripts/backup_database.py backup --output-dir /var/backups/trace --require-offsite --timeout 900
+ExecStartPost=/usr/bin/find /var/backups/trace -maxdepth 1 -name 'trace-*.age' -mtime +7 -delete
+UMask=0077
+TimeoutStartSec=50min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/trace /var/backups/trace
+ReadOnlyPaths=/etc/trace

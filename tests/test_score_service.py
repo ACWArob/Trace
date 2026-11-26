@@ -4,29 +4,28 @@ from threading import Barrier, Event
 from urllib.error import HTTPError, URLError
 from unittest.mock import Mock
 import sys
-import tempfile
+import threading
 import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ratings import RatingsStore
+from score_queue import ScoreQueue
 from score_service import ScoreService
+from tests.pg_support import PostgresTestCase
 
 
 SCORES = [{'source': 'Letterboxd', 'value': 4.1, 'max': 5}]
 
 
-class ScoreServiceTests(unittest.TestCase):
+class ScoreServiceTests(PostgresTestCase):
     def setUp(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        self.path = Path(directory.name) / 'test.sqlite3'
-        self.store = RatingsStore(self.path)
+        super().setUp()
+        self.store = RatingsStore(self.database)
+        self.queue = ScoreQueue(self.database)
 
-    def service(self):
-        service = ScoreService(RatingsStore(self.path))
-        self.addCleanup(service.close)
-        return service
+    def service(self, **kwargs):
+        return ScoreService(RatingsStore(self.database), **kwargs)
 
     @staticmethod
     def providers(loader, enabled=True):
@@ -35,11 +34,13 @@ class ScoreServiceTests(unittest.TestCase):
     def seed_stale(self, imdb_id='tt1234567'):
         self.store.save_provider_cache('mdblist', 'movie', imdb_id, SCORES, now=time.time()-100, refresh_after=time.time()-50)
 
+    def queued(self):
+        with self.database.connect() as db:
+            return [tuple(row) for row in db.execute('SELECT provider,kind,external_id FROM score_refresh_queue ORDER BY external_id')]
+
     def test_success_and_negative_results_survive_service_restart(self):
         loader = Mock(return_value=SCORES)
-        first = self.service()
-        result = first.lookup('movie', 'tt1234567', self.providers(loader))
-        first.close()
+        result = self.service().lookup('movie', 'tt1234567', self.providers(loader))
         forbidden = Mock(side_effect=AssertionError('Cached score must not load'))
         again = self.service().lookup('movie', 'tt1234567', self.providers(forbidden))
         self.assertEqual(result, again)
@@ -54,36 +55,83 @@ class ScoreServiceTests(unittest.TestCase):
         self.assertEqual(first_empty['sources'], [])
         empty.assert_called_once_with()
         forbidden.assert_not_called()
+        self.assertEqual(self.queued(), [])
 
-    def test_stale_scores_return_while_refresh_is_blocked_then_update(self):
-        self.seed_stale()
-        entered, release = Event(), Event()
-        def load():
-            entered.set()
-            if not release.wait(timeout=3):
-                raise TimeoutError()
-            return [{'source': 'Letterboxd', 'value': 4.3, 'max': 5}]
+    def test_no_threads_are_started_for_loads_or_stale_refreshes(self):
+        self.seed_stale('tt7654321')
+        before = {thread.ident for thread in threading.enumerate()}
+        loader = Mock(return_value=SCORES)
         service = self.service()
-        try:
-            with ThreadPoolExecutor(max_workers=1) as caller:
-                pending = caller.submit(service.lookup, 'movie', 'tt1234567', self.providers(load))
-                self.assertTrue(entered.wait(timeout=2))
-                result = pending.result(timeout=1)
-                self.assertEqual(result['sources'], SCORES)
-                self.assertTrue(result['providerMeta']['mdblist']['stale'])
-        finally:
-            release.set()
-        service.close()
+        service.lookup('movie', 'tt1234567', self.providers(loader))
+        service.lookup('movie', 'tt7654321', self.providers(loader))
+        self.assertEqual({thread.ident for thread in threading.enumerate()}, before)
+        self.assertEqual(loader.call_count, 1)
+
+    def test_cold_load_runs_in_the_caller_thread(self):
+        threads = []
+        def load():
+            threads.append(threading.current_thread())
+            return SCORES
+        self.service().lookup('movie', 'tt1234567', self.providers(load))
+        self.assertEqual(threads, [threading.current_thread()])
+
+    def test_stale_scores_return_immediately_and_are_queued_for_the_cron(self):
+        self.seed_stale()
+        forbidden = Mock(side_effect=AssertionError('A stale read must not load'))
+        service = self.service()
+        for _ in range(2):  # queueing twice keeps a single row
+            result = service.lookup('movie', 'tt1234567', self.providers(forbidden))
+        self.assertEqual(result['sources'], SCORES)
+        self.assertTrue(result['providerMeta']['mdblist']['stale'])
+        self.assertEqual(result['providerStatus']['mdblist'], 'available')
+        self.assertEqual(self.queued(), [('mdblist', 'movie', 'tt1234567')])
+        forbidden.assert_not_called()
+
+    def test_cron_drain_refreshes_queued_scores(self):
+        self.seed_stale()
+        service = self.service()
+        service.lookup('movie', 'tt1234567', self.providers(Mock()), title='A Film')
+        seen = []
+        def loader_for(provider, kind, imdb_id, title):
+            seen.append((provider, kind, imdb_id, title))
+            return lambda: [{'source': 'Letterboxd', 'value': 4.3, 'max': 5}]
+        self.assertEqual(service.refresh_queued(25, loader_for), {'claimed': 1, 'done': 1, 'failed': 0})
+        self.assertEqual(seen, [('mdblist', 'movie', 'tt1234567', 'A Film')])
+        self.assertEqual(self.queued(), [])
         refreshed = self.service().lookup('movie', 'tt1234567', self.providers(Mock()))
         self.assertEqual(refreshed['sources'][0]['value'], 4.3)
         self.assertFalse(refreshed['providerMeta']['mdblist']['stale'])
+
+    def test_cron_skips_keys_another_request_already_refreshed(self):
+        self.seed_stale()
+        service = self.service()
+        service.lookup('movie', 'tt1234567', self.providers(Mock()))
+        self.store.save_provider_cache('mdblist', 'movie', 'tt1234567', SCORES)
+        forbidden = Mock(side_effect=AssertionError('A fresh row must not load'))
+        result = service.refresh_queued(25, lambda *key: forbidden)
+        self.assertEqual((result['done'], result['failed']), (1, 0))
+        forbidden.assert_not_called()
+
+    def test_cron_drops_unconfigured_providers_and_requeues_failures(self):
+        self.seed_stale()
+        self.seed_stale('tt7654321')
+        service = self.service()
+        for imdb_id in ('tt1234567', 'tt7654321'):
+            service.lookup('movie', imdb_id, self.providers(Mock()))
+        self.assertEqual(service.refresh_queued(25, lambda *key: None), {'claimed': 2, 'done': 2, 'failed': 0})
+        self.assertEqual(self.queued(), [])
+        service.lookup('movie', 'tt1234567', self.providers(Mock()))
+        result = service.refresh_queued(25, lambda *key: Mock(side_effect=URLError('private failure detail')))
+        self.assertEqual(result, {'claimed': 1, 'done': 0, 'failed': 1})
+        self.assertEqual(self.queued(), [('mdblist', 'movie', 'tt1234567')])
+        self.assertEqual(self.store.get_provider_backoff('mdblist')['status'], 'unavailable')
 
     def test_failed_refresh_preserves_stale_scores_and_backoff_after_restart(self):
         self.seed_stale()
         original = self.store.read_provider_cache('mdblist', 'movie', 'tt1234567')
         service = self.service()
-        service.lookup('movie', 'tt1234567', self.providers(Mock(side_effect=URLError('private failure detail'))))
-        service.close()
+        service.lookup('movie', 'tt1234567', self.providers(Mock()))
+        service.refresh_queued(25, lambda *key: Mock(side_effect=URLError('private failure detail')))
         forbidden = Mock(side_effect=AssertionError('Active cooldown must not load'))
         result = self.service().lookup('movie', 'tt1234567', self.providers(forbidden))
         self.assertEqual(result['sources'], SCORES)
@@ -93,6 +141,16 @@ class ScoreServiceTests(unittest.TestCase):
         self.assertEqual(self.store.read_provider_cache('mdblist', 'movie', 'tt1234567'), original)
         self.assertNotIn('private', str(result))
         forbidden.assert_not_called()
+
+    def test_cold_failure_sets_a_cooldown_and_never_leaks_details(self):
+        loader = Mock(side_effect=URLError('private failure detail'))
+        first = self.service().lookup('movie', 'tt1234567', self.providers(loader))
+        second = self.service().lookup('movie', 'tt7654321', self.providers(loader))
+        self.assertEqual(first['providerStatus']['mdblist'], 'unavailable')
+        self.assertEqual(second['providerStatus']['mdblist'], 'unavailable')
+        self.assertEqual(first['sources'], [])
+        self.assertNotIn('private', str(first))
+        loader.assert_called_once_with()
 
     def test_rate_limit_backoff_survives_restart_and_applies_to_other_titles(self):
         loader = Mock(side_effect=HTTPError('https://example.invalid/?apikey=private', 429, 'private', {'Retry-After': '600'}, None))
@@ -114,6 +172,7 @@ class ScoreServiceTests(unittest.TestCase):
         missing = self.service().lookup('movie', 'tt7654321', self.providers(forbidden, False))
         self.assertEqual(missing['providerStatus']['mdblist'], 'not_configured')
         forbidden.assert_not_called()
+        self.assertEqual(self.queued(), [])
 
     def test_simultaneous_cold_requests_share_one_load(self):
         entered, release = Event(), Event()
@@ -133,6 +192,7 @@ class ScoreServiceTests(unittest.TestCase):
                 release.set()
             self.assertEqual(first.result(timeout=3)['sources'], second.result(timeout=3)['sources'])
         loader.assert_called_once_with()
+        self.assertEqual(service._key_locks, {})
 
     def test_distinct_titles_can_load_concurrently(self):
         barrier = Barrier(2)
@@ -145,25 +205,37 @@ class ScoreServiceTests(unittest.TestCase):
             for future in pending:
                 self.assertEqual(future.result(timeout=3)['providerStatus']['mdblist'], 'available')
 
-    def test_outstanding_refresh_work_is_bounded(self):
-        release = Event()
-        def load():
-            if not release.wait(timeout=3):
-                raise TimeoutError()
+    def test_a_lookup_stops_loading_after_its_time_budget_and_queues_the_rest(self):
+        now = [0.0]
+        def slow():
+            now[0] += 11
             return SCORES
-        service = self.service()
-        try:
-            for index in range(8):
-                imdb_id = f'tt{index:07d}'
-                self.seed_stale(imdb_id)
-                result = service.lookup('movie', imdb_id, self.providers(load))
-                self.assertTrue(result['providerMeta']['mdblist']['stale'])
-            forbidden = Mock()
-            result = service.lookup('movie', 'tt9999999', self.providers(forbidden))
-            self.assertEqual(result['providerStatus']['mdblist'], 'unavailable')
-            forbidden.assert_not_called()
-        finally:
-            release.set()
+        service = self.service(clock=lambda: now[0])
+        third = Mock()
+        providers = {'omdb': {'enabled': True, 'load': slow}, 'mdblist': {'enabled': True, 'load': third}}
+        result = service.lookup('movie', 'tt1234567', providers)
+        self.assertEqual(result['providerStatus'], {'omdb': 'available', 'mdblist': 'unavailable'})
+        third.assert_not_called()
+        self.assertEqual(self.queued(), [('mdblist', 'movie', 'tt1234567')])
+
+    def test_a_caller_waiting_past_the_budget_gives_up_without_loading(self):
+        entered, release = Event(), Event()
+        def slow():
+            entered.set()
+            release.wait(timeout=3)
+            return SCORES
+        service = self.service(load_budget=0.05)
+        second = Mock()
+        with ThreadPoolExecutor(max_workers=1) as caller:
+            first = caller.submit(service.lookup, 'movie', 'tt1234567', self.providers(slow))
+            try:
+                self.assertTrue(entered.wait(timeout=2))
+                result = service.lookup('movie', 'tt1234567', self.providers(second))
+            finally:
+                release.set()
+            first.result(timeout=3)
+        self.assertEqual(result['providerStatus']['mdblist'], 'unavailable')
+        second.assert_not_called()
 
     def test_invalid_titles_and_keys_never_leak_error_details(self):
         loader = Mock(side_effect=HTTPError('https://example.invalid/private', 401, 'private', {}, None))

@@ -107,6 +107,18 @@ test('Offline root navigation and versioned modules use public shell; online res
   assert.equal(app.writes.length, writeCount);
 });
 
+test('Private photo responses never pass through or enter the shell cache', async () => {
+  const app = worker(publicFile);
+  await app.lifecycle('install');
+  const writes = app.writes.length;
+  for (const path of [`/api/photos/${'a'.repeat(64)}`, `/api/photos/${'a'.repeat(64)}?encoding=base64`, '/api/photos']) {
+    assert.equal(app.request(path), undefined, path);
+  }
+  assert.equal(app.request('/api/photos', {method: 'POST'}), undefined);
+  assert.equal(app.writes.length, writes);
+  assert.match(workerSource, /const CACHE_NAME = `\$\{CACHE_PREFIX\}v19`;/);
+});
+
 test('Activation deletes only obsolete Trace shell caches and requires explicit update message', async () => {
   const app = worker(publicFile);
   await app.lifecycle('install');
@@ -123,7 +135,7 @@ test('Activation deletes only obsolete Trace shell caches and requires explicit 
   assert.equal(app.activations, 1);
 });
 
-function mobile({ios = false, waiting = null, native = false} = {}) {
+function mobile({ios = false, waiting = null, native = false, apiFetch = null, images = []} = {}) {
   const windowListeners = new Map();
   const serviceListeners = new Map();
   const status = {textContent: ''};
@@ -141,12 +153,16 @@ function mobile({ios = false, waiting = null, native = false} = {}) {
     addEventListener(name, fn) { windowListeners.set(name, fn); },
     dispatchEvent(event) { events.push(event); },
     location: {reload() { reloads++; }},
-    ...(native ? {TraceNative: {platform: 'ios'}} : {}),
+    ...(native ? {TraceNative: {platform: 'ios', ...(apiFetch ? {apiFetch} : {})}} : {}),
   };
   vm.runInNewContext(mobileSource, {
     window,
     navigator: {serviceWorker, userAgent: ios ? 'iPhone' : 'Android', platform: ios ? 'iPhone' : 'Linux', maxTouchPoints: 1},
-    document: {querySelectorAll(selector) { return selector === '[data-install-trace-status]' ? [status] : []; }, addEventListener() {}},
+    document: {querySelectorAll(selector) {
+      if (selector === '[data-install-trace-status]') return [status];
+      if (selector === 'img[src^="/api/photos/"]') return images.filter(image => image.getAttribute('src').startsWith('/api/photos/'));
+      return [];
+    }, addEventListener() {}},
     CustomEvent: class { constructor(type, options) { this.type = type; this.detail = options.detail; } },
   });
   return {window, status, events, windowListeners, serviceListeners, get reloads() { return reloads; }, get registrations() { return registrations; }};
@@ -197,4 +213,44 @@ test('A waiting app update is advertised without activation or reload until expl
   app.serviceListeners.get('controllerchange')();
   assert.equal(app.reloads, 0, 'Update acceptance alone must not reload a page with unfinished edits');
   assert.equal(app.window.TraceMobile.state.refreshRequired, true);
+});
+
+function image(src) {
+  return {attributes: {src}, getAttribute(name) { return this.attributes[name]; }, setAttribute(name, value) { this.attributes[name] = value; }};
+}
+
+test('Native photo hydrator replaces only private photo images and caches each photo', async () => {
+  const id = 'b'.repeat(64);
+  const requests = [];
+  const images = [image(`/api/photos/${id}`), image('https://covers.openlibrary.org/b/id/1-L.jpg'),
+    image('/assets/trace-icon.svg'), image('/api/photos/not-a-photo-id'), image(`/api/photos/${id}`)];
+  const app = mobile({native: true, images, async apiFetch(path, options) {
+    requests.push({path, options});
+    return {ok: true, async json() { return {contentType: 'image/jpeg', data: 'AAEC'}; }};
+  }});
+  await app.window.TraceMobile.hydratePhotos();
+  assert.equal(images[0].getAttribute('src'), 'data:image/jpeg;base64,AAEC');
+  assert.equal(images[4].getAttribute('src'), 'data:image/jpeg;base64,AAEC');
+  assert.equal(images[1].getAttribute('src'), 'https://covers.openlibrary.org/b/id/1-L.jpg');
+  assert.equal(images[2].getAttribute('src'), '/assets/trace-icon.svg');
+  assert.equal(images[3].getAttribute('src'), '/api/photos/not-a-photo-id');
+  assert.deepEqual(requests.map(request => request.path), [`/api/photos/${id}?encoding=base64`]);
+  images.push(image(`/api/photos/${id}`));
+  await app.window.TraceMobile.hydratePhotos();
+  assert.equal(images[5].getAttribute('src'), 'data:image/jpeg;base64,AAEC');
+  assert.equal(requests.length, 1, 'a viewed photo is served from the small cache');
+});
+
+test('Native photo hydrator rejects non-image responses and is inactive on the web', async () => {
+  const id = 'c'.repeat(64);
+  const bad = [image(`/api/photos/${id}`)];
+  const app = mobile({native: true, images: bad, async apiFetch() {
+    return {ok: true, async json() { return {contentType: 'text/html', data: 'PGI+'}; }};
+  }});
+  await app.window.TraceMobile.hydratePhotos();
+  assert.equal(bad[0].getAttribute('src'), `/api/photos/${id}`);
+  assert.equal(await app.window.TraceMobile.photo(id), null);
+  const web = mobile({images: [image(`/api/photos/${id}`)]});
+  await web.window.TraceMobile.hydratePhotos();
+  assert.equal(await web.window.TraceMobile.photo(id), null);
 });
